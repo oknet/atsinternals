@@ -4,7 +4,7 @@ Continuation，延续式编程模式。
 
 要理解ATS的源代码，就必须明白这玩意到底是个什么东西，我的理解就是：
 - 这是一个容器，记住上一次干到哪儿了
-- 这东西带着一个锁，避免被别人操作，我干的活，我自己接着干
+- 这东西带着一个锁，避免两个人同时干一个活，产生冲突
 
 这是一个非常古老的技术，因为ATS也是一个非常古老的系统，以至于后来微软在这个技术基础上提出了一个改进型：Co-Routine变成模式。
 在ATS中大多数的的数据结构都继承自Continuation，例如：Action，Event，VConnection，各种SM等。
@@ -56,8 +56,9 @@ public:
 ## ProxyMutex 对象
 
 鉴于事件系统的多线程特性，每个Continuation都带有一个对ProxyMutex对象的引用，以保护其状态，并确保原子操作。
-这个ProxyMutex对象必须通过Continuation的派生类或者使用IO Core Event System的客户来分配，并需要作为参数传递给Continuation类的构造函数。
-
+因此在创建任何一个Continuation对象或由其派生的对象时：
+- 通常由使用EventSystem的客户来创建ProxyMutex对象
+- 然后再创建Continuation对象时，将ProxyMutex对象作为参数传递给Continuation类的构造函数。
 
 ## TSAPI
 
