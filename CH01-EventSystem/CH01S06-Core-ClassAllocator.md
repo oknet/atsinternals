@@ -42,5 +42,4 @@ Allocator类是所有ClassAllocator类的基类
 
 ## 参考资料
 - [Allocator.h](http://github.com/apache/trafficserver/tree/master/lib/ts/Allocator.h)
-
 - [ink_queue.h](http://github.com/apache/trafficserver/tree/master/lib/ts/ink_queue.h)
