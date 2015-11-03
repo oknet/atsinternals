@@ -118,13 +118,13 @@ classObj->mutex_var_name = NULL;
 
 这部分将会在Lock部分介绍。
 
-## Ptr 与 RefCountObj
+## Ptr模版 与 RefCountObj类
 
 RefCountObj是一个引用计数类，ProxyMutex继承自这个类，那么ProxyMutex的实例mutex就内置了一个计数器，初始值为0。
 
-Ptr类封装了ProxyMutex类，其内部有一个m_ptr指针，类型为ProxyMutex。
+通过Ptr\<ProxyMutex\>声明的实例，由Ptr模版对ProxyMutex类再次封装，其实例内部有一个m_ptr指针，类型为ProxyMutex。
 
-Ptr的定义中，对赋值操作符“＝”进行了重载，来实现接受ProxyMutex类型的赋值，同时对==, != 比较操作也做了重载。
+同时Ptr模版的定义中，对赋值操作符“＝”进行了重载，来实现接受ProxyMutex类型的赋值，同时对==, != 比较操作也做了重载。
 
 ### 操作符＝（赋值）重载函数分析
 
