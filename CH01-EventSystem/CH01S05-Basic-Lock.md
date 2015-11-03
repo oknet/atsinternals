@@ -2,7 +2,8 @@
 
 由于I_Lock.h在2014年进行了重构，所以下文分析的ATS 6.0版本中包含的代码与早期版本可能不一样。
 
-为了保证多线程操作对于共享资源的访问，ATS定义了一下几种锁的操作：
+为了保证多线程操作对于共享资源的访问，ATS定义了以下几种锁的操作：
+
 - 阻塞型上锁，阻塞直到完成上锁
    - SCOPED_MUTEX_LOCK
 - 非阻塞型上锁，需要在调用后进行判断，有可能没有成功上锁
@@ -17,6 +18,8 @@
 实际使用中，通过宏定义的方式来调用Lock。为什么通过此方式？（后面讨论）
 
 每个宏都一个DEBUG版本，为了描述简便，下面的介绍中删除了DEBUG版本。
+
+阻塞型上锁部分：
 
 ```
 /**
@@ -48,6 +51,8 @@ public:
   ~MutexLock() { Mutex_unlock(m, m->thread_holding); }
 };
 ```
+
+非阻塞型上锁部分：
 
 ```
 /**
@@ -146,6 +151,8 @@ public:
 };
 ```
 
+释放锁／解锁部分
+
 ```
 /**
   释放ProxyMutex上的锁
@@ -164,6 +171,7 @@ public:
 ATS的锁被设计为自动锁，你会看到在代码里很少看到使用MUTEX_RELEASE这个宏，但是明明在函数的开头调用了加锁的宏，这是什么原理呢？
 
 可以在```class MutexLock```和```class MutexTryLock```的定义中看到，析构函数中都调用了：
+
 - Mutex_unlock(m, m->thread_holding);
 - Mutex_unlock(m.m_ptr, m.m_ptr->thread_holding);
 - 这两种使用方法有区别吗？**
@@ -177,14 +185,17 @@ ATS的锁被设计为自动锁，你会看到在代码里很少看到使用MUTEX
 当使用MUTEX_TRY_LOCK之后，发现没有获得锁，但是后面又需要上锁的情况如何处理？
 
 通常情况可能会这样做：
+
 - 显示解锁，然后重新调用SCOPED_MUTEX_LOCK来上锁
 
 但是TryLock的设计，为这种特殊情况增加了一个方法acquire()
+
 - 可以直接调用 _l.acquire(ethread) 实现阻塞，直到加锁成功
 - 但是要小心使用
 
 
 ## 参考资料
+
 - [I_Lock.h]
 (http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Lock.h)
 - [ProxyMutex](CH01S03-Basic-ProxyMutex.md)
