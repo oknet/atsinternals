@@ -9,6 +9,7 @@ ProxyMutex 是在Continuation和Thread中使用的互斥锁。
 由于事件系统是多线程的模式，通过ProxyMutex可以保护数据结构和状态信息，否则将会受到并发线程的影响。
 
 ProxyMutex对象有一个ink_mutex类型（在ink_mutex.h中定义）的成员，它是对不同平台的互斥锁类型的封装。
+
 ProxyMutex通过ink_mutex来实现互斥锁的功能，这样就没有特定平台的函数调用的负担。
 
 ProxyMutex也有一个指针，指回到当前持有锁的EThread，用于验证它是否正确的被释放。
@@ -16,6 +17,7 @@ ProxyMutex也有一个指针，指回到当前持有锁的EThread，用于验证
 ## 定义／方法／成员
 
 ProxyMutex 类主要是对底层mutex的封装，用来支持跨越多个平台的mutex系统。
+
 在创建一个ProxyMutex对象时，首选的方式是使用new_ProxyMutex()函数。
 
 ```
@@ -86,11 +88,13 @@ new_ProxyMutex()
 ## ProxyMutex的使用方法
 
 在一个class里定义ProxyMutex类型时，通常定义为一个Ptr指针：
+
 ```
 Ptr<ProxyMutex> mutex_var_name;
 ```
 
 在分配这个class的实例之后，如果必须要为它指定一个mutex，可以通过以下方法：
+
 ```
 // 分配一个新的mutex
 classObj->mutex_var_name = new_ProxyMutex();
@@ -98,7 +102,12 @@ classObj->mutex_var_name = new_ProxyMutex();
 classObj->mutex_var_name = Cont->mutex;
 ```
 
-当我们不再需要mutex时，例如classObj需要被释放时，只需要简单的将mutex指向NULL，Ptr将自动判断是否可以释放这个mutex占用的内存空间。千万不要调用mutex.free()方法来释放Ptr\<ProxyMutex\> mutex。在ATS的实现中，几乎所有的ProxyMutex都是采用Ptr\<ProxyMutex\>方式定义的。
+当我们不再需要mutex时，例如classObj需要被释放时，只需要简单的将mutex指向NULL，Ptr将自动判断是否可以释放这个mutex占用的内存空间。
+
+千万不要调用mutex.free()方法来释放Ptr\<ProxyMutex\> mutex。
+
+在ATS的实现中，几乎所有的ProxyMutex都是采用Ptr\<ProxyMutex\>方式定义的。
+
 ```
 classObj->mutex_var_name = NULL;
 ```
@@ -112,6 +121,7 @@ classObj->mutex_var_name = NULL;
 ## Ptr 与 RefCountObj
 
 RefCountObj是一个引用计数类，ProxyMutex继承自这个类，那么ProxyMutex的实例mutex就内置了一个计数器，初始值为0。
+
 Ptr类封装了ProxyMutex类，其内部有一个m_ptr指针，类型为ProxyMutex。
 
 Ptr的定义中，对赋值操作符“＝”进行了重载，来实现接受ProxyMutex类型的赋值，同时对==, != 比较操作也做了重载。
@@ -119,6 +129,7 @@ Ptr的定义中，对赋值操作符“＝”进行了重载，来实现接受Pr
 ### 操作符＝（赋值）重载函数分析
 
 PtrMutex ＝ p的过程如下：
+
 ```
 temp_ptr = PtrMutex->m_ptr;
 if (m_ptr != p) {
@@ -132,16 +143,19 @@ return(PtrMutex);
 ```
 
 首先我们分配两个ProxyMutex实例以及一个智能指针Ptr\<ProxyMutex\> PtrMutex
+
 - Ptr\<ProxyMutex\> PtrMutex;
 - ProxyMutex *p=new_ProxyMutex();
 - ProxyMutex *m=new_ProxyMutex();
 
 首先我们将p赋值给它：
+
 - PtrMutex.m_ptr=p
 - PtrMutex.m_ptr 的引用计数加1，其实就是p的引用计数为1了
 - 返回PtrMutex
 
 然后我们再将m赋值给它：
+
 - temp_ptr暂存之前的p
 - PtrMutex.m_ptr=m
 - PtrMutex.m_ptr 的引用计数加1，其实就是m的引用计数为1了
@@ -150,6 +164,7 @@ return(PtrMutex);
 - 返回PtrMutex
 
 然后我们再将NULL赋值给它
+
 - temp_ptr暂存上面的m
 - PtrMutex.m_ptr=NULL，为NULL，那么引用计数不能增加，所以m的引用计数不变，仍然为1
 - temp_ptr 的引用计数减1，其实就是m的引用计数减1，变为0了
@@ -157,10 +172,12 @@ return(PtrMutex);
 - 返回PtrMutex
 
 如果是 PtrMutex1=PtrMutex2 这样的操作呢？
+
 - 转化为PtrMutex1 ＝ PtrMutex2.m_ptr
 - 参考上面的流程就可以了
 
 ### RefCountObj的定义
+
 ```
 class RefCountObj : public ForceVFPTToTop
 {
@@ -193,6 +210,7 @@ public:
 ```
 
 ### Ptr的定义
+
 ```
 template <class T> class Ptr
 {
@@ -262,6 +280,7 @@ template <class T> inline Ptr<T> &Ptr<T>::operator=(const Ptr<T> &src)
 
 
 ## 参考资料
+
 - [I_Lock.h]
 (http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Lock.h)
 - [Ptr.h]
