@@ -3,6 +3,7 @@
 Continuation，延续式编程模式。
 
 要理解ATS的源代码，就必须明白这玩意到底是个什么东西，我的理解就是：
+
 - 这是一个容器，记住上一次干到哪儿了
 - 这东西带着一个锁，避免两个人同时干一个活，产生冲突
 
@@ -10,6 +11,7 @@ Continuation，延续式编程模式。
 在ATS中大多数的的数据结构都继承自Continuation，例如：Action，Event，VConnection，各种SM等。
 
 以下部分来自源代码中注释的简单翻译：
+
 - Continuation 是一个通用类，可以用于实现事件驱动的状态机。
 - 通过包括其他状态和方法，Continuation 可以将状态与控制流结合，通常这样的设计用于支持分阶段，事件驱动的控制流程。
 - 一定程度上来讲Continuation是整个异步回调机制的多线程事件编程基础。
@@ -38,8 +40,17 @@ public:
     Continuation(ProxyMutex * amutex = NULL);
 };
 
+inline Continuation::Continuation(ProxyMutex *amutex)
+  : handler(NULL), mutex(amutex)
+{
+}
+
+#define SET_HANDLER(_h) (handler = ((ContinuationHandler)_h))
+#define SET_CONTINUATION_HANDLER(_c, _h) (_c->handler = ((ContinuationHandler)_h))
 ```
-延续（Continuation）是一个轻型数据结构，它的实现只有一个用于回调的方法。
+
+延续（Continuation）是一个轻型数据结构，它的实现只有一个用于回调的方法：
+
 - handler：当前的Continuation处理函数。
    - 用户可以通过提供“ContinuationHandler”（成员函数handler的类型）来决定延续的行为。
       - 该函数在事件到达时，由handleEvent调用。
@@ -56,7 +67,9 @@ public:
 ## ProxyMutex 对象
 
 鉴于事件系统的多线程特性，每个Continuation都带有一个对ProxyMutex对象的引用，以保护其状态，并确保原子操作。
-因此在创建任何一个Continuation对象或由其派生的对象时：
+
+因此，在创建任何一个Continuation对象或由其派生的对象时：
+
 - 通常由使用EventSystem的客户来创建ProxyMutex对象
 - 然后再创建Continuation对象时，将ProxyMutex对象作为参数传递给Continuation类的构造函数。
 
@@ -66,4 +79,5 @@ Continuation在API中的结构叫TSCont，是插件开发中最常用到的抽�
 
 
 ## 参考资料
+
 - [I_Continuation.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Continuation.h)
