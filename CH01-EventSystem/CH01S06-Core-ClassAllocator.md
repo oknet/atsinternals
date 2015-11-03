@@ -22,7 +22,7 @@ ATS中使用到的各种数据结构，特别是需要在EventSystem与各种Pro
 所有的数据结构都使用Allocator类来分配，不符合面向对象的设计习惯，因此ATS设计了ClassAllocator模版。
 
 ## 参考资料
-[Allocator.h](http://git.atsdev.skyguardmis.com/opensource/trafficserver/tree/master/lib/ts/Allocator.h)
+[Allocator.h](http://github.com/apache/trafficserver/tree/master/lib/ts/Allocator.h)
 
 # Allocator
 
@@ -41,6 +41,6 @@ Allocator类是所有ClassAllocator类的基类
    - 该内存块由chunk_size个element_size字节的“小块内存”组成
 
 ## 参考资料
-[Allocator.h](http://git.atsdev.skyguardmis.com/opensource/trafficserver/tree/master/lib/ts/Allocator.h)
+[Allocator.h](http://github.com/apache/trafficserver/tree/master/lib/ts/Allocator.h)
 
-[ink_queue.h](http://git.atsdev.skyguardmis.com/opensource/trafficserver/tree/master/lib/ts/ink_queue.h)
+[ink_queue.h](http://github.com/apache/trafficserver/tree/master/lib/ts/ink_queue.h)
