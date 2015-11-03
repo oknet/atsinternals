@@ -66,4 +66,4 @@ Continuation在API中的结构叫TSCont，是插件开发中最常用到的抽�
 
 
 ## 参考资料
-[I_Continuation.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Continuation.h)
+- [I_Continuation.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Continuation.h)
