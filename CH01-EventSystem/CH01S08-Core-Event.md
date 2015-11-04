@@ -308,10 +308,12 @@ PS：但是在EThread::execute()中没有对Cont->handleEvent的返回值进行�
 ### 放入EventSystem
 
 - 根据轮询规则选择下一个线程，然后将Event放入选择的线程
-   - eventProcessor.schedule(e->init(c, t, p));
-   - EThread::schedule(e->init(c, t, p));
+   - eventProcessor.schedule(e->init(cont, timeout, period));
+   - EThread::schedule(e->init(cont, timeout, period));
 - 放入当前线程
    - e->schedule_*();
+   - this_ethread()->schedule_*_local(e);
+      - 只能在e->ethread==this_ethread的时候使用
 
 ### 释放Event
 
