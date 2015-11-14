@@ -1,4 +1,4 @@
-# PollDescriptor & EventIO
+# 基础组件：PollDescriptor 和 EventIO
 
 PollDescriptor 是对多种平台上的I/O Poll操作的封装，目前ATS支持epoll，kequeu，port三种。
 
