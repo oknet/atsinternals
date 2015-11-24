@@ -840,7 +840,7 @@ ProtectedQueue::enqueue(Event *e, bool fast_signal)
 
 - signal
    - 首先以阻塞方式获得锁
-   - 然后触发cong_signal
+   - 然后触发cond_signal
    - 最后释放锁
 - try_signal是signal的非阻塞版本
    - 尝试获得锁，如果获得锁，就跟signal是一样的，然后返回1，表示成功执行signal操作
