@@ -104,11 +104,13 @@ ATS可以创建两种类型的EThread线程：
 
 - DEDICATED类型
    - 该类型的线程，在执行完某个延续后，就消亡了
+   - 换句话说，这个类型只处理／执行一个Event，在创建这种类型的EThread时就要传入Event。
    - 或者是处理一个独立的任务，例如NetAccept的延续就是通过此种类型来执行的。
 - REGULAR类型
    - 该类型的线程，在ATS启动后，就一直存在着，它的线程执行函数：execute()是一个死循环
    - 该类型的线程维护了一个事件池，当事件池不为空时，线程就从事件池中取出事件（Event），同时执行事件（Event）封装的延续（Continuation）
    - 当需要调度某个线程执行某个延续（Continuation）时，通过EventProcessor将一个延续（Continuation）封装成一个事件（Event）并将其加入到线程的事件池中
+   - 这个类型是EventSystem的核心，它会处理很多的Event，而且可以从外部传入Event，然后让这个EThread处理／执行Event。
 - MONITOR类型
    - 实际上还有第三种类型，但是MONITOR类型当前未使用到
    - 也许在Yahoo开源时被删除了
