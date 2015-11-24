@@ -364,9 +364,16 @@ EThread::process_event(Event *e, int calling_code)
 }
 ```
 
-## EThread::execute() REGULAR 流程分析
+## EThread::execute() REGULAR 和 DEDICATED 流程分析
 
-EThread::execute()的REGULAR部分为一个死循环，按照以下逻辑持续扫描/遍历多个队列，并执行Event内部的handler
+EThread::execute() 由switch语句分成多个部分：
+
+- 第一部分是 REGULAR 类型的处理
+  - 它由一个无限循环内的代码，持续扫描/遍历多个队列，并回调Event内部Cont的handler
+- 第二部分是 DEDICATED 类型的处理
+  - 直接回调oneevent内部的Cont的handler，其实是一个简化版的process_event(oneevent, EVENT_IMMEDIATE)
+
+下面是对execute()代码的注释和分析：
 
 ```
 source: iocore/eventsystem/UnixEThread.cc
@@ -679,9 +686,14 @@ o#########>  event route
 
 ## signal_hook 介绍
 
-signal_hook, evfd, ep 这三个成员是一体的，专门用来支持网络IO的，在epoll_wait调用时，会有一个超时等待时间。
+在epoll_wait调用时，会有一个阻塞的超时等待时间，前面我们介绍Event System的时候，特别强调必须是完全无阻塞的。
 
-在这个等待时间进行到一半的时候，有一个需要立即处理的Event，怎么办？如何让EventSystem以最快的速度处理这个Event？
+但是epoll_wait中的阻塞又是一个可能会出现的情况，那么ATS是如何处理Event System中这种特殊的阻塞情况呢？
+
+答案是```受控阻塞```:
+
+- 阻塞的时间设置上限，由epoll_wait的超时参数决定
+- 通过signal让epoll_wait在超时到达之前返回
 
 通过man epoll_wait可以很容易得知：
 
@@ -697,11 +709,15 @@ signal_hook, evfd, ep 这三个成员是一体的，专门用来支持网络IO�
 - ATS通过eventfd()系统调用创建了一个evfd，并将这个fd封装到ep里，然后添加到了epoll fd里，关注evfd的READ事件。
 - 如果让evfd变成可读，就会触发新事件，那么只需要提供一个方法让evfd可读，就可以产生新事件，这样epoll_wait就可以立即返回
 
+ATS通过将evfd添加到fd集合中实现了这个受控阻塞，这就是受控阻塞的原理。
+
 为了让这个设计更具有通用性，于是增加了signal_hook用于向evfd里写数据，这个signal_hook在iocore/net/UnixNet.cc里的initialize_thread_for_net中被初始化为net_signal_hook_function()，并且在初始化ep的时候，指定类型（ep->type）为EVENTIO_ASYNC_SIGNAL。
 
 在NetHandler::mainNetEvent中可以看到专门对EVENTIO_ASYNC_SIGNAL类型的EventIO进行了处理，就是调用net_signal_hook_callback()来读取其中的数据，由于这里只是为了让epoll_wait从timeout wait状态中提前返回，所以读取到的数据没什么用。
 
 就这样，ATS把epoll_wait的超时等待变成了可控等待。
+
+因此，evfd，signal_hook 和 ep，这三个成员是一体的，是专门用来支持网络IO的受控阻塞。
 
 实际上这个超时等待的默认值为10ms，也就是百分之一秒，ATS连这么短的时间都要打断去立即处理一个Event，可见ATS是为了达到实时处理的目的，真正实现schedule_imm_signal()的EVENT_IMMEDIATE的意义！
 
