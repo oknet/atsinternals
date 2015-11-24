@@ -169,6 +169,8 @@ struct EventIO {
 
 ## 方法
 
+### start
+
 在需要将一个文件描述符以及文件描述符的延伸（NetVC，UDPVC，DNSConn，NetAccept）添加到PollDescriptor时，可以通过EventIO提供的start方法：
 
 - start(EventLoop l, DNSConnection *vc, int events)
@@ -212,6 +214,8 @@ EventIO::start(EventLoop l, int afd, Continuation *c, int e)
 }
 ```
 
+### stop
+
 对应start方法的则是stop方法，stop方法只有epoll和port的实现，没有kqueue的处理（我对kqueue不熟悉，不知道为何这里没有针对kqueue的处理）：
 
 ```
@@ -235,12 +239,16 @@ EventIO::stop()
 }
 ```
 
-start和stop分别对应添加、删除，然后还定义了以下两个方法，但是对于epoll ET模式，这两个方法都是空方法：
+### modify & refresh
+
+start和stop分别对应添加、删除，然后还定义了修改和刷新两个方法，但是对于epoll ET模式，这两个方法都是空方法：
 
 - modify
    - 修改，对epoll LT，kqueue LT，port有相关代码定义，这里就不做分析了
 - refresh
    - 刷新，对kqueue LT，port有相关代码定义，这里就不做分析了
+
+### close
 
 最后还有一个close方法，用于关闭fd，首先调用stop方法停止polling，然后根据type的类型，调用该类型的close方法完成fd的关闭。
 
@@ -268,18 +276,13 @@ EventIO::close()
 }
 ```
 
-### stop & close 方法
+close 方法好像只有dns系统调用，其它系统没有看到有任何调用此方法的操作：
 
-close 方法好像只有dns系统调用，其它系统没有看到有任何调用此方法的操作。
-
-在close_UnixNetVConnection中则是先调用stop方法，然后再自己调用了vc->con.close()
-
-- 其实是可以把调用stop方法修改为调用close方法的
-
-在NetAccept的处理中，因为只有在遇到错误时才需要把listen fd从epoll fd中删除，因此这块很少用到
-
-- 在acceptFastEvent的Lerror标签处直接调用了server.close()，没有把listen fd从epoll fd中删除，貌似是一个小bug
-- 在cancel中也是直接调用了server.close()，没有把listen fd从epoll fd中删除
+- 在close_UnixNetVConnection中则是先调用stop方法，然后再自己调用了vc->con.close()
+  - 其实是可以把调用stop方法修改为调用close方法的
+- 在NetAccept的处理中，因为只有在遇到错误时才需要把listen fd从epoll fd中删除，因此这块很少用到
+  - 在acceptFastEvent的Lerror标签处直接调用了server.close()，没有把listen fd从epoll fd中删除，貌似是一个小bug???
+  - 在cancel中也是直接调用了server.close()，没有把listen fd从epoll fd中删除
 
 ## 参考资料
 
