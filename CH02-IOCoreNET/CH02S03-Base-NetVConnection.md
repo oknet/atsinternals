@@ -74,95 +74,115 @@ VC_EVENT_ERROR
 
 ## 方法
 
-### do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
+由于VConnection只是一个基类，因此下面的方法都需要在其继承类中重新进行定义。
+
+但是为了保证定义的统一，在VConnection的继承类中必须要要按照以下基本的约定来实现这些方法。
+
+### do_io_read
 
 准备接收来自 VConnection 数据
 
-- 状态机（SM）调用它来从 VConnection 读取数据。
-- 处理机（Processor）实现这个读取功能时，首先获取锁，然后将新的数据放入buf，回调Continuation，然后释放锁。
-- 例如：让状态机处理以特殊字符标记事务结束数据传输协议。
+  - 状态机（SM）调用它来从 VConnection 读取数据。
+  - 处理机（Processor）实现这个读取功能时，首先获取锁，然后将新的数据放入buf，回调Continuation，然后释放锁。
+  - 例如：让状态机处理以特殊字符标记事务结束数据传输协议。
 
 可能的Event Code（在状态机回调 Continuation 时，VConn可能会使用这些值作为Event Code）
 
-- VC_EVENT_READ_READY
-  - 数据已经添加到buffer，或者buffer满了
-- VC_EVENT_READ_COMPLETE
-  - nbytes字节的数据已经被读取到buffer了
-- VC_EVENT_EOS
-  - Stream的读取端关闭了连接
+  - VC_EVENT_READ_READY
+    - 数据已经添加到buffer，或者buffer满了
+  - VC_EVENT_READ_COMPLETE
+    - nbytes字节的数据已经被读取到buffer了
+  - VC_EVENT_EOS
+    - Stream的读取端关闭了连接
 
-参数
+参数(Continuation *c, int64_t nbytes, MIOBuffer *buf)
 
-- c
-  - 在读操作完成后，将要回调的Continuation，同时会传递Event Code过去
-- nbytes
-  - 想要读取的字节数，如果不确定要读取多少，必须设定为INT64_MAX
-- buf
-  - 读取到的数据会放入这里
+  - c
+    - 在读操作完成后，将要回调的Continuation，同时会传递Event Code过去
+  - nbytes
+    - 想要读取的字节数，如果不确定要读取多少，必须设定为INT64_MAX
+  - buf
+    - 读取到的数据会放入这里
 
 返回值
 
-- 代表调度IO操作的VIO类型
+  - 代表调度IO操作的VIO类型
 
 注意
 
-- 当c＝NULL，nbytes＝0，buf＝NULL时表示取消之前设置的do_io_read操作。
-- 当没有数据可读，或者buf写满，会导致VIO被disable，需要调用reenable才会继续读取数据。
+  - 当c＝NULL，nbytes＝0，buf＝NULL时表示取消之前设置的do_io_read操作。
+  - 当没有数据可读，或者buf写满，会导致VIO被disable，需要调用reenable才会继续读取数据。
 
-### do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner)
+### do_io_write
 
 准备向 VConnection 写入数据
 
-- 状态机（SM）调用它来向 VConnection 写入数据。
-- 处理机（Processor）实现这个读取功能时，首先获取锁，然后将来自buf的数据写入，回调Continuation，然后释放锁。
+  - 状态机（SM）调用它来向 VConnection 写入数据。
+  - 处理机（Processor）实现这个读取功能时，首先获取锁，然后将来自buf的数据写入，回调Continuation，然后释放锁。
 
 可能的Event Code（在状态机回调 Continuation 时，VConn可能会使用这些值作为Event Code）
 
-- VC_EVENT_WRITE_READY
-  - 来自buffer的数据已经写入，或者buffer为空
-- VC_EVENT_WRITE_COMPLETE
-  - 来自buffer的nbytes字节的数据已经被写入
+  - VC_EVENT_WRITE_READY
+    - 来自buffer的数据已经写入，或者buffer为空
+  - VC_EVENT_WRITE_COMPLETE
+    - 来自buffer的nbytes字节的数据已经被写入
 
-参数
+参数(Continuation *c, int64_t nbytes, IOBufferReader *buf, bool owner)
 
-- c
-  - 在读操作完成后，将要回调的Continuation，同时会传递Event Code过去
-- nbytes
-  - 想要写入的字节数，如果不确定要写入多少，必须设定为INT64_MAX
-- buf
-  - 数据源，将从这里读取数据，然后写入
-- owner
-  - 未使用，默认false，如果设置为true，可能会引发assert ??
+  - c
+    - 在读操作完成后，将要回调的Continuation，同时会传递Event Code过去
+  - nbytes
+    - 想要写入的字节数，如果不确定要写入多少，必须设定为INT64_MAX
+  - buf
+    - 数据源，将从这里读取数据，然后写入
+  - owner
+    - 未使用，默认false，如果设置为true，可能会引发assert ??
 
 返回值
 
-- 代表调度IO操作的VIO类型
+  - 代表调度IO操作的VIO类型
 
 注意
 
-- 当c＝NULL，nbytes＝0，buf＝NULL时表示取消之前设置的do_io_write操作。
-- 当写数据失败，或者buf空了，会导致VIO被disable，需要调用reenable才会继续写数据。
+  - 当c＝NULL，nbytes＝0，buf＝NULL时表示取消之前设置的do_io_write操作。
+  - 当写数据失败，或者buf空了，会导致VIO被disable，需要调用reenable才会继续写数据。
+
+### set_continuation
+
+为指定VIO设置Continuation，通常应该由VIO::set_continuation()来调用此方法。
+
+参数(VIO *vio, Continuation *cont)
+
+  - vio
+    - 将要设置Continuation的VIO
+  - cont
+    - 即将要关联到VIO的Continuation
 
 ### reenable & reenable_re
 
-激活VIO
+激活指定的VIO，通常应该由VIO::reenable()来调用此方法。
 
-- 让之前设置的VIO恢复运行，EventSystem将会呼叫处理机（Processor）。
+  - 让之前设置的VIO恢复运行，EventSystem将会呼叫处理机（Processor）。
+
+参数(VIO *vio)
+
+  - vio
+    - 准备激活的VIO
 
 ### do_io_close
 
 表示不再需要这个 VConnection 了 
 
-- 当状态机使用完一个VConnection，必须调用这个函数，表示可以进行回收。
-- 在调用了close之后
-  - VConnection和底层的Processor都不能再发送任何与此VConnection相关联的Event给状态机。
-  - 状态机也不能够访问该VConnection和从其获得/返回的VIO。
+  - 当状态机使用完一个VConnection，必须调用这个函数，表示可以进行回收。
+  - 在调用了close之后
+    - VConnection和底层的Processor都不能再发送任何与此VConnection相关联的Event给状态机。
+    - 状态机也不能够访问该VConnection和从其获得/返回的VIO。
 
-参数
+参数(int lerrno = -1)
 
-- lerrno
-  - 用于表示这是一个正常的关闭还是一个异常的关闭
-  - 两种关闭的区别由底层的VConnection类型来决定
+  - lerrno
+    - 用于表示这是一个正常的关闭还是一个异常的关闭
+    - 两种关闭的区别由底层的VConnection类型来决定
 
 ### do_io_shutdown
 
@@ -173,13 +193,15 @@ VC_EVENT_ERROR
   - 状态机也不可以使用来自被Shutdown方向的VIO
   - 即使双向传输都被Shutdown，当状态机需要回收该VConnection时，仍然必须通过调用do_io_close来完成回收操作。
 
-可能的Howto值
-  - IO_SHUTDOWN_READ ＝ 0
-    - 关闭读取端，表示该VConn不应该再产生Read Event
-  - IO_SHUTDOWN_WRITE ＝ 1
-    - 关闭写入端，表示该VConn不应该再产生Write Event
-  - IO_SHUTDOWN_READWRITE = 2
-    - 双向关闭，表示该VConn不应该再产生Read和Write Event
+参数(ShutdownHowTo_t howto)
+
+  - howto 取值及含义
+    - IO_SHUTDOWN_READ ＝ 0
+      - 关闭读取端，表示该VConn不应该再产生Read Event
+    - IO_SHUTDOWN_WRITE ＝ 1
+      - 关闭写入端，表示该VConn不应该再产生Write Event
+    - IO_SHUTDOWN_READWRITE = 2
+      - 双向关闭，表示该VConn不应该再产生Read和Write Event
 
 ### get_data & set_data
 
@@ -188,14 +210,16 @@ VC_EVENT_ERROR
   - 其行为取决于哪种VConnection的类型被使用
   - 在派生类中存取自定义的数据结构
 
-参数
+参数(int id, void *data)
 
-- id
-  - 为枚举类型TSApiDataType
-- data
-  - 对应的数据
-- 返回值
-  - 成功返回True
+  - id
+    - 为枚举类型TSApiDataType
+  - data
+    - 对应的数据
+
+返回值
+
+- 成功返回True
 
 ```
   /** Used in VConnection::get_data(). */
