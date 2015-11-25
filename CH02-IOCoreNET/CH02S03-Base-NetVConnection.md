@@ -17,13 +17,14 @@ VConnection类是由Processor返回的一种单向或双向数据管道的抽象
 VConnection定义了一个可以串联的虚拟管道，可以让ATS在网络、状态机、磁盘间形成流式数据通信，是上层通信机制的很关键一环。
 
 ```
-                                   +------ UserSM ------+
-                                  /                      \
-    +------ CS_VC ------+        /                        \        +------ SS_VC ------+
-   /                     \      /                          \      /                     \
-FD                        CS_VIO                            SS_VIO                        FD
+                                      +------ UserSM ------+
+                                     /       (HTTPSM)       \
+       +------ CS_VC ------+        /                        \        +------ SS_VC ------+
+      /                     \      /                          \      /                     \
+CS_FD                        CS_VIO                            SS_VIO                        SS_FD
 
-    FD = File Descriptor
+ CS_FD = Client Side File Descriptor
+ SS_FD = Server Side File Descriptor
  CS_VC = Client Side VConnection
  SS_VC = Server Side VConnection
 CS_VIO = Client Side VIO
