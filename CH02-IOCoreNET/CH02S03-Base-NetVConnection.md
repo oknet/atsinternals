@@ -2,11 +2,11 @@
 
 在ATS中VConnection抽象很有趣，几乎跟OSI的模型对应了起来：
 
-|OSI Layer|VC Class|Comments|
-|6|SSLNetVConnection|提供了SSL会话协议支持|
-|4|UnixNetVConnection|提供了成员保存socket fd，建立了socket fd与VIO之间的数据流逻辑|
-|3|NetVConnection|有了IP信息，但是没有提供socket fd|
-|2|VConnection|基类|
+||OSI Layer||VC Class||Comments||
+||6||SSLNetVConnection||提供了SSL会话协议支持||
+||4||UnixNetVConnection||提供了成员保存socket fd，建立了socket fd与VIO之间的数据流逻辑||
+||3||NetVConnection||有了IP信息，但是没有提供socket fd||
+||2||VConnection||基类||
 
 ## 定义
 
