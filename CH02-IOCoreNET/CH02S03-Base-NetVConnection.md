@@ -4,10 +4,16 @@
 
 | OSI Layer |       VC Class     | Comments                                                      |
 |:---------:|-------------------:|:--------------------------------------------------------------|
-|     6     |  SSLNetVConnection | 提供了SSL会话协议支持                                         |
+|     6     |  SSLNetVConnection | 提供了SSL会话协议支持，提供保存SSL Session的成员              |
 |     4     | UnixNetVConnection | 提供了成员保存socket fd，建立了socket fd与VIO之间的数据流逻辑 |
-|     3     |     NetVConnection | 有了IP信息，但是没有提供socket fd                             |
+|     3     |     NetVConnection | 有了保存IP信息的成员，但是没有保存socket fd的成员             |
 |     2     |        VConnection | 基类                                                          |
+
+NetVConnection是IOCoreNET部分非常基础、非常古老的抽象类。
+
+本质上来说，NetVConnection及其派生类是用于连接一个FD与VIO(MIOBuffer)的状态机。
+
+在ATS中有很多状态机也叫做VC，如：TransformVC，他们继承自VConnection，他们连接的对象与NetVConnection不同。
 
 ## 定义
 
