@@ -143,8 +143,9 @@ PS：参考I_IOBuffer.h的876行及913行。
 ### IOBufferBlock链表释放过程的递归调用分析（真的会出现Stack Overflow吗？）
 
 首先，假定我们拥有两个IOBufferReader分别为 LA 和 LF
-- 此时A，B，C，E，F的引用计数器都为1，只有D的引用计数器为2。
-- 对应的IOBufferBlock的链表关系如下图：
+
+  - 此时A，B，C，E，F的引用计数器都为1，只有D的引用计数器为2。
+  - 对应的IOBufferBlock的链表关系如下图：
 
 ```
              +-----+------+     +-----+------+     +-----+------+     +-----+------+     +-----+------+
@@ -157,13 +158,15 @@ LF.block---->| F 1 | next |----------------------------------------------+
 ```
 
 然后，我们调用IOBufferReader::clear()将LA完全释放掉：
-- LA.clear()中执行了block=NULL;
+
+  - LA.clear()中执行了block=NULL;
 
 由于block的定义是：```Ptr<IOBufferBlock> block;```
-- 因此上面操作中的等号被Ptr重载
-- Ptr把NULL赋值给A.block
-- Ptr把A的引用计数减1，变成0
-- 当引用计数为0，Ptr会调用A.free()
+
+  - 因此上面操作中的等号被Ptr重载
+  - Ptr把NULL赋值给A.block
+  - Ptr把A的引用计数减1，变成0
+  - 当引用计数为0，Ptr会调用A.free()
 
 ```
 LA.block---->NULL
@@ -178,12 +181,13 @@ LF.block---->| F 1 | next |----------------------------------------------+
 ```
 
 进入A.free()方法后，会首先由A.clear()方法进行操作
-- A.data=NULL; 释放IOBufferData
-- 由于A.next指向B，所以如果A被释放了，也需要对B的引用计数减1
-- 然后发现B的引用计数也变成0了，B也要释放
-- 在递归调用B.free()之前
-   - 首先把C.m_ptr保存到n，这样不至于在释放B之后丢掉了C的地址
-   - 然后把B.next指向NULL，就是断开与C的指向
+
+  - A.data=NULL; 释放IOBufferData
+  - 由于A.next指向B，所以如果A被释放了，也需要对B的引用计数减1
+  - 然后发现B的引用计数也变成0了，B也要释放
+  - 在递归调用B.free()之前
+     - 首先把C.m_ptr保存到n，这样不至于在释放B之后丢掉了C的地址
+     - 然后把B.next指向NULL，就是断开与C的指向
 
 ```
 LA.block---->NULL
@@ -198,11 +202,12 @@ LF.block---->| F 1 | next |----------------------------------------------+
 ```
 
 进入B.free()方法后，会首先由B.clear()方法进行操作
-- B.data=NULL; 释放IOBufferData
-- 由于B.next已经被指向NULL，因此跳过while部分
-- 将B.next.m_ptr指向NULL
-- 从B.clear()方法返回B.free()，执行THREAD_FREE()释放B
-- 返回A.clear()继续执行
+
+  - B.data=NULL; 释放IOBufferData
+  - 由于B.next已经被指向NULL，因此跳过while部分
+  - 将B.next.m_ptr指向NULL
+  - 从B.clear()方法返回B.free()，执行THREAD_FREE()释放B
+  - 返回A.clear()继续执行
 
 ```
 LA.block---->NULL
@@ -217,12 +222,13 @@ LF.block---->| F 1 | next |----------------------------------------------+
 ```
 
 重新返回到A.clear()
-- 把C的地址从n中取回来，将其赋值给p，因此p=C，然后继续while循环
-- 其实这里你可以认为A.next指向了C，因为A.clear()初次while循环时p=A.next=B
-- 然后将C的引用减1，也变成0了，B也要释放
-- 在递归调用C.free()之前
-   - 首先把D.m_ptr保存到n，这样不至于在释放C之后丢掉了D的地址
-   - 然后把C.next指向NULL，就是断开与D的指向
+
+  - 把C的地址从n中取回来，将其赋值给p，因此p=C，然后继续while循环
+  - 其实这里你可以认为A.next指向了C，因为A.clear()初次while循环时p=A.next=B
+  - 然后将C的引用减1，也变成0了，B也要释放
+  - 在递归调用C.free()之前
+     - 首先把D.m_ptr保存到n，这样不至于在释放C之后丢掉了D的地址
+     - 然后把C.next指向NULL，就是断开与D的指向
 
 ```
 LA.block---->NULL
@@ -237,11 +243,12 @@ LF.block---->| F 1 | next |----------------------------------------------+
 ```
 
 进入C.free()方法后，会首先由C.clear()方法进行操作
-- C.data=NULL; 释放IOBufferData
-- 由于C.next已经被指向NULL，因此跳过while部分
-- 将C.next.m_ptr指向NULL
-- 从C.clear()方法返回C.free()，执行THREAD_FREE()释放C
-- 返回A.clear()继续执行
+
+  - C.data=NULL; 释放IOBufferData
+  - 由于C.next已经被指向NULL，因此跳过while部分
+  - 将C.next.m_ptr指向NULL
+  - 从C.clear()方法返回C.free()，执行THREAD_FREE()释放C
+  - 返回A.clear()继续执行
 
 ```
 LA.block---->NULL
@@ -256,10 +263,11 @@ LF.block---->| F 1 | next |----------------------------------------------+
 ```
 
 重新返回到A.clear()
-- 把D的地址从n中取回来，将其赋值给p，因此p=D，然后继续while循环
-- 然后将D的引用减1，发现D的引用计数没有变成0而是1，说明还有其它链表使用了C，因此不能继续释放C
-- 将A.next.m_ptr指向NULL
-- 从A.clear()方法返回A.free()，执行THREAD_FREE()释放A
+
+  - 把D的地址从n中取回来，将其赋值给p，因此p=D，然后继续while循环
+  - 然后将D的引用减1，发现D的引用计数没有变成0而是1，说明还有其它链表使用了C，因此不能继续释放C
+  - 将A.next.m_ptr指向NULL
+  - 从A.clear()方法返回A.free()，执行THREAD_FREE()释放A
 
 ```
 LA.block---->NULL
@@ -274,15 +282,16 @@ LF.block---->| F 1 | next |----------------------------------------------+
 ```
 
 这里的示例使用的链表比较小，但是仍然可以看到释放的过程是一个递归的过程：
-- 因为，在当前节点释放后，next节点的引用也需要减1
-- 所以，在释放当前节点的时候，首先看一下next节点是否存在
-   - 如果存在，就对next节点的引用计数减1
-   - 如果在减1之后，next节点的引用计数变成0了，那么就需要先释放next节点指向的元素。
-- 释放该元素的流程如下：
-   - 首先，保存被释放元素的next节点到n，并将next节点指向NULL，这样就使得next节点成为一个孤节点。
-   - 然后，通过free()释放next节点
-   - 然后，将n作为next节点，循环做判断。
-- 所以对于一个block=A[1]->B[1]->C[1]->D[2]->E[1]->NULL的链表（括号内表示引用计数器的值），在free整个链表的时候的调用栈如下：
+
+  - 因为，在当前节点释放后，next节点的引用也需要减1
+  - 所以，在释放当前节点的时候，首先看一下next节点是否存在
+     - 如果存在，就对next节点的引用计数减1
+     - 如果在减1之后，next节点的引用计数变成0了，那么就需要先释放next节点指向的元素。
+  - 释放该元素的流程如下：
+     - 首先，保存被释放元素的next节点到n，并将next节点指向NULL，这样就使得next节点成为一个孤节点。
+     - 然后，通过free()释放next节点
+     - 然后，将n作为next节点，循环做判断。
+  - 所以对于一个block=A[1]->B[1]->C[1]->D[2]->E[1]->NULL的链表（括号内表示引用计数器的值），在free整个链表的时候的调用栈如下：
 
 ```
 block=NULL
