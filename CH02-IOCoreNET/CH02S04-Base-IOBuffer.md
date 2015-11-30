@@ -60,13 +60,22 @@ inkcoreapi extern Allocator ioBufAllocator[DEFAULT_BUFFER_SIZES];
     - 一个指向MIOBuffer的指针
 
 ```
-                +------[read]------> MIOBufferAccessor ------[write]-----+
-                |                                                        V
-          IOBufferReader <------------------[read]------------------> MIOBuffer
-                |                                                        |
-          IOBufferBlock ---- IOBufferBlock ---- IOBufferBlock ---- IOBufferBlock ----> NULL
-                |                  |                  |                  |
-          IOBufferData       IOBufferData       IOBufferData       IOBufferData
+      IOBufferReader  -----[entry.read]------+ 
+        ||     ||                            V
+      block   mbuf                   MIOBufferAccessor
+        ||     ||                            |
+        ||  MIOBuffer <----[mbuf.write]------+
+        ||     ||
+        ||  _writer
+        ||     ||
+      IOBufferBlock ===> IOBufferBlock ===> IOBufferBlock ===> NULL
+           ||                 ||                 ||
+         _data              _data              _data
+           ||                 ||                 ||
+      IOBufferData       IOBufferData       IOBufferData
+
+|| or = means member reference
+|  or - means method path
 ```
 
 总结一下：
@@ -615,6 +624,8 @@ IOBufferReader
   - 内部成员 智能指针 block 指向多个IOBufferBlock构成的单链表的第一个元素。
   - 内部成员 mbuf 指回到创建此IOBufferReader实例的MIOBuffer实例。
 
+看上去 IOBufferReader 是可以直接访问 IOBufferBlock 链表的，但是其内部成员 mbuf 又决定了它是为 MIOBuffer 设计的。
+
 ### 定义
 
 ```
@@ -656,15 +667,6 @@ public:
   // 只初始化 block，start_offset, size_limit 三个成员
   void reset();
 
-  /**
-    Consume a number of bytes from this reader's IOBufferBlock
-    list. Advances the current position in the IOBufferBlock list of
-    this reader by n bytes.
-
-    @param n number of bytes to consume. It must be less than or equal
-      to read_avail().
-
-  */
   // 记录消费 n 字节数据，n 必须小于 read_avail()
   // 在消费时，自动指针 block 会逐个指向 block->next
   // 本函数只是记录消费的状态，具体数据的读取操作，仍然要访问成员mbuf，或者block里的底层数据块来进行
@@ -674,114 +676,45 @@ public:
   // 通过直接调用 mbuf->clone_reader(this) 来实现
   IOBufferReader *clone();
 
-  /**
-    Deallocate this reader. Removes and deallocates this reader from
-    the underlying MIOBuffer. This IOBufferReader object must not be
-    used after this call.
-
-  */
   // 释放当前实例，之后就不能再使用该实例了
   // 通过直接调用 mbuf->dealloc_reader(this) 来实现
   void dealloc();
 
-  /**
-    Get a pointer to the first block with data. Returns a pointer to
-    the first IOBufferBlock in the block chain with data available for
-    this reader
-
-    @return pointer to the first IOBufferBlock in the list with data
-      available for this reader.
-
-  */
   // 返回 block 成员
   IOBufferBlock *get_current_block();
 
-  /**
-    Consult this reader's MIOBuffer writable space. Queries the MIOBuffer
-    associated with this reader about the amount of writable space
-    available without adding any blocks on the buffer and returns true
-    if it is less than the water mark.
-
-    @return true if the MIOBuffer associated with this IOBufferReader
-      returns true in MIOBuffer::current_low_water().
-
-  */
+  // 当前剩余可写入空间是否处于低限状态
+  // 直接调用 mbuf->current_low_water() 实现
+  // 判断规则如下：
+  //     在不增加block的情况下，当前MIOBuffer类型的成员 mbuf 可写入的空间，
+  //     如果低于water_mark值，则返回true，否则返回false
+  // return mbuf->current_write_avail() <= mbuf->water_mark;
   bool current_low_water();
 
-  /**
-    Queries the underlying MIOBuffer about. Returns true if the amount
-    of writable space after adding a block on the underlying MIOBuffer
-    is less than its water mark. This function call may add blocks to
-    the MIOBuffer (see MIOBuffer::low_water()).
-
-    @return result of MIOBuffer::low_water() on the MIOBuffer for
-      this reader.
-
-  */
+  // 当前剩余可写入空间是否处于低限状态
+  // 直接调用 mbuf->low_water() 实现
+  // 与 current_low_water() 相似，但是在返回ture时表示追加了一个空的block到 mbuf
+  // return mbuf->write_avail() <= mbuf->water_mark;
   bool low_water();
 
-  /**
-    To see if the amount of data available to the reader is greater than
-    the MIOBuffer's water mark. Indicates whether the amount of data
-    available to this reader exceeds the water mark for this reader's
-    MIOBuffer.
-
-    @return true if the amount of data exceeds the MIOBuffer's water mark.
-
-  */
+  // 当前可读取数据是否高于低限
+  // return read_avail() >= mbuf->water_mark;
   bool high_water();
 
-  /**
-    Perform a memchr() across the list of IOBufferBlocks. Returns the
-    offset from the current start point of the reader to the first
-    occurence of character 'c' in the buffer.
-
-    @param c character to look for.
-    @param len number of characters to check. If len exceeds the number
-      of bytes available on the buffer or INT64_MAX is passed in, the
-      number of bytes available to the reader is used. It is independent
-      of the offset value.
-    @param offset number of the bytes to skip over before beginning
-      the operation.
-    @return -1 if c is not found, otherwise position of the first
-      ocurrence.
-
-  */
+  // 在 IOBufferBlock 链表上执行 memchr 的操作，但是在ATS中好像没有使用到这个方法
+  // 返回 -1 表示没有找到 c，否则返回 c 首次在 IOBufferBlock 链表中出现的偏移值
   inkcoreapi int64_t memchr(char c, int64_t len = INT64_MAX, int64_t offset = 0);
 
-  /**
-    Copies and consumes data. Copies len bytes of data from the buffer
-    into the supplied buffer, which must be allocated prior to the call
-    and it must be at large enough for the requested bytes. Once the
-    data is copied, it consumed from the reader.
-
-    @param buf in which to place the data.
-    @param len bytes to copy and consume. If 'len' exceeds the bytes
-      available to the reader, the number of bytes available is used
-      instead.
-
-    @return number of bytes copied and consumed.
-
-  */
+  // 从当前的 IOBufferBlock 链表，复制 len 长度的数据到 buf，buf 必须事先分配好空间
+  // 如果 len 超过了当前可读取的数据长度，则使用当前可读取数据的长度作为 len 值
+  // 通过 consume() 消费已经读取完成的Block
+  // 返回实际复制的数据长度
   inkcoreapi int64_t read(void *buf, int64_t len);
 
-  /**
-    Copy data but do not consume it. Copies 'len' bytes of data from
-    the current buffer into the supplied buffer. The copy skips the
-    number of bytes specified by 'offset' beyond the current point of
-    the reader. It also takes into account the current start_offset value.
-
-    @param buf in which to place the data. The pointer is modified after
-      the call and points one position after the end of the data copied.
-    @param len bytes to copy. If len exceeds the bytes available to the
-      reader or INT64_MAX is passed in, the number of bytes available is
-      used instead. No data is consumed from the reader in this operation.
-    @param offset bytes to skip from the current position. The parameter
-      is modified after the call.
-    @return pointer to one position after the end of the data copied. The
-      parameter buf is set to this value also.
-
-  */
+  // 从当前的 IOBufferBlock 链表的当前位置，偏移 offset 字节开始，复制 len 长度的数据到 buf
+  // 但是与 read() 不同，该操作不执行 consume() 操作
+  // 返回指针，指向 memcpy 向 buf 中写入数据的结尾；如果没有发生写操作，则等于 buf
+  // 例如，当offset超过当前可读数据的最大值，返回值就等于 buf
   inkcoreapi char *memcpy(const void *buf, int64_t len = INT64_MAX, int64_t offset = 0);
 
   /**
@@ -795,8 +728,13 @@ public:
     @return reference to the character in that position.
 
   */
+  // 重载下标操作符 reader[i]，可以像使用数组一样使用IOBufferReader
+  // 使用时需要注意不要让 i 超出界限，否则会抛出异常
+  // 这里没有使用 const char 来声明返回值的类型，但是我们仍然应该只从 IOBufferReader 中读取数据，
+  //     虽然没有硬性限制不可向其写入，但是实际上这里不应该使用 reader[i] = x; 的代码
   char &operator[](int64_t i);
 
+  // 返回成员 mbuf
   MIOBuffer *
   writer() const
   {
@@ -808,25 +746,26 @@ public:
     return mbuf;
   }
 
+  // 如果与 MIOBufferAccessor 关联，则指向 MIOBufferAccessor
   MIOBufferAccessor *accessor; // pointer back to the accessor
 
-  /**
-    Back pointer to this object's MIOBuffer. A pointer back to the
-    MIOBuffer this reader is allocated from.
-
-  */
+  // 指向分配此 IOBufferReader 的MIOBuffer
   MIOBuffer *mbuf;
+  // 智能指针 block 在初始情况指向 MIOBuffer 里的 IOBufferBlock 的链表头
+  // 随着 consume() 的使用，block 逐个指向 block->next
   Ptr<IOBufferBlock> block;
 
-  /**
-    Offset beyond the shared start(). The start_offset is used in the
-    calls that copy or consume data and is an offset at the beginning
-    of the available data.
-
-  */
+  // start_offset 用来标记当前可用数据与 block 成员的偏移位置
+  // 每次 block＝block->next，start_offset都会重新计算
+  // 通常情况下 start_offset 不会大于当前 block 的可用数据长度
+  // 如果超过，则在 skip_empty_blocks() 中会跳过无用的 block 并修正该值
   int64_t start_offset;
+  
+  // 好像没什么用处，在初始化的时候、reset()时被设置为INT64_MAX
+  // 其它对 size_limit 修改的地方都是判断不等于INT64_MAX的情况才做修改
   int64_t size_limit;
 
+  // 构造函数
   IOBufferReader() : accessor(NULL), mbuf(NULL), start_offset(0), size_limit(INT64_MAX) {}
 };
 ```
