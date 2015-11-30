@@ -362,19 +362,75 @@ IOBufferData是最底层的内存单元，实现了内存的分配和释放，�
   - 可以通过 new_constant_IOBufferData() 创建一个实例
   - 它的实例占用的内存空间由 ioDataAllocator 分配
 
-### 方法
+### 定义
 
-- block_size 返回分配的内存大小
-- dealloc 释放之前由alloc分配，由该类管理的内存。
-- alloc 根据size_index和type来分配内存，如果之前已经分配过，会先执行dealloc操作
-- data 返回_data成员
-- free 首先执行dealloc，然后释放该对象。因此执行该方法后就不能再使用和引用该对象了。
+```
+class IOBufferData : public RefCountObj
+{
+public:
+  // 返回分配的内存大小
+  int64_t block_size();
 
-### 成员变量
+  // 释放之前由alloc分配，由该类管理的内存。
+  void dealloc();
 
-- \_size_index 表示内存块的字节数，通过公式128*2^size_index 来得出。
-- _mem_type 内存分配类型，AllocType枚举值
-- _data 指向内存块的指针
+  // 根据size_index和type来分配内存，如果之前已经分配过，会先执行dealloc操作
+  void alloc(int64_t size_index, AllocType type = DEFAULT_ALLOC);
+
+  // 返回 _data 成员
+  char *
+  data()
+  {
+    return _data;
+  }
+
+  // 重载 char * 操作，返回 _data 成员
+  operator char *() { return _data; }
+
+  // 释放 IOBufferData 实例自身
+  // 首先执行dealloc，然后释放IOBuffeData对象自身（通过 ioDataAllocator 回收内存资源）
+  // 因此,执行该方法后就不能再使用和引用该对象了
+  virtual void free();
+
+  // 表示内存块的字节数，通过公式128*2^size_index 来得出
+  int64_t _size_index;
+
+  // 内存分配类型，AllocType枚举值
+  // NO_ALLOC 表示当前未分配，用于延时分配。
+  AllocType _mem_type;
+
+  // 指向内存块的指针
+  char *_data;
+
+#ifdef TRACK_BUFFER_USER
+  const char *_location;
+#endif
+
+  /**
+    Constructor. Initializes state for a IOBufferData object. Do not use
+    this method. Use one of the functions with the 'new_' prefix instead.
+
+  */
+  // 构造函数，初始化IOBufferData
+  // 但是不要直接使用这个方法，需要时，请通过 new_IOBufferData 获得一个实例
+  IOBufferData()
+    : _size_index(BUFFER_SIZE_NOT_ALLOCATED), _mem_type(NO_ALLOC), _data(NULL)
+#ifdef TRACK_BUFFER_USER
+      ,
+      _location(NULL)
+#endif
+  {
+  }
+
+private:
+  // declaration only
+  IOBufferData(const IOBufferData &);
+  IOBufferData &operator=(const IOBufferData &);
+};
+
+// 声明一个全局分配此类型实例的 ClassAllocator
+inkcoreapi extern ClassAllocator<IOBufferData> ioDataAllocator;
+```
 
 ## 基础组件：IOBufferBlock
 
@@ -393,40 +449,164 @@ IOBufferBlock 用于链接多个IOBufferData，构成更大的存储单元，实
   - 可以通过 new_IOBufferBlock() 创建一个实例
   - 它的实例占用的内存空间由 ioBlockAllocator 分配
 
-### 方法
+### 定义
 
-- buf 返回指向底层数据块的指针
-- start 返回指向正在使用数据区域的开始位置的指针
-- end 返回指向正在使用数据区域的结束位置的指针
-- buf_end 返回指向底层数据块结束位置的指针
-- size 返回正在使用的数据区域的大小， end - start
-- read_avail 对于读操作可以读取的长度，与size等价
-- write_avail 对于写操作可以继续写入的长度，表示可用的空间大小，buf_end - end
-- block_size 底层数据块的大小，IOBufferData->block_size()
-- consume 减少正在使用的数据区域，start＋＝len
-- fill 增加正在使用的数据区域，end＋＝len，但是首先要用end()获取当前的数据区域的结尾，然后拷贝数据到结尾后，再调用此方法
-- reset 重置正在使用的数据区域，start＝end＝buf，之后read_avail＝＝0, buf_end＝buf＋block_size
-- clone 克隆IOBufferBlock，但是底层数据块不会被克隆，所以克隆出来的实例引用同一个底层数据块，并且write_avail＝＝0, 就是buf_end＝end
-- clear 重置data＝buf_end＝end＝start＝NULL，并且对next指向的下一个Block做引用计数减少操作
-- alloc 分配一块长度为i的buffer给data
-- dealloc 同clear
-- set 将IOBufferData与该Block实例建立引用关系，可以通过len和offset指定仅使用部分Data。start＝buf＋offset，end＝start＋len，buf_end＝start＋block_size
-- set_internal 通过内部调用建立一个没有分配内存块的IOBufferData实例，然后将已经分配好的内存指针赋值给IOBufferData实例，其它与set相同
-- free 首先调用dealloc，然后再释放该实例占用的内存，注意此Block引用的底层IOBufferData不会受到影响
+```
+class IOBufferBlock : public RefCountObj
+{
+public:
+  // 返回指向底层数据块 IOBufferData 的指针
+  char *
+  buf()
+  {
+    return data->_data;
+  }
 
-### 成员变量
+  // 返回 _start 成员变量，指向正在使用数据区域的开始位置的指针
+  char *
+  start()
+  {
+    return _start;
+  }
 
-- 
-- 
--
+  // 返回 _end 成员变量，指向正在使用数据区域的结束位置的指针
+  char *
+  end()
+  {
+    return _end;
+  }
 
+  // 返回 _buf_end 成员变量，指向底层数据块结束位置的指针
+  char *
+  buf_end()
+  {
+    return _buf_end;
+  }
+
+  // 返回 _end - _start 的值，表示正在使用的数据区域的大小
+  int64_t
+  size()
+  {
+    return (int64_t)(_end - _start);
+  }
+
+  // 返回 _end - _start 的值，表示对于读操作可以读取的长度，与size()等价
+  int64_t
+  read_avail()
+  {
+    return (int64_t)(_end - _start);
+  }
+
+  // 返回 _buf_end - _end 的值，表示对于写操作可以继续写入的长度，表示可用的空间大小
+  int64_t
+  write_avail()
+  {
+    return (int64_t)(_buf_end - _end);
+  }
+
+  // 返回底层数据块的大小，调用 IOBufferData->block_size() 方法
+  int64_t
+  block_size()
+  {
+    return data->block_size();
+  }
+
+  // 减少正在使用的数据区域，_start -= len
+  void consume(int64_t len);
+
+  // 增加正在使用的数据区域，_end＋＝len
+  // 但是，首先要用end()获取当前的数据区域的结尾，然后拷贝数据到结尾后，再调用此方法
+  // 注意，不能超过 _buf_end，就是 len <= write_avail()
+  void fill(int64_t len);
+
+  // 重置正在使用的数据区域，_start＝_end＝buf()，_buf_end＝buf()＋block_size()
+  // 重置之后，read_avail()＝＝0，write_avail()＝＝block_size()
+  void reset();
+
+  // 克隆IOBufferBlock，但是底层数据块IOBufferData不会被克隆，所以克隆出来的IOBufferBlock实例引用同一个底层数据块
+  // 注意，克隆出来的IOBufferBlock实例的 write_avail()＝＝0，就是buf_end＝end
+  IOBufferBlock *clone();
+
+  // 清除底层数据快，注意与reset()的区别
+  // 本操作通过 data＝NULL 只断开当前Block与底层数据块的连接，底层数据块是否被释放／回收，由其引用计数决定。
+  // 由于IOBufferBlock是一个链表，因此要递归将 next 的引用计数减少，如果减为0时，还要调用 free() 释放 next 指向的Block
+  // 最后，data＝_buf_end＝_end＝_start＝next＝NULL
+  // 事实上可以把 clear 看做析构函数，除了不释放Block自身
+  // 如果需要重新使用这个Block，可以通过 alloc() 重新分配底层数据块
+  void clear();
+
+  // 分配一块长度索引值为 i 的 buffer 给 data，并通过 reset() 方法初始化
+  void alloc(int64_t i = default_large_iobuffer_size);
+
+  // 直接调用 clear() 方法
+  void dealloc();
+
+  // 将IOBufferData与该Block实例建立引用关系
+  // 可以通过 len 和 offset 指定仅引用Data的一部分
+  // _start＝buf()＋offset，_end＝_start＋len，_buf_end＝buf()＋block_size()
+  // 注：源代码有一个古老的bug，在写这篇笔记时被发现，TS-3754
+  void set(IOBufferData *d, int64_t len = 0, int64_t offset = 0);
+  // 通过内部调用建立一个没有立即分配内存块的IOBufferData实例
+  // 然后将已经分配好的内存指针赋值给IOBufferData实例，其它与set相同
+  void set_internal(void *b, int64_t len, int64_t asize_index);
+  
+  // 把当前数据复制到 b，然后调用 dealloc() 释放数据块，然后调用set_internal()
+  // 最后让新数据块的size()与原数据块一致: _end = _start + old_size
+  void realloc_set_internal(void *b, int64_t buf_size, int64_t asize_index);
+  // 同：realloc_set_internal(b, buf_size, BUFFER_SIZE_NOT_ALLOCATED)
+  void realloc(void *b, int64_t buf_size);
+  // 通过 ioBufAllocator[i].alloc_void() 来分配一个缓冲区 b，然后调用realloc_set_internal()
+  void realloc(int64_t i);
+  
+  // xmalloc分配模式，未做分析 **
+  void realloc_xmalloc(void *b, int64_t buf_size);
+  void realloc_xmalloc(int64_t buf_size);
+
+  // 释放IOBufferBlock实例自身
+  // 首先调用dealloc，然后通过 ioBlockAllocator 回收内存。
+  virtual void free();
+
+  // 指向数据区内可读取的第一个字节
+  char *_start;
+  // 指向数据区内可写入的第一个字节，也是最后可读取字节的下一个字节
+  char *_end;
+  // 指向整个数据区的最后的位置，边界，此位置已经不能写入数据了
+  char *_buf_end;
+
+#ifdef TRACK_BUFFER_USER
+  const char *_location;
+#endif
+
+  // 指向IOBufferData类型的智能指针，上述_start, _end, _buf_end指针范围都落在其成员 _data 内
+  // 若更改 data 的指向，则必须重新设置 _start, _end, _buf_end
+  Ptr<IOBufferData> data;
+
+  // 为了形成Block链表，next 是指向下一个Block的智能指针
+  Ptr<IOBufferBlock> next;
+
+  // 构造函数，初始化IOBufferBlock
+  // 但是不要直接使用这个方法，需要时，请通过 new_IOBufferBlock 获得一个实例
+  IOBufferBlock();
+
+private:
+  IOBufferBlock(const IOBufferBlock &);
+  IOBufferBlock &operator=(const IOBufferBlock &);
+};
+
+// 声明一个全局分配此类型实例的 ClassAllocator
+extern inkcoreapi ClassAllocator<IOBufferBlock> ioBlockAllocator;
+```
 
 ## 基础组件：IOBufferReader
 
 IOBufferReader
 
-  - 不依赖MIOBuffer。
+  - 不依赖MIOBuffer
+    - 当多个读取者从同一个MIOBuffer中读取数据时，每一个读取者都需要标记自己从哪里开始读，总共读多少数据，当前读了多少
+    - 此时不能直接修改MIOBuffer中的指针，而通过IOBufferReader来描述这些元素
   - 用于读取一组IOBufferBlock。
+    - 通过MIOBuffer来创建IOBufferReader时，是直接从MIOBuffer中复制IOBufferBlock的成员
+    - 因此实际上是对IOBufferBlock进行读取操作
   - IOBufferReader表示一个给定的缓冲区数据的消费者从哪儿开始读取数据。
   - 提供了一个统一的界面，可以轻松访问一组IOBufferBlock内包含的数据。
   - IOBufferReader 内部封装了自动移除数据块的判断逻辑。
@@ -435,18 +615,221 @@ IOBufferReader
   - 内部成员 智能指针 block 指向多个IOBufferBlock构成的单链表的第一个元素。
   - 内部成员 mbuf 指回到创建此IOBufferReader实例的MIOBuffer实例。
 
-### 方法
+### 定义
 
-- 
-- 
-- 
+```
+class IOBufferReader
+{
+public:
+  // 返回可供消费（读取）数据区域的开始位置（通过成员 start_offset 协助）
+  // 返回 NULL 表示没有关联数据块
+  char *start();
 
+  // 返回可供消费（读取）数据在第一个数据块（IOBufferBlock）里的结束位置
+  // 返回 NULL 表示没有关联数据块
+  char *end();
 
-### 成员变量
+  // 返回当前所有数据块里面剩余可消费（读取）的数据长度
+  // 遍历所有的数据块，累加每一个数据块内的可用数据长度再减去代表已经消费数据长度的 start_offset
+  int64_t read_avail();
 
-- 
-- 
--
+  // 返回当前所有数据块里面剩余可消费（读取）的数据长度是否大于 size
+  bool is_read_avail_more_than(int64_t size);
+
+  // 返回当前所有数据块里面剩余可消费（读取）的数据块的数量
+  // 随着数据的消费（读取）：
+  //     成员 block 逐个指向链表中的下一个 IOBufferBlock，
+  //     成员 start_offset 也会按照新的Block的信息重新设置
+  int block_count();
+
+  // 返回可供消费（读取）数据在第一个数据块里的长度
+  int64_t block_read_avail();
+
+  // 根据 start_offset 的值，跳过不需要的 block
+  // start_offset 的值必须在 [ 0, block->size() ) 范围内
+  void skip_empty_blocks();
+
+  // 清除所有成员变量，IOBufferReader将不可用
+  void clear();
+
+  // 重置IOBufferReader的状态，成员 mbuf 和 accessor 不会被重置
+  // 只初始化 block，start_offset, size_limit 三个成员
+  void reset();
+
+  /**
+    Consume a number of bytes from this reader's IOBufferBlock
+    list. Advances the current position in the IOBufferBlock list of
+    this reader by n bytes.
+
+    @param n number of bytes to consume. It must be less than or equal
+      to read_avail().
+
+  */
+  // 记录消费 n 字节数据，n 必须小于 read_avail()
+  // 在消费时，自动指针 block 会逐个指向 block->next
+  // 本函数只是记录消费的状态，具体数据的读取操作，仍然要访问成员mbuf，或者block里的底层数据块来进行
+  void consume(int64_t n);
+
+  // 克隆当前实例，复制当前的状态和指向同样的IOBufferBlock，以及同样的start_offset值
+  // 通过直接调用 mbuf->clone_reader(this) 来实现
+  IOBufferReader *clone();
+
+  /**
+    Deallocate this reader. Removes and deallocates this reader from
+    the underlying MIOBuffer. This IOBufferReader object must not be
+    used after this call.
+
+  */
+  // 释放当前实例，之后就不能再使用该实例了
+  // 通过直接调用 mbuf->dealloc_reader(this) 来实现
+  void dealloc();
+
+  /**
+    Get a pointer to the first block with data. Returns a pointer to
+    the first IOBufferBlock in the block chain with data available for
+    this reader
+
+    @return pointer to the first IOBufferBlock in the list with data
+      available for this reader.
+
+  */
+  // 返回 block 成员
+  IOBufferBlock *get_current_block();
+
+  /**
+    Consult this reader's MIOBuffer writable space. Queries the MIOBuffer
+    associated with this reader about the amount of writable space
+    available without adding any blocks on the buffer and returns true
+    if it is less than the water mark.
+
+    @return true if the MIOBuffer associated with this IOBufferReader
+      returns true in MIOBuffer::current_low_water().
+
+  */
+  bool current_low_water();
+
+  /**
+    Queries the underlying MIOBuffer about. Returns true if the amount
+    of writable space after adding a block on the underlying MIOBuffer
+    is less than its water mark. This function call may add blocks to
+    the MIOBuffer (see MIOBuffer::low_water()).
+
+    @return result of MIOBuffer::low_water() on the MIOBuffer for
+      this reader.
+
+  */
+  bool low_water();
+
+  /**
+    To see if the amount of data available to the reader is greater than
+    the MIOBuffer's water mark. Indicates whether the amount of data
+    available to this reader exceeds the water mark for this reader's
+    MIOBuffer.
+
+    @return true if the amount of data exceeds the MIOBuffer's water mark.
+
+  */
+  bool high_water();
+
+  /**
+    Perform a memchr() across the list of IOBufferBlocks. Returns the
+    offset from the current start point of the reader to the first
+    occurence of character 'c' in the buffer.
+
+    @param c character to look for.
+    @param len number of characters to check. If len exceeds the number
+      of bytes available on the buffer or INT64_MAX is passed in, the
+      number of bytes available to the reader is used. It is independent
+      of the offset value.
+    @param offset number of the bytes to skip over before beginning
+      the operation.
+    @return -1 if c is not found, otherwise position of the first
+      ocurrence.
+
+  */
+  inkcoreapi int64_t memchr(char c, int64_t len = INT64_MAX, int64_t offset = 0);
+
+  /**
+    Copies and consumes data. Copies len bytes of data from the buffer
+    into the supplied buffer, which must be allocated prior to the call
+    and it must be at large enough for the requested bytes. Once the
+    data is copied, it consumed from the reader.
+
+    @param buf in which to place the data.
+    @param len bytes to copy and consume. If 'len' exceeds the bytes
+      available to the reader, the number of bytes available is used
+      instead.
+
+    @return number of bytes copied and consumed.
+
+  */
+  inkcoreapi int64_t read(void *buf, int64_t len);
+
+  /**
+    Copy data but do not consume it. Copies 'len' bytes of data from
+    the current buffer into the supplied buffer. The copy skips the
+    number of bytes specified by 'offset' beyond the current point of
+    the reader. It also takes into account the current start_offset value.
+
+    @param buf in which to place the data. The pointer is modified after
+      the call and points one position after the end of the data copied.
+    @param len bytes to copy. If len exceeds the bytes available to the
+      reader or INT64_MAX is passed in, the number of bytes available is
+      used instead. No data is consumed from the reader in this operation.
+    @param offset bytes to skip from the current position. The parameter
+      is modified after the call.
+    @return pointer to one position after the end of the data copied. The
+      parameter buf is set to this value also.
+
+  */
+  inkcoreapi char *memcpy(const void *buf, int64_t len = INT64_MAX, int64_t offset = 0);
+
+  /**
+    Subscript operator. Returns a reference to the character at the
+    specified position. You must ensure that it is within an appropriate
+    range.
+
+    @param i positions beyond the current point of the reader. It must
+      be less than the number of the bytes available to the reader.
+
+    @return reference to the character in that position.
+
+  */
+  char &operator[](int64_t i);
+
+  MIOBuffer *
+  writer() const
+  {
+    return mbuf;
+  }
+  MIOBuffer *
+  allocated() const
+  {
+    return mbuf;
+  }
+
+  MIOBufferAccessor *accessor; // pointer back to the accessor
+
+  /**
+    Back pointer to this object's MIOBuffer. A pointer back to the
+    MIOBuffer this reader is allocated from.
+
+  */
+  MIOBuffer *mbuf;
+  Ptr<IOBufferBlock> block;
+
+  /**
+    Offset beyond the shared start(). The start_offset is used in the
+    calls that copy or consume data and is an offset at the beginning
+    of the available data.
+
+  */
+  int64_t start_offset;
+  int64_t size_limit;
+
+  IOBufferReader() : accessor(NULL), mbuf(NULL), start_offset(0), size_limit(INT64_MAX) {}
+};
+```
 
 ## 基础组件：MIOBuffer
 
@@ -467,6 +850,373 @@ MIOBuffer
   - 成员 IOBufferReader readers[MAX_MIOBUFFER_READERS] 定义了多重读（消费者），默认最大值5。
   - 可以通过 new\_MIOBuffer() 创建一个实例，free\_MIOBuffer(mio) 销毁一个实例。
   - 它的实例占用的内存空间由 ioAllocator 分配
+
+### 定义
+
+```
+class MIOBuffer
+{
+public:
+  /**
+    Increase writer's inuse area. Instructs the writer associated with
+    this MIOBuffer to increase the inuse area of the block by as much as
+    'len' bytes.
+
+    @param len number of bytes to add to the inuse area of the block.
+
+  */
+  void fill(int64_t len);
+
+  /**
+    Adds a block to the end of the block list. The block added to list
+    must be writable by this buffer and must not be writable by any
+    other buffer.
+
+  */
+  void append_block(IOBufferBlock *b);
+
+  /**
+    Adds a new block to the end of the block list. The size is determined
+    by asize_index. See the remarks section for a mapping of indexes to
+    buffer block sizes.
+
+  */
+  void append_block(int64_t asize_index);
+
+  /**
+    Adds new block to the end of block list using the block size for
+    the buffer specified when the buffer was allocated.
+
+  */
+  void add_block();
+
+  /**
+    Adds by reference len bytes of data pointed to by b to the end
+    of the buffer.  b MUST be a pointer to the beginning of  block
+    allocated from the ats_xmalloc() routine. The data will be deallocated
+    by the buffer once all readers on the buffer have consumed it.
+
+  */
+  void append_xmalloced(void *b, int64_t len);
+
+  /**
+    Adds by reference len bytes of data pointed to by b to the end of the
+    buffer. b MUST be a pointer to the beginning of  block allocated from
+    ioBufAllocator of the corresponding index for fast_size_index. The
+    data will be deallocated by the buffer once all readers on the buffer
+    have consumed it.
+
+  */
+  void append_fast_allocated(void *b, int64_t len, int64_t fast_size_index);
+
+  /**
+    Adds the nbytes worth of data pointed by rbuf to the buffer. The
+    data is copied into the buffer. write() does not respect watermarks
+    or buffer size limits. Users of write must implement their own flow
+    control. Returns the number of bytes added.
+
+  */
+  inkcoreapi int64_t write(const void *rbuf, int64_t nbytes);
+
+#ifdef WRITE_AND_TRANSFER
+  /**
+    Same functionality as write but for the one small difference. The
+    space available in the last block is taken from the original and
+    this space becomes available to the copy.
+
+  */
+  inkcoreapi int64_t write_and_transfer_left_over_space(IOBufferReader *r, int64_t len = INT64_MAX, int64_t offset = 0);
+#endif
+
+  /**
+    Add by data from IOBufferReader r to the this buffer by reference. If
+    len is INT64_MAX, all available data on the reader is added. If len is
+    less than INT64_MAX, the smaller of len or the amount of data on the
+    buffer is added. If offset is greater than zero, than the offset
+    bytes of data at the front of the reader are skipped. Bytes skipped
+    by offset reduce the number of bytes available on the reader used
+    in the amount of data to add computation. write() does not respect
+    watermarks or buffer size limits. Users of write must implement
+    their own flow control. Returns the number of bytes added. Each
+    write() call creates a new IOBufferBlock, even if it is for one
+    byte. As such, it's necessary to exercise caution in any code that
+    repeatedly transfers data from one buffer to another, especially if
+    the data is being read over the network as it may be coming in very
+    small chunks. Because deallocation of outstanding buffer blocks is
+    recursive, it's possible to overrun the stack if too many blocks
+    have been added to the buffer chain. It's imperative that users
+    both implement their own flow control to prevent too many bytes
+    from becoming outstanding on a buffer that the write() call is
+    being used and that care be taken to ensure the transfers are of a
+    minimum size. Should it be necessary to make a large number of small
+    transfers, it's preferable to use a interface that copies the data
+    rather than sharing blocks to prevent a build of blocks on the buffer.
+
+  */
+  inkcoreapi int64_t write(IOBufferReader *r, int64_t len = INT64_MAX, int64_t offset = 0);
+
+  int64_t remove_append(IOBufferReader *);
+
+  /**
+    Returns a pointer to the first writable block on the block chain.
+    Returns NULL if there are not currently any writable blocks on the
+    block list.
+
+  */
+  IOBufferBlock *
+  first_write_block()
+  {
+    if (_writer) {
+      if (_writer->next && !_writer->write_avail())
+        return _writer->next;
+      ink_assert(!_writer->next || !_writer->next->read_avail());
+      return _writer;
+    } else
+      return NULL;
+  }
+
+
+  char *
+  buf()
+  {
+    IOBufferBlock *b = first_write_block();
+    return b ? b->buf() : 0;
+  }
+  char *
+  buf_end()
+  {
+    return first_write_block()->buf_end();
+  }
+  char *
+  start()
+  {
+    return first_write_block()->start();
+  }
+  char *
+  end()
+  {
+    return first_write_block()->end();
+  }
+
+  /**
+    Returns the amount of space of available for writing on the first
+    writable block on the block chain (the one that would be reutrned
+    by first_write_block()).
+
+  */
+  int64_t block_write_avail();
+
+  /**
+    Returns the amount of space of available for writing on all writable
+    blocks currently on the block chain.  Will NOT add blocks to the
+    block chain.
+
+  */
+  int64_t current_write_avail();
+
+  /**
+    Adds blocks for writing if the watermark criteria are met. Returns
+    the amount of space of available for writing on all writable blocks
+    on the block chain after a block due to the watermark criteria.
+
+  */
+  int64_t write_avail();
+
+  /**
+    Returns the default data block size for this buffer.
+
+  */
+  int64_t block_size();
+
+  /**
+    Returns the default data block size for this buffer.
+
+  */
+  int64_t
+  total_size()
+  {
+    return block_size();
+  }
+
+  /**
+    Returns true if amount of the data outstanding on the buffer exceeds
+    the watermark.
+
+  */
+  bool
+  high_water()
+  {
+    return max_read_avail() > water_mark;
+  }
+
+  /**
+    Returns true if the amount of writable space after adding a block on
+    the buffer is less than the water mark. Since this function relies
+    on write_avail() it may add blocks.
+
+  */
+  bool
+  low_water()
+  {
+    return write_avail() <= water_mark;
+  }
+
+  /**
+    Returns true if amount the amount writable space without adding and
+    blocks on the buffer is less than the water mark.
+
+  */
+  bool
+  current_low_water()
+  {
+    return current_write_avail() <= water_mark;
+  }
+  void set_size_index(int64_t size);
+
+  /**
+    Allocates a new IOBuffer reader and sets it's its 'accessor' field
+    to point to 'anAccessor'.
+
+  */
+  IOBufferReader *alloc_accessor(MIOBufferAccessor *anAccessor);
+
+  /**
+    Allocates an IOBufferReader for this buffer. IOBufferReaders hold
+    data on the buffer for different consumers. IOBufferReaders are
+    REQUIRED when using buffer. alloc_reader() MUST ONLY be a called
+    on newly allocated buffers. Calling on a buffer with data already
+    placed on it will result in the reader starting at an indeterminate
+    place on the buffer.
+
+  */
+  IOBufferReader *alloc_reader();
+
+  /**
+    Allocates a new reader on this buffer and places it's starting
+    point at the same place as reader r. r MUST be a pointer to a reader
+    previous allocated from this buffer.
+
+  */
+  IOBufferReader *clone_reader(IOBufferReader *r);
+
+  /**
+    Deallocates reader e from this buffer. e MUST be a pointer to a reader
+    previous allocated from this buffer. Reader need to allocated when a
+    particularly consumer is being removed from the buffer but the buffer
+    is still in use. Deallocation is not necessary when the buffer is
+    being freed as all outstanding readers are automatically deallocated.
+
+  */
+  void dealloc_reader(IOBufferReader *e);
+
+  /**
+    Deallocates all outstanding readers on the buffer.
+
+  */
+  void dealloc_all_readers();
+
+  void set(void *b, int64_t len);
+  void set_xmalloced(void *b, int64_t len);
+  void alloc(int64_t i = default_large_iobuffer_size);
+  void alloc_xmalloc(int64_t buf_size);
+  void append_block_internal(IOBufferBlock *b);
+  int64_t puts(char *buf, int64_t len);
+
+  // internal interface
+
+  bool
+  empty()
+  {
+    return !_writer;
+  }
+  int64_t max_read_avail();
+
+  int max_block_count();
+  void check_add_block();
+
+  IOBufferBlock *get_current_block();
+
+  void
+  reset()
+  {
+    if (_writer) {
+      _writer->reset();
+    }
+    for (int j = 0; j < MAX_MIOBUFFER_READERS; j++)
+      if (readers[j].allocated()) {
+        readers[j].reset();
+      }
+  }
+
+  void
+  init_readers()
+  {
+    for (int j = 0; j < MAX_MIOBUFFER_READERS; j++)
+      if (readers[j].allocated() && !readers[j].block)
+        readers[j].block = _writer;
+  }
+
+  void
+  dealloc()
+  {
+    _writer = NULL;
+    dealloc_all_readers();
+  }
+
+  void
+  clear()
+  {
+    dealloc();
+    size_index = BUFFER_SIZE_NOT_ALLOCATED;
+    water_mark = 0;
+  }
+
+  void
+  realloc(int64_t i)
+  {
+    _writer->realloc(i);
+  }
+  void
+  realloc(void *b, int64_t buf_size)
+  {
+    _writer->realloc(b, buf_size);
+  }
+  void
+  realloc_xmalloc(void *b, int64_t buf_size)
+  {
+    _writer->realloc_xmalloc(b, buf_size);
+  }
+  void
+  realloc_xmalloc(int64_t buf_size)
+  {
+    _writer->realloc_xmalloc(buf_size);
+  }
+
+  int64_t size_index;
+
+  /**
+    Determines when to stop writing or reading. The watermark is the
+    level to which the producer (filler) is required to fill the buffer
+    before it can expect the reader to consume any data.  A watermark
+    of zero means that the reader will consume any amount of data,
+    no matter how small.
+
+  */
+  int64_t water_mark;
+
+  Ptr<IOBufferBlock> _writer;
+  IOBufferReader readers[MAX_MIOBUFFER_READERS];
+
+#ifdef TRACK_BUFFER_USER
+  const char *_location;
+#endif
+
+  MIOBuffer(void *b, int64_t bufsize, int64_t aWater_mark);
+  MIOBuffer(int64_t default_size_index);
+  MIOBuffer();
+  ~MIOBuffer();
+};
+```
 
 ### 方法
 
@@ -498,6 +1248,69 @@ MIOBufferAccessor
 
   - IOBuffer 读（消费者）、写（生产者）的封装
   - 它将MIOBuffer和IOBufferReader封装在一起
+
+### 定义
+
+```
+struct MIOBufferAccessor {
+  IOBufferReader *
+  reader()
+  {
+    return entry;
+  }
+
+  MIOBuffer *
+  writer()
+  {
+    return mbuf;
+  }
+
+  int64_t
+  block_size() const
+  {
+    return mbuf->block_size();
+  }
+
+  int64_t
+  total_size() const
+  {
+    return block_size();
+  }
+
+  void reader_for(IOBufferReader *abuf);
+  void reader_for(MIOBuffer *abuf);
+  void writer_for(MIOBuffer *abuf);
+
+  void
+  clear()
+  {
+    mbuf = NULL;
+    entry = NULL;
+  }
+
+  MIOBufferAccessor()
+    :
+#ifdef DEBUG
+      name(NULL),
+#endif
+      mbuf(NULL), entry(NULL)
+  {
+  }
+
+  ~MIOBufferAccessor();
+
+#ifdef DEBUG
+  const char *name;
+#endif
+
+private:
+  MIOBufferAccessor(const MIOBufferAccessor &);
+  MIOBufferAccessor &operator=(const MIOBufferAccessor &);
+
+  MIOBuffer *mbuf;
+  IOBufferReader *entry;
+};
+```
 
 ### 方法
 
