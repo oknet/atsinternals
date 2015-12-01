@@ -796,37 +796,21 @@ MIOBuffer
 class MIOBuffer
 {
 public:
-  /**
-    Increase writer's inuse area. Instructs the writer associated with
-    this MIOBuffer to increase the inuse area of the block by as much as
-    'len' bytes.
+  // MIOBuffer 的写操作部分
 
-    @param len number of bytes to add to the inuse area of the block.
-
-  */
+  // 将当前正在使用的数据区域扩大 len 字节（增加了可读数据量，减少了可写空间）
+  // 直接对IOBufferBlock链表 _writer 成员进行操作，如果当前剩余的可写空间不足，会自动追加空的 block
   void fill(int64_t len);
 
-  /**
-    Adds a block to the end of the block list. The block added to list
-    must be writable by this buffer and must not be writable by any
-    other buffer.
-
-  */
+  // 向IOBufferBlock链表 _writer 成员追加 block
+  // Block *b必须是当前MIOBuffer可写，其它MIOBuffer不可写
   void append_block(IOBufferBlock *b);
 
-  /**
-    Adds a new block to the end of the block list. The size is determined
-    by asize_index. See the remarks section for a mapping of indexes to
-    buffer block sizes.
-
-  */
+  // 向IOBufferBlock链表 _writer 成员追加指定大小的空 block
   void append_block(int64_t asize_index);
 
-  /**
-    Adds new block to the end of block list using the block size for
-    the buffer specified when the buffer was allocated.
-
-  */
+  // 向IOBufferBlock链表 _writer 成员追加当前MIOBuffer默认大小的空 block
+  // 直接调用了 append_block(size_index)
   void add_block();
 
   /**
@@ -848,60 +832,46 @@ public:
   */
   void append_fast_allocated(void *b, int64_t len, int64_t fast_size_index);
 
-  /**
-    Adds the nbytes worth of data pointed by rbuf to the buffer. The
-    data is copied into the buffer. write() does not respect watermarks
-    or buffer size limits. Users of write must implement their own flow
-    control. Returns the number of bytes added.
-
-  */
+  // 将 rbuf 内，长度为 nbytes 字节的数据，写入 IOBufferBlock 成员 _writer
+  // 返回值为实际发生的写入字节数
+  // 不检测 watermark 和 size_limit，但是剩余可写空间不足时会追加 block。
+  // 如果需要流量控制，调用者需要自己实现，本方法没有实现流量控制功能
+  // PS：write 是多态定义，下面还有一种 write 的定义
   inkcoreapi int64_t write(const void *rbuf, int64_t nbytes);
 
 #ifdef WRITE_AND_TRANSFER
-  /**
-    Same functionality as write but for the one small difference. The
-    space available in the last block is taken from the original and
-    this space becomes available to the copy.
-
-  */
+  // 基本与下面的 write() 相同
+  // 但是把最后一个克隆出来的 block 的写入权限从 IOBufferReader *r 引用的MIOBuffer转到了当前MIOBuffer
+  // PS: 每一次追加到 block 链表，_writer 成员会指向新添加的这个 block，因为 _writer 成员总是指向第一个可写入的 block
   inkcoreapi int64_t write_and_transfer_left_over_space(IOBufferReader *r, int64_t len = INT64_MAX, int64_t offset = 0);
 #endif
 
-  /**
-    Add by data from IOBufferReader r to the this buffer by reference. If
-    len is INT64_MAX, all available data on the reader is added. If len is
-    less than INT64_MAX, the smaller of len or the amount of data on the
-    buffer is added. If offset is greater than zero, than the offset
-    bytes of data at the front of the reader are skipped. Bytes skipped
-    by offset reduce the number of bytes available on the reader used
-    in the amount of data to add computation. write() does not respect
-    watermarks or buffer size limits. Users of write must implement
-    their own flow control. Returns the number of bytes added. Each
-    write() call creates a new IOBufferBlock, even if it is for one
-    byte. As such, it's necessary to exercise caution in any code that
-    repeatedly transfers data from one buffer to another, especially if
-    the data is being read over the network as it may be coming in very
-    small chunks. Because deallocation of outstanding buffer blocks is
-    recursive, it's possible to overrun the stack if too many blocks
-    have been added to the buffer chain. It's imperative that users
-    both implement their own flow control to prevent too many bytes
-    from becoming outstanding on a buffer that the write() call is
-    being used and that care be taken to ensure the transfers are of a
-    minimum size. Should it be necessary to make a large number of small
-    transfers, it's preferable to use a interface that copies the data
-    rather than sharing blocks to prevent a build of blocks on the buffer.
-
-  */
+  // 跳过 IOBufferReader 开始的 offset 字节的数据后，通过 clone() 复制当前 block，
+  // 通过 append_block() 将新的 block 追加到 IOBufferBlock 成员 _writer，
+  // 直到完成长度为 len 的数据（或剩余全部数据／INT64_MAX）的处理。
+  // 返回值为实际发生的写入字节数
+  // 以下为源代码中的注释直接翻译：
+  // 不检测 watermark 和 size_limit，但是剩余可写空间不足时会追加 block。
+  // 如果需要流量控制，调用者需要自己实现，本方法没有实现流量控制功能
+  // 即使一个 block 中的可用数据只有 1 个字节，也会克隆整个 block，
+  // 因此，当在两个 MIOBuffer 之间传输数据时需要小心处理，
+  // 尤其是源MIOBuffer的数据是从网络上读取得到时，因为接收的数据可能都是很小的数据块。
+  // 由于 Block 的释放是一个递归过程，当有太多的 Block 在链表中时，如果释放可能导致调用栈溢出（这里应该有错误，见上面的分析）
+  // 在使用 write() 方法时，建议由调用者来进行流量控制，避免链表内的 block 太多，另外要控制使用克隆方式传送数据的最小字节数。
+  // 如果遇到大量小数据块的传送，建议使用第一种write()方法复制数据，而不是使用克隆 block 的方式。
+  // PS: 不会修改 IOBufferReader *r 的数据消费情况。
   inkcoreapi int64_t write(IOBufferReader *r, int64_t len = INT64_MAX, int64_t offset = 0);
 
+  // 把 IOBufferReader *r 里面的 block 链表转移到当前MIOBuffer
+  // IOBufferReader *r 原来的 block 链接则会被清空
+  // 返回所有被转移的数据长度
+  // 基本上可以认为这是一个concat操作
   int64_t remove_append(IOBufferReader *);
 
-  /**
-    Returns a pointer to the first writable block on the block chain.
-    Returns NULL if there are not currently any writable blocks on the
-    block list.
-
-  */
+  // 返回第一个可写的 block
+  // 通常 _writer 指向第一个可写的 block，
+  // 但是极特殊情况，当前 block 被写满了，那么就是 block->next 是第一个可写的 block
+  // 如果返回 NULL 表示没有可写的 block
   IOBufferBlock *
   first_write_block()
   {
@@ -914,43 +884,37 @@ public:
       return NULL;
   }
 
-
+  // 返回第一个可写的 block 的 buf()
   char *
   buf()
   {
     IOBufferBlock *b = first_write_block();
     return b ? b->buf() : 0;
   }
+  // 返回第一个可写的 block 的 buf_end()
   char *
   buf_end()
   {
     return first_write_block()->buf_end();
   }
+  // 返回第一个可写的 block 的 start()
   char *
   start()
   {
     return first_write_block()->start();
   }
+  // 返回第一个可写的 block 的 end()
   char *
   end()
   {
     return first_write_block()->end();
   }
 
-  /**
-    Returns the amount of space of available for writing on the first
-    writable block on the block chain (the one that would be reutrned
-    by first_write_block()).
-
-  */
+  // 返回第一个可写的 block 的剩余可写空间
   int64_t block_write_avail();
 
-  /**
-    Returns the amount of space of available for writing on all writable
-    blocks currently on the block chain.  Will NOT add blocks to the
-    block chain.
-
-  */
+  // 返回所有 block 的剩余可写空间
+  // 此操作不会追加空的 block 到链表尾部
   int64_t current_write_avail();
 
   /**
@@ -959,29 +923,24 @@ public:
     on the block chain after a block due to the watermark criteria.
 
   */
+  // 返回所有 block 的剩余可写空间
+  // 如果：可读数据小于 watermark值 并且 剩余可写空间小于等于 watermark 值
+  //     那么自动追加空的 block 到链表尾部
+  // 返回值也包含了新追加的 block 的空间
   int64_t write_avail();
 
-  /**
-    Returns the default data block size for this buffer.
-
-  */
+  // 返回该MIOBuffer申请 block 时使用的缺省尺寸
+  // 该值在创建MIOBuffer时传入由构造函数初始化，保存在成员 size_index 中。
   int64_t block_size();
 
-  /**
-    Returns the default data block size for this buffer.
-
-  */
+  // 同block_size，貌似被废弃了，没有见到代码中有使用
   int64_t
   total_size()
   {
     return block_size();
   }
 
-  /**
-    Returns true if amount of the data outstanding on the buffer exceeds
-    the watermark.
-
-  */
+  // 可读取数据长度超过 watermark 值时返回 true
   bool
   high_water()
   {
@@ -994,24 +953,31 @@ public:
     on write_avail() it may add blocks.
 
   */
+  // 可写空间小于等于 water_mark 值时返回 true
+  // 此方法通过 write_avail 来获得当前剩余可写空间的大小，因此可能会追加空的 block
   bool
   low_water()
   {
     return write_avail() <= water_mark;
   }
 
-  /**
-    Returns true if amount the amount writable space without adding and
-    blocks on the buffer is less than the water mark.
-
-  */
+  // 可写空间小于等于 water_mark 值时返回 true
+  // 此方法不会追加空的 block
   bool
   current_low_water()
   {
     return current_write_avail() <= water_mark;
   }
+  
+  // 根据size的值选择一个最小的值，用来设置成员 size_index
+  // 例如：
+  //     当size＝128时，选择size_index为0，此时计算出来的block size＝128
+  //     当size＝129时，选择size_index为1，此时计算出来的block size＝256
   void set_size_index(int64_t size);
 
+
+  // MIOBuffer 的读操作部分
+  
   /**
     Allocates a new IOBuffer reader and sets it's its 'accessor' field
     to point to 'anAccessor'.
