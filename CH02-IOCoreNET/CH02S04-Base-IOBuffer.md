@@ -740,6 +740,9 @@ public:
   {
     return mbuf;
   }
+  // 当一个IOBufferReader已经与一个MIOBuffer关联之后，就会设置mbuf指向该MIOBuffer
+  // 通过这个方法来判断当前的IOBufferReader是否已经与MIOBuffer关联
+  // 返回与之关联的MIOBuffer指针，或NULL表示未关联
   MIOBuffer *
   allocated() const
   {
@@ -793,6 +796,8 @@ MIOBuffer
 ### 定义
 
 ```
+#define MAX_MIOBUFFER_READERS 5
+
 class MIOBuffer
 {
 public:
@@ -978,11 +983,9 @@ public:
 
   // MIOBuffer 的读操作部分
   
-  /**
-    Allocates a new IOBuffer reader and sets it's its 'accessor' field
-    to point to 'anAccessor'.
-
-  */
+  // 从 readers[] 成员分配一个可用的IOBufferReader，并且设置该Reader的accessor成员指向anAccessor
+  // 一个Reader必须与MIOBuffer关联，如果一个MIOBufferAccessor与MIOBuffer关联，
+  //     那么与MIOBuffer关联的IOBufferReader也必须与MIOBufferAccessor关联
   IOBufferReader *alloc_accessor(MIOBufferAccessor *anAccessor);
 
   /**
@@ -994,14 +997,19 @@ public:
     place on the buffer.
 
   */
+  // 从 readers[] 成员分配一个可用的IOBufferReader
+  // 与alloc_accessor不同，本方法将accessor成员指向NULL
+  // 当一个MIOBuffer创建后，必须创建至少一个IOBufferReader。
+  // 如果在MIOBuffer中填充了数据之后才创建IOBufferReader，那么IOBufferReader可能无法从数据的开头进行读取。
+  // PS: 由于使用了自动指针Ptr，而 _writer 又总是指向第一个可写的block，
+  //     那么随着 _writer 指针的移动，最早创建的block就会失去它的引用者，就会被Ptr自动释放
+  //     所以在创建MIOBuffer之后，首先就要创建一个IOBufferReader，
+  //     以保证最早创建的block被引用，这样就不会被Ptr自动释放了
   IOBufferReader *alloc_reader();
 
-  /**
-    Allocates a new reader on this buffer and places it's starting
-    point at the same place as reader r. r MUST be a pointer to a reader
-    previous allocated from this buffer.
-
-  */
+  // 从 readers[] 成员分配一个可用的IOBufferReader
+  // 然后从 r 的成员 block, start_offset, size_limit 复制到刚分配的IOBufferReader
+  // 但是需要注意，r 必须是readers[] 成员中的一个，否则对block 的访问会出现问题
   IOBufferReader *clone_reader(IOBufferReader *r);
 
   /**
@@ -1012,18 +1020,24 @@ public:
     being freed as all outstanding readers are automatically deallocated.
 
   */
+  // 释放IOBufferReader，但是 e 必须是readers[] 成员中的一个
+  // 如果 e 关联了 accessor，那么还会调用 e->accessor->clear()，那么 accessor 就无法对MIOBuffer进行读、写操作了
+  // 然后调用 e->clear()，在clear中必须设置mbuf＝NULL
   void dealloc_reader(IOBufferReader *e);
 
-  /**
-    Deallocates all outstanding readers on the buffer.
-
-  */
+  // 逐个释放 readers[] 的每一个成员
   void dealloc_all_readers();
 
+  // 使用一个预分配的数据块初始化MIOBuffer
+  // 并且将已经分配的IOBufferReader也指向此数据块
   void set(void *b, int64_t len);
   void set_xmalloced(void *b, int64_t len);
+  // 使用指定的size_index值创建一个空内存块，初始化MIOBuffer
+  // 并且将已经分配的IOBufferReader也指向此空内存块
+  // 同时会使用新的size_index值更新MIOBuffer成员size_index
   void alloc(int64_t i = default_large_iobuffer_size);
   void alloc_xmalloc(int64_t buf_size);
+  // 追加 IOBufferBlock *b 到 _writer->next
   void append_block_internal(IOBufferBlock *b);
   int64_t puts(char *buf, int64_t len);
 
