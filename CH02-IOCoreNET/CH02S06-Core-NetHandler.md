@@ -317,8 +317,9 @@ NetHandler::process_enabled_list(NetHandler *nh)
           Debug("iocore_net_main", "Unhandled epoll event on write: 0x%04x write.enabled=%d closed=%d write.netready_queue=%d",
                 get_ev_events(pd, x), vc->write.enabled, vc->closed, write_ready_list.in(vc));
         }
-      // 如果不是写事件也没有错误的情况。
-      // 这儿不是所有的读事件都会触发了？？？？？？
+      // 如果不是写事件也没有错误的情况。这儿不是所有的读事件都会触发了？？？？？？
+      // 下面的 if 语句有bug，已提交官方并修复：TS-3969
+      // 该bug只是影响debug时的输出，并不对ATS的工作流程产生影响
       } else if (!(get_ev_events(pd, x) & EVENTIO_ERROR)) {
         // 就输出一个DEBUG信息
         Debug("iocore_net_main", "Unhandled epoll event: 0x%04x", get_ev_events(pd, x));
