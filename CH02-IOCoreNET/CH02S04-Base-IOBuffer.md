@@ -922,12 +922,6 @@ public:
   // 此操作不会追加空的 block 到链表尾部
   int64_t current_write_avail();
 
-  /**
-    Adds blocks for writing if the watermark criteria are met. Returns
-    the amount of space of available for writing on all writable blocks
-    on the block chain after a block due to the watermark criteria.
-
-  */
   // 返回所有 block 的剩余可写空间
   // 如果：可读数据小于 watermark值 并且 剩余可写空间小于等于 watermark 值
   //     那么自动追加空的 block 到链表尾部
@@ -952,12 +946,6 @@ public:
     return max_read_avail() > water_mark;
   }
 
-  /**
-    Returns true if the amount of writable space after adding a block on
-    the buffer is less than the water mark. Since this function relies
-    on write_avail() it may add blocks.
-
-  */
   // 可写空间小于等于 water_mark 值时返回 true
   // 此方法通过 write_avail 来获得当前剩余可写空间的大小，因此可能会追加空的 block
   bool
@@ -988,15 +976,6 @@ public:
   //     那么与MIOBuffer关联的IOBufferReader也必须与MIOBufferAccessor关联
   IOBufferReader *alloc_accessor(MIOBufferAccessor *anAccessor);
 
-  /**
-    Allocates an IOBufferReader for this buffer. IOBufferReaders hold
-    data on the buffer for different consumers. IOBufferReaders are
-    REQUIRED when using buffer. alloc_reader() MUST ONLY be a called
-    on newly allocated buffers. Calling on a buffer with data already
-    placed on it will result in the reader starting at an indeterminate
-    place on the buffer.
-
-  */
   // 从 readers[] 成员分配一个可用的IOBufferReader
   // 与alloc_accessor不同，本方法将accessor成员指向NULL
   // 当一个MIOBuffer创建后，必须创建至少一个IOBufferReader。
@@ -1012,14 +991,6 @@ public:
   // 但是需要注意，r 必须是readers[] 成员中的一个，否则对block 的访问会出现问题
   IOBufferReader *clone_reader(IOBufferReader *r);
 
-  /**
-    Deallocates reader e from this buffer. e MUST be a pointer to a reader
-    previous allocated from this buffer. Reader need to allocated when a
-    particularly consumer is being removed from the buffer but the buffer
-    is still in use. Deallocation is not necessary when the buffer is
-    being freed as all outstanding readers are automatically deallocated.
-
-  */
   // 释放IOBufferReader，但是 e 必须是readers[] 成员中的一个
   // 如果 e 关联了 accessor，那么还会调用 e->accessor->clear()，那么 accessor 就无法对MIOBuffer进行读、写操作了
   // 然后调用 e->clear()，在clear中必须设置mbuf＝NULL
@@ -1028,6 +999,9 @@ public:
   // 逐个释放 readers[] 的每一个成员
   void dealloc_all_readers();
 
+
+  // MIOBuffer 的设置／初始化部分
+  
   // 使用一个预分配的数据块初始化MIOBuffer
   // 并且将已经分配的IOBufferReader也指向此数据块
   void set(void *b, int64_t len);
@@ -1037,12 +1011,21 @@ public:
   // 同时会使用新的size_index值更新MIOBuffer成员size_index
   void alloc(int64_t i = default_large_iobuffer_size);
   void alloc_xmalloc(int64_t buf_size);
-  // 追加 IOBufferBlock *b 到 _writer->next
+  // 追加 IOBufferBlock *b 到 _writer->next，然后让 _writer 指向 b
+  // 注意，这个操作会导致 _writer->next 的引用计数减少
+  // 如果 b->next 不为 NULL，则遍历 _writer，直到 _writer->next == NULL
   void append_block_internal(IOBufferBlock *b);
+  // 向当前数据块写入以 \0 或 \n 结尾的字符串 s，最大长度 len，写入内容包括 \0 或 \n
+  // 返回0，如果当前数据块的剩余可写空间不足
+  // 返回-1，如果在len长度内仍然没有找到 \0 或 \n
+  // 返回实际写入的长度，当成功时
+  // PS：len 包含了 \0 或 \n 的1个字节在内
   int64_t puts(char *buf, int64_t len);
 
-  // internal interface
 
+  // 以下仅限内部使用
+
+  // 判断是否为空MIOBuffer，就是没有block
   bool
   empty()
   {
@@ -1050,11 +1033,18 @@ public:
   }
   int64_t max_read_avail();
 
+  // 遍历 readers[] 成员内每一个Reader的block数量，找到最大值
   int max_block_count();
+  
+  // 根据 water_mark 值，判断是否需要追加block
+  // 如果需要则追加
+  // 相关逻辑请参阅：理解 water_mark
   void check_add_block();
 
+  // 获得第一个可写入的 block
   IOBufferBlock *get_current_block();
 
+  // 分别调用 block 和 所有 reader 的 reset() 重置MIOBuffer
   void
   reset()
   {
@@ -1067,6 +1057,8 @@ public:
       }
   }
 
+  // 初始化已分配的 reader
+  // 将 reader 的 block 指向 _writer 引用的 IOBufferBlock 链表
   void
   init_readers()
   {
@@ -1075,6 +1067,7 @@ public:
         readers[j].block = _writer;
   }
 
+  // 释放 block 和 所有 reader
   void
   dealloc()
   {
@@ -1082,6 +1075,8 @@ public:
     dealloc_all_readers();
   }
 
+  // 清除所有成员的状态，首先调用dealoc()，
+  // 然后设置 size_index 为 BUFFER_SIZE_NOT_ALLOCATED，water_mark = 0
   void
   clear()
   {
@@ -1090,11 +1085,15 @@ public:
     water_mark = 0;
   }
 
+  // 为当前 block 重新分配一个更大的内存块
   void
   realloc(int64_t i)
   {
     _writer->realloc(i);
   }
+  
+  // 为当前 block 重新分配一个更大的内存块，
+  // 然后将 b 指向的内存块的内容复制到新分配的内存块
   void
   realloc(void *b, int64_t buf_size)
   {
@@ -1111,55 +1110,67 @@ public:
     _writer->realloc_xmalloc(buf_size);
   }
 
+  // 记录当前缺省内存块大小的索引值
   int64_t size_index;
 
-  /**
-    Determines when to stop writing or reading. The watermark is the
-    level to which the producer (filler) is required to fill the buffer
-    before it can expect the reader to consume any data.  A watermark
-    of zero means that the reader will consume any amount of data,
-    no matter how small.
-
-  */
+  // 决定何时停止写和读
+  // 例如: 需要至少读取多少字节，才触发上层状态机
+  //       需要还有多少剩余空间，才分配新的block，等
+  // PS：需要通过上层状态机配合实现
   int64_t water_mark;
 
+  // 指向第一个可写入数据的IOBufferBlock
   Ptr<IOBufferBlock> _writer;
+  // 保存可以读取此MIOBuffer的IOBufferReader，默认值最大为 5 个
   IOBufferReader readers[MAX_MIOBUFFER_READERS];
 
 #ifdef TRACK_BUFFER_USER
   const char *_location;
 #endif
 
+  // 构造函数
+  // 使用预分配的内存块初始化MIOBuffer，并设置water_mark值，size_index值设置为未分配状态
   MIOBuffer(void *b, int64_t bufsize, int64_t aWater_mark);
+  // 只设置size_index值，但是不立即分配底层block
+  // 写入数据时，自动根据size_index值分配block
   MIOBuffer(int64_t default_size_index);
+  // size_index值设置为未分配状态
   MIOBuffer();
+  
+  // 析构函数
+  // 其定义同dealloc()，释放 block 和 所有 reader
   ~MIOBuffer();
 };
 ```
 
 ### 方法
 
-- inkcoreapi int64_t write(const void *rbuf, int64_t nbytes);
-   - 从rbuf复制nbytes字节到当前的IOBufferBlock
-   - 如果当前的IOBufferBlock写满了，就再追加一个到末尾，继续完成nbytes的写入
-- inkcoreapi int64_t write(IOBufferReader *r, int64_t len = INT64_MAX, int64_t offset = 0);
-   - 将r中包含的可用数据，通过clone方法进行复制，然后追加到当前的IOBufferBlock链表。
-   - 需要注意的是clone方法得到的IOBufferBlock是直接引用了IOBufferData，通过\_start和\_end来指定IOBufferData中被引用的部分数据，即使只有1个字节被引用，同时它不可以被写入任何数据，因此如果继续追加数据时，会创建新的Block，并追加到链表尾部。
-   - 此方法会遍历r中IOBufferBlock链表中包含的所有可读取的Block，并逐个clone。
-   - 由于在释放IOBufferBlock链表时，是一个递归调用的过程，这样会导致调用栈的叠加，如果IOBufferBlock链表过长的话，会导致调用栈溢出，因此在使用write方法时，应当尽可能避免使用IOBufferReader作为源，写入较小字节的方法。因为这样会导致IOBufferBlock链表不合理的增长。当预期写入连续多个长度较小的数据时，可以考虑使用第一种write方法，以减少IOBufferBlock链表的长度。
-- 
+详细描述一下两种 write 方法，避免混乱(多数内容来自源码注释的直接翻译)
 
-### 成员变量
+  - inkcoreapi int64_t write(const void *rbuf, int64_t nbytes);
+    - 从rbuf复制nbytes字节到当前的IOBufferBlock
+    - 如果当前的IOBufferBlock写满了，就再追加一个到末尾，继续完成nbytes的写入
+  - inkcoreapi int64_t write(IOBufferReader *r, int64_t len = INT64_MAX, int64_t offset = 0);
+    - 将r中包含的可用数据，通过clone方法进行复制，然后追加到当前的IOBufferBlock链表。
+    - 需要注意的是：
+      - clone方法得到的IOBufferBlock是直接引用了IOBufferData，通过\_start和\_end来指定IOBufferData中被引用的部分数据
+      - 即使只有1个字节被引用，也会clone一个完整的IOBufferBlock实例，同时它不可以被写入任何数据。
+      - 因此如果继续追加数据时，会创建新的Block，并追加到链表尾部。
+    - 此方法会遍历r中IOBufferBlock链表中包含的所有可读取的Block，并逐个clone，但是并不会修改 r 的读取状态。
+    - 由于在释放IOBufferBlock链表时，是一个递归调用的过程，
+      - 这样会导致调用栈的叠加，如果IOBufferBlock链表过长的话，会导致调用栈溢出**
+    - 因此在使用write方法时，
+      - 在写入大量较小字节的数据块时，应当尽可能避免使用IOBufferReader作为源，因为这样会导致IOBufferBlock链表不合理的增长。
+      - 当预期写入连续多个长度较小的数据时，可以考虑使用第一种write方法，以减少IOBufferBlock链表的长度。
 
-- water_mark
-   - 它可以用于，当你需要读取到一定数量的数据或者可用数据低于某个数量时才去执行某个操作
-   - 例如当```可读取的数据量```和```可写入的空间```同时小于此值时，才会追加新的Block到MIOBuffer。
-   - 例如我们可以设置当buf里的可用数据低于water_mark值时，才从磁盘读取数据，这样可以降低磁盘I/O，不然每次读取的数据量很小，非常浪费磁盘I/O的调度。
-   - water_mark用来表示这个最小的数量
-   - 默认值为0
-   - 
-- 
--
+### 理解 water_mark
+
+它可以用于
+
+  - 当你需要读取到一定数量的数据或者可用数据低于某个数量时才去执行某个操作
+  - 例如当```可读取的数据量```和```可写入的空间```同时小于此值时，才会追加新的Block到MIOBuffer。参考：check_add_block()
+  - 例如我们可以设置当buf里的可用数据低于water_mark值时，才从磁盘读取数据，这样可以降低磁盘I/O，不然每次读取的数据量很小，非常浪费磁盘I/O的调度。
+  - 默认值为0
 
 ## 基础组件：MIOBufferAccessor
 
@@ -1172,34 +1183,43 @@ MIOBufferAccessor
 
 ```
 struct MIOBufferAccessor {
+  // 返回 IOBufferReader
   IOBufferReader *
   reader()
   {
     return entry;
   }
 
+  // 返回 MIOBuffer
   MIOBuffer *
   writer()
   {
     return mbuf;
   }
 
+  // 返回 MIOBuffer 创建 block 时的缺省尺寸（只读）
   int64_t
   block_size() const
   {
     return mbuf->block_size();
   }
 
+  // 同 block_size()
   int64_t
   total_size() const
   {
     return block_size();
   }
 
+  // 用IOBufferReader *abuf来初始化当前accessor的读、写
   void reader_for(IOBufferReader *abuf);
+  // 用MIOBuffer *abuf来初始化当前accessor的读、写
   void reader_for(MIOBuffer *abuf);
+  // 用MIOBuffer *abuf来初始化当前accessor的写
+  // 当前accessor不可读
   void writer_for(MIOBuffer *abuf);
 
+  // 清除与 MIOBuffer 和 IOBufferReader 的关联
   void
   clear()
   {
@@ -1207,6 +1227,8 @@ struct MIOBufferAccessor {
     entry = NULL;
   }
 
+  // 构造函数
+  // 功能同clear()
   MIOBufferAccessor()
     :
 #ifdef DEBUG
@@ -1216,6 +1238,8 @@ struct MIOBufferAccessor {
   {
   }
 
+  // 析构函数
+  // 空函数
   ~MIOBufferAccessor();
 
 #ifdef DEBUG
@@ -1226,21 +1250,17 @@ private:
   MIOBufferAccessor(const MIOBufferAccessor &);
   MIOBufferAccessor &operator=(const MIOBufferAccessor &);
 
+  // 指向用于写操作的MIOBuffer
   MIOBuffer *mbuf;
+  // 指向用于读操作的IOBufferReader
   IOBufferReader *entry;
 };
 ```
 
-### 方法
-
-- 
-- 
-- 
-
-### 成员变量
-
-- 
-- 
--
-
-
+## 参考资料
+- [I_IOBuffer.h]
+(http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_IOBuffer.h)
+- [P_IOBuffer.h]
+(http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_IOBuffer.h)
+- [IOBuffer.cc]
+(http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/IOBuffer.cc)
