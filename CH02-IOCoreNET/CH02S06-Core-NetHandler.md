@@ -14,11 +14,24 @@
 在 NetHandler 中有八个队列：
 
   - Que: open_list
+    - 保存当前EThread管理的所有VC
   - Dlist: cop_list
-  - ASLLM: (read|write)_enable_list
-  - QueM: (read|write)_ready_list
+    - 在InactivityCop状态机中遍历open_list，把vc->thread==this_ethread()的vc放入这个cop_list
+    - 然后对cop_list内的vc逐个检查超时情况
+    - PS：我查阅了代码后，发现在open_list内的vc，不存在vc->thread不是this_ethread()的情况
   - Que: active_queue
+    - 由上层状态机，如HttpSM等，将vc放入，用于实现inactive timeout
+    - 在InactivityCop中，通过manage_avtive_queue来清理
   - Que: keep_alive_queue
+    - 由上层状态机，如HttpSM等，将vc放入，用于实现keep alive timeout
+    - 在InactivityCop中，通过manage_keep_alive_queue来清理
+  - ASLLM: (read|write)_enable_list
+    - 在执行异步reenable时，将vc直接放入原子队列
+    - 在EThread A中要reenable一个VC，但是这个VC是由EThread B管理的，此时就属于异步reenable
+  - QueM: (read|write)_ready_list
+    - 在NetHandler::mainNetEvent执行时，会首先将(read|write)_enable_list全部取出，导入到(read|write)_ready_list
+    - 另外在执行同步reenable时，也会将vc直接放入此队列
+    - 在EThread A中要reenable一个VC，这个VC也是由EThread A管理的，此时就属于同步reenable
 
 其中 (read|write)_enable_list 两个队列是原子队列，可以不加锁直接操作，其它六个队列都需要加锁才能操作
 
@@ -151,7 +164,9 @@ enable_list是在执行UnixNetVConnection::reenable()时，遇到无法取得net
 
 ```
 struct NetState {
+  // 表示当前VIO是否是激活的状态
   volatile int enabled;
+  // VIO 实例
   VIO vio;
   // 定义双向链表节点，可以把多个UnixNetVConnection连接起来，间接的把NetState也就联系了起来
   // ready_link有两个成员：UnixNetVConnection *prev和集成自SLINK的UnixNetVConnection *next
@@ -159,9 +174,15 @@ struct NetState {
   // 定义单向链表节点，可以把多个UnixNetVConnection连接起来，间接的把NetState也就联系了起来
   // enable_link有一个成员：UnixNetVConnection *next
   SLink<UnixNetVConnection> enable_link;
+  
+  // 表示这个vc被放入了enable_list
   int in_enabled_list;
+  
+  // 表示这个vc被epoll_wait返回
   int triggered;
 
+  // 构造函数
+  // 这里使用VIO::NONE调用VIO的构造函数初始化vio成员
   NetState() : enabled(0), vio(VIO::NONE), in_enabled_list(0), triggered(0) {}
 };
 
@@ -222,6 +243,29 @@ class NetHandler : public Continuation
 ...
 };
 ```
+
+如果VC不会跨线程操作，那么NetHandler以下成员就可以满足要求：
+
+  - ready_list 保存所有epoll_wait返回的vc
+  - 遍历 ready_list 就可以处理所有网络事件
+  - reenable 时只需要把vc添加到ready_list中即可
+
+在多线程的设计中，跨线程的资源访问是很难避免的，但是跨线程的加锁操作也会比较慢，而且还要考虑拿不到锁的时候不能阻塞EThread执行的异步情况
+
+  - NetHandler 实现了 enable_list 这两个分别用于读、写操作的原子队列
+  - 这样就可以跨线程直接向 enbale_list 添加 vc
+  - 然后 NetHandler 再从 enable_list 把 vc 转入 ready_list
+ 
+但是，我们注意到 NetHandler 的mutex竟然没有继承自EThread，而是通过 new_ProxyMutex 创建了一个新的。
+
+  - 结果就是，EThread 回调 NetHandler 时可能拿不到锁，那就会在process_event中安排重新调度
+  - 好处是，另外一个线程如果想访问 NetHandler 是可以拿到锁的
+
+问题：
+
+  - 如果其它线程可以拿到NetHandler的锁，那么为何还要设计原子队列？
+  - 如果有原子队列，为什么NetHandler的mutex不是继承自EThread呢？
+
 
 ## 主函数 NetHandler::mainNetEvent(int event, Event *e) 流程分析：
 
