@@ -272,7 +272,11 @@ class NetHandler : public Continuation
 
 首先，调用 ```process_enabled_list(this)``` 将enable_list转存到ready_list。在函数前的注释中明确了这一步操作是要把在其它线程中enabled的VC移动到ready_list中。
 
-mainNetEvent()算是NetHandler状态机的处理机（Processor），每个线程内会有一个NetHandler实例，因此在运行时会锁定ethread的mutex，只有本线程内运行的处理机才可以操作内部数据。当我们在状态机（SM）中需要处理一个关联的VC，但是这个VC在另外一个线程中管理时，那么就牵扯到夸线程的操作，此时由于无法直接操作ready_list，因此ATS IOCore实现了一个中间队列enable_list。由于enable_list是支持原子操作的，所以可以在不用加锁的情况下跨线程操作。只需要在每次处理ready_list时，首先把当前的enable_list的内容导入就可以了。
+mainNetEvent()是NetHandler状态机的回调函数，而每个线程内会有一个NetHandler实例，在回调时会锁定状态机NetHandler的mutex，只有本线程内运行的状态机才可以操作其内部数据。
+
+当我们在状态机（SM）中需要处理一个关联的VC，但是这个VC在另外一个线程中管理时，那么就牵扯到跨线程的操作，此时由于无法直接操作ready_list，因此ATS IOCore实现了一个中间队列enable_list。
+
+由于enable_list是支持原子操作的，可以在不用加锁的情况下跨线程操作，只需要在每次处理ready_list时，首先把当前的enable_list的内容导入就可以了。
 
 ```
 //
@@ -450,22 +454,24 @@ NetHandler::process_enabled_list(NetHandler *nh)
 在ATS中的表现就是，ATS只接收数据，而不转发数据出去，除非接收到了所有的数据才会开始向外发送数据。在网络速度比较快的情况下这种现象会比较明显，网速不好的情况，由于不能保证数据持续到达，因此readv可能很快就会遇到-EAGAIN错误，所以很少产生这个问题。特别是在实现Tunnel的时候，必须考虑到这种情况的出现。
 
 在write_to_net方法里，通过判断MIOBuffer的状态和调用load_buffer_and_write()函数的返回值来执行不同的处理过程：
-- 如果vio.ntodo==0，那么会忽略本次写事件，并且将此VC的WRITE VIO禁止掉，除非通过vio->reenable()恢复，否则此VC上不会再次触发写事件，返回。
-- 如果本次输出不会完成VIO（就是不会触发VC_EVENT_WRITE_COMPLETE），同时MIOBuffer还有空间可以写入数据：
-   - 先触发一次VC_EVENT_WRITE_READY事件，让状态机尝试将MIOBuffer填满。
-- 如果MIOBuffer内仍然无数据，将此VC的WRITE VIO禁止掉，返回。
-- 如果MIOBuffer有数据供输出，那么就会调用load_buffer_and_write()写数据，其返回值：
-   - 等于-EAGAIN 或 -ENOTCONN，根据need的值进行如下设定之后返回：
+
+  - 如果vio.ntodo==0
+    - 那么会忽略本次写事件，并且将此VC的WRITE VIO禁止掉，除非通过vio->reenable()恢复，否则此VC上不会再次触发写事件，返回。
+  - 如果本次输出不会完成VIO（就是不会触发VC_EVENT_WRITE_COMPLETE），同时MIOBuffer还有空间可以写入数据：
+    - 先触发一次VC_EVENT_WRITE_READY事件，让状态机尝试将MIOBuffer填满。
+  - 如果MIOBuffer内仍然无数据，将此VC的WRITE VIO禁止掉，返回。
+  - 如果MIOBuffer有数据供输出，那么就会调用load_buffer_and_write()写数据，其返回值：
+    - 等于 -EAGAIN 或 -ENOTCONN，根据need的值进行如下设定之后返回：
       - need & EVENTIO_WRITE == true，从write ready队列删除VC，但是仍然会让epoll等待此VC上的EVENTIO_WRITE事件。
       - need & EVENTIO_READ == true，从read ready队列删除VC，但是仍然会让epoll等待此VC上的EVENTIO_READ事件。
-   - 等于0 或 -ECONNRESET，触发VC_EVENT_EOS事件，返回
-   - 大于0 并且 vio.ntodo() 小于等于0，触发VC_EVENT_WRITE_COMPLETE，返回
-   - 大于0 并且 vio.ntodo() 大于0，
+    - 等于0 或 -ECONNRESET，触发VC_EVENT_EOS事件，返回
+    - 大于0 并且 vio.ntodo() 小于等于0，触发VC_EVENT_WRITE_COMPLETE，返回
+    - 大于0 并且 vio.ntodo() 大于0，
       - 如果之前触发过VC_EVENT_WRITE_READY事件，并且状态机设置了WBE EVENT，则触发WBE EVENT，返回。
       - 如果之前没有触发过VC_EVENT_WRITE_READY事件，则触发VC_EVENT_WRITE_READY事件，然后调用write_reschedule将此VC重新放回 write_ready_list队列，返回
-- 最后
-   - 在写操作之后，再次判断MIOBuffer为空，则将此VC的WRITE VIO禁止掉，返回。
-   - 根据need的值，把vc重新放回ready list队列
+  - 最后
+    - 在写操作之后，再次判断MIOBuffer为空，则将此VC的WRITE VIO禁止掉，返回。
+    - 根据need的值，把vc重新放回ready list队列
       - 如果放回write ready list则仍然会被while循环调用，
       - 如果放回read ready list则会在下一次EventSystem的调用时被处理。
       - 猜测此处是为了SSL快速完成握手操作而设置。**
@@ -478,34 +484,73 @@ NetHandler::process_enabled_list(NetHandler *nh)
 
 这是iocore核心的通信层，要保证每一次调用能够快速返回，以便与EventSystem能够及时处理新的Event。
 
+  - 所以EThread回调NetHandler状态机的频率非常的高（只要EThread空闲就调用）
+  - 这样就可以让每次epoll_wait返回的VC数量比较少，可以迅速处理完读、写两类事件的回调
+
 在这里，read是生产者，将输入的数据放入缓存中，write是消费者，负责消费缓存中的数据。
 
 为了达到高性能，那么生产者会被设计为竭尽全力填满缓冲区，消费者会竭尽全力消费缓冲区的数据。所以：
-- 一旦缓冲区有空闲空间，就要调用生产者来填满缓冲区
-- 一旦缓冲区有数据，就要调用消费者来消费缓冲区的数据
+
+  - 一旦缓冲区有空闲空间，就要调用生产者来填满缓冲区
+  - 一旦缓冲区有数据，就要调用消费者来消费缓冲区的数据
 
 当存在多个生产者和消费者时，批量处理生产者的申请，完成生产之后，再批量处理消费者的申请，完成消费，返回到EventSystem，如此算是一个循环。这样的批量设计需要一个场地（内存）摆放所有生产者生产出来的数据，然后再由消费者集中消费，那么场地（内存）的占用就会比较多。
 
+ATS这种设计是否有问题呢？
+
+  - 如果批量生产，那么生产的数据就需要暂时堆放在一处（需要内存空间来存储）
+    - 然后再批量消费，腾空堆放处（释放内存）
+    - 那么就会看到ATS对内存的使用应该是有一个波峰和波谷
+  - 有时候要接收一个大文件，就会持续生产
+    - ATS没有限制生产的次数，导致消费过程被延迟
+
 如果边生产边消费呢？
-- 在一个线程里没法并发处理两个队列，所以只能让生产者和消费者轮流进场生产和消费。
-- 由于在生产的过程中，同时也在消费，所以需要的场地就没有之前那么大。
 
-但是这种情况是否有问题？
-- 如果有一对生产者和消费者特别投脾气
-   - 一个生产，一个消费
-   - 再生产，再消费
-   - 直到生产者不再生产数据
-- 结果就是场地的占用时间变长了，如果场地是按照时间租用的，那么成本也很高。
-- 如果第一个生产者生产的内容是A，而第一个消费者想要的内容是B
-   - 消费者就会离开，不再回来，除非有生产者叫它回来
-   - 那么消费效率就降低了
-- 结果就是最后一个消费者离开了，仍然还有很多数据堆在场地里，没人要。
+  - 在一个线程里没法并发处理两个队列，所以只能让生产者和消费者轮流进场生产和消费。
+  - 由于在生产的过程中，同时也在消费，所以需要的场地就没有之前那么大。
 
-前面提到过，这个nethandler里处理读写操作占用的时间不能太久，否则EventSystem就没法及时处理新的Event，如果是边生产边消费的模型，在nethandler里处理的时间就完全不受控制了，所以这不符合EventSystem对于IO子系统的要求。
+但是这种方式是否有问题？
 
-为了避免在这里出现循环处理IO的情况，在READ READY和WRITE READY的处理函数中要考虑到：
-- READ READY 中只从读缓冲区（场地）复制有限的内容到写缓冲区（场地）
-- WRITE READY 中要保证写缓冲区（场地）不为空，同时保证读缓冲区（场地）不满
+  - 如果有一对生产者和消费者特别投脾气
+    - 一个生产，一个消费
+    - 再生产，再消费
+    - 直到生产者不再生产数据
+  - 结果就是场地的占用时间变长了，如果场地是按照时间租用的，那么成本也很高。
+  - 如果第一个生产者生产的内容是A，而第一个消费者想要的内容是B
+    - 消费者就会离开，不再回来，除非有生产者叫它回来
+    - 那么消费效率就降低了
+  - 结果就是最后一个消费者离开了，仍然还有很多数据堆在场地里，没人要。
+
+前面提到过，这个nethandler里处理读写操作占用的时间不能太久，否则EventSystem就没法及时处理新的Event
+
+  - 如果是边生产边消费的模型，在nethandler里处理的时间就完全不受控制了，
+  - 所以，这不符合EventSystem对于IO子系统的要求。
+
+所以，在ATS的IO处理中，分为读、写两个阶段：
+
+  - 首先读取数据到内存
+  - 然后处理数据
+  - 然后写数据
+  - 最后回收临时的内存空间
+
+这样的逻辑最简单和清晰。
+
+由于ATS的IO核心没有限制一个VC上的读、写触发的次数，为了避免出现循环处理IO读、写的情况，在READ READY和WRITE READY的处理函数中应该：
+
+  - READ READY 处理函数
+    - 应只从读缓冲区（场地）复制有限的内容到写缓冲区（场地）
+    - 实现对读取流量的控制，同时控制数据对内存的占用
+  - WRITE READY 处理函数
+    - 要确保以下两个条件不能同时满足
+      - 写缓冲区（场地）为空
+      - 读缓冲区（场地）满
+    - 一旦同时满足，就会导致VC被憋死，因为：
+      - 写缓冲区为空，VIO Write就会自动被禁止
+      - 读缓冲一满，VIO Read酒会呗自动禁止
+    - 通常读、写会共用同一个缓冲区（例如：Single Buffer Tunnel）
+      - 上述两个条件永远无法同时满足
+    - 但是，在一些特殊的设计时，会使用分开的两个缓冲区
+      - 就必须特别留意，不要让上面的两个条件同时满足
 
 ## 参考资料
 
