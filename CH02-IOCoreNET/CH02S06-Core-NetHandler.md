@@ -20,11 +20,13 @@
     - 然后对cop_list内的vc逐个检查超时情况
     - PS：我查阅了代码后，发现在open_list内的vc，不存在vc->thread不是this_ethread()的情况
   - Que: active_queue
-    - 由上层状态机，如HttpSM等，将vc放入，用于实现inactive timeout
-    - 在InactivityCop中，通过manage_avtive_queue来清理
+    - 由上层状态机，如HttpSM等，通过add_to_active_queue将vc放入，用于实现inactive timeout
+    - 在InactivityCop中，通过manage_active_queue来清理
+    - 另外还提供了remove_from_active_queue的方法，从队列中删除vc
   - Que: keep_alive_queue
-    - 由上层状态机，如HttpSM等，将vc放入，用于实现keep alive timeout
+    - 由上层状态机，如HttpSM等，通过add_to_keep_alive_queue将vc放入，用于实现keep alive timeout
     - 在InactivityCop中，通过manage_keep_alive_queue来清理
+    - 另外还提供了remove_from_keep_alive_queue的方法，从队列中删除vc
   - ASLLM: (read|write)_enable_list
     - 在执行异步reenable时，将vc直接放入原子队列
     - 在EThread A中要reenable一个VC，但是这个VC是由EThread B管理的，此时就属于异步reenable
