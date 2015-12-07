@@ -115,6 +115,7 @@ public:
   */
   virtual void cancel_inactivity_timeout() = 0;
 
+  // 以下四个方法是对NetHandler中对应方法的封装，其实是通过成员nh调用了NetHandler的方法
   // 添加NetVC到keep alive队列
   virtual void add_to_keep_alive_queue() = 0;
   // 从keep alive队列移除NetVC
