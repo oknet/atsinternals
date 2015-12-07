@@ -121,7 +121,8 @@ public:
   virtual void remove_from_keep_alive_queue() = 0;
   // 添加NetVC到active队列
   virtual bool add_to_active_queue() = 0;
-  // 没有从active队列移除NetVC的方法？？
+  // 这里好像漏掉了下面的方法的声明，因为在UnixNetVConnection里定义了该方法
+  // virtual void remove_from_active_queue() = 0;
 
   // 返回当前active_timeout的值（纳秒）
   virtual ink_hrtime get_active_timeout() = 0;
