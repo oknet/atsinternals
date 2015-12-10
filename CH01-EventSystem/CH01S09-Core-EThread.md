@@ -414,7 +414,7 @@ EThread::execute()
         // 事件被异步取消时
         if (e->cancelled)
           free_event(e);
-        // 立即执行事件
+        // 立即执行的事件
         else if (!e->timeout_at) { // IMMEDIATE
           ink_assert(e->period == 0);
           // 通过process_event回调状态机
@@ -447,7 +447,7 @@ EThread::execute()
         done_one = false;
         // execute all the eligible internal events
         // check_ready方法将优先级队列内的多个子队列进行重排（reschedule）
-        // 使每个子队列容纳的事件的执行事件符合每一个字队列的要求
+        // 使每个子队列容纳的事件的执行时间符合每一个字队列的要求
         EventQueue.check_ready(cur_time, this);
         // dequeue_ready方法只操作0号子队列，这里面的事件需要在5ms内执行
         while ((e = EventQueue.dequeue_ready(cur_time))) {
@@ -493,7 +493,7 @@ EThread::execute()
         // 目的1: 优先处理立即执行的事件
         // 目的2: 可能有需要执行的负事件
         while ((e = EventQueueExternal.dequeue_local())) {
-          // 首先是立即执行事件
+          // 首先是立即执行的事件
           // 这里为何没有首先判断cancelled？
           if (!e->timeout_at)
             // 通过process_event回调状态机
@@ -541,7 +541,7 @@ EThread::execute()
       // 隐性队列为空，没有负事件
       } else { // Means there are no negative events
         // 没有负事件，那就是只有周期性事件需要执行，那么此时就需要节省CPU资源避免空转
-        // 通过内部队列里最早需要执行事件的事件距离当前时间的差值，得到可以休眠的时间
+        // 通过内部队列里最早需要执行事件的时间距离当前时间的差值，得到可以休眠的时间
         next_time = EventQueue.earliest_timeout();
         ink_hrtime sleep_time = next_time - cur_time;
 
