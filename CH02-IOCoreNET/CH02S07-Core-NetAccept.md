@@ -69,6 +69,7 @@ struct NetAccept : public Continuation {
   //     pd->pfd[ifd].df == server.fd
   int ifd;
   
+  //////////////////////
   // 在创建NetAccept实例之后，要填充下面的参数值，然后再启动NetAccept
   // 定义了Server实例，其内保存有listen fd，ip_family，local_ip，local_port信息
   Server server;
@@ -83,7 +84,6 @@ struct NetAccept : public Continuation {
   bool backdoor;
   // 返回给调用者的Action类型，同时其内也保存了指向上层状态机的Continuation
   Ptr<NetAcceptAction> action_;
-  
   // 在NetAccept运行中，如果得到了一个新的连接，
   // 将会使用下面这些设置来设置新连接的socket属性。
   int recv_bufsize;
@@ -91,14 +91,15 @@ struct NetAccept : public Continuation {
   uint32_t sockopt_flags;
   uint32_t packet_mark;
   uint32_t packet_tos;
-
   // 这个参数决定新的连接将被放入哪种类型的EThread里来处理
   // 例如：ET_NET, ET_SSL, ...
   EventType etype;
   // 以上是需要在启动NetAccept之前，需要设置的参数
+  //////////////////////
 
   // 这个成员貌似被废弃了
   UnixNetVConnection *epoll_vc; // only storage for epoll events
+
   // 在accept_thread=0的时候，用来把Listen FD添加到对应EThread的epoll fd中。（参考：NetAccept::init_accept_per_thread())
   // 但是在NetHandler::mainNetEvent()方法中，并未看到对epd->type==EVENTIO_NETACCEPT类型的处理
   //     看上去是废弃了，但是并未废弃！！！
@@ -118,34 +119,191 @@ struct NetAccept : public Continuation {
   // 为指定的 REGULAR ETHREAD 添加一个定时回调的 NetAccept 状态机，回调时运行acceptEvent()
   virtual void init_accept(EThread *t = NULL, bool isTransparent = false);
   // 为每一个 ET_NET 组里的 REGULAR ETHREAD 添加一个定时回调的 NetAccept 状态机
-  // 如果accept_fn == net_accept，那么回调时运行acceptFastEvent()，否则运行acceptEvent()
+  // 如果accept_fn == net_accept，那么回调时：
+  //     运行acceptFastEvent()，但是该方法不会调用accept_fn
+  //     否则：运行acceptEvent()，该方法通过accept_fn接受新连接
   // 所有的 NetAccept 状态机共享同一个listen fd
   virtual void init_accept_per_thread(bool isTransparent);
   // 克隆当前的 NetAccept 状态机，目前只有 init_accept_per_thread() 使用
+  // 通过 new NetAccept 创建新对象，然后通过成员拷贝初始化新对象的成员
   virtual NetAccept *clone() const;
+  
   // 如果server.fd已经存在，那么就对其进行必要的设置，使其符合 listen fd 的要求
   // 否则，创建一个设置好的 listen fd
-  // 0 == success
+  // 此方法根据 callback_on_open 的设置，可能会对上层状态机进行回调
+  // 注意：如果在上层状态机中设置了NetAccept的mutex，将会是无效的，
+  //       因为do_listen在回调完成后，会将mutex设置为NULL
+  //       这里比较特殊，因为此时该NetAccept状态机还未交付到任何REGULAR ETHREAD中
+  // 返回 0 表示成功
   int do_listen(bool non_blocking, bool transparent = false);
 
-  int do_blocking_accept(EThread *t);
-  virtual int acceptEvent(int event, void *e);
-  virtual int acceptFastEvent(int event, void *e);
+  // 在 DEDICATED ETHREAD 中的主回调函数
+  // 持续调用do_blocking_accept(t)，当其返回值小于0时，释放并析构自身，DEDICATED ETHREAD将会退出
   int acceptLoopEvent(int event, Event *e);
+  // do_blocking_accept是acceptLoopEvent的一部分
+  // 通过阻塞方式调用 accept 获得新连接，
+  //     从全局内存池为新连接分配 vc 对象
+  //     同时设置 vc->from_accept_thread = true，这样在释放 vc 占用的内存时，返回全局内存池
+  // 返回 0：达到当前总连接限定时
+  // 返回-1：当NetAccept被cancel时，分配 vc 对象内存失败时
+  // 返回 1：当 accept_till_done==false，表示每次只接受一个新连接
+  int do_blocking_accept(EThread *t);
+  
+  // 采用非阻塞方式调用 accept_fn 获得新连接：
+  //     accept_fn 指向的默认方法 net_accept 是从全局内存空间分配 vc 内存的。
+  // 首先尝试拿action_->mutex的锁，其实就是上层状态机的锁。
+  //     如果情况特殊，action_->mutex 为NULL，那么就使用NetAccept自身的mutex
+  // 拿到锁之后：
+  //     如果该NetAccept没有取消，调用accept_fn()方法：
+  //         大于 0：成功获取新连接，返回EventSystem等待下一次调用
+  //         等于 0：目前没有连接，返回EventSystem等待下一次调用
+  //         小于 0：
+  //     若已被取消：取消回调此方法的Event，同时释放NetAccept自身
+  // 如果没有拿到锁，返回EventSystem等待下一次调用
+  // 通过该方法创建的VC状态机，第一个被回调的函数是acceptEvent，
+  //     传入的是 EVENT_NONE（同步）或 EVENT_IMMEDIATE（异步）事件
+  //     再由 acceptEvent 回调上层状态机，然后会设置状态机下一次回调的函数为mainEvent
+  virtual int acceptEvent(int event, void *e);
+  // 与acceptEvent不同：
+  //     本方法不处理 backdoor 类型的连接，
+  //     不调用accept_fn方法，而是使用socketManager.accept来获得新连接，
+  //     是从线程内存空间分配 vc 内存的
+  //     被取消时，会同时关闭 listen fd
+  //     总是同步回调状态机，传递 NET_EVENT_ACCEPT 事件和 VC
+  //     第一个被回调的函数是mainEvent，也就是该方法包含了acceptEvent内的工作
+  // 对新连接设置 socket options 的时候，也是直接调用socketManager的相关方法进行设置：
+  //     send buffer, recv buffer
+  //     TCP_NODELAY, SO_KEEPALIVE, non blocking
+  // 每次执行，会重复调用accept，创建多个新的 VC，
+  //     直到返回EAGAIN，或出现错误，才会返回到EventSystem
+  virtual int acceptFastEvent(int event, void *e);
+  
+  // 取消 NetAccept
+  // 调用 action_->cancel(), 然后关闭listen fd
   void cancel();
 
+  // 构造函数
+  // 所有的成员都被初始化为0，false，NULL，ifd 为 －1
   NetAccept();
+  
+  // 析构函数
+  // action_ 是自动指针，实际是释放该资源
   virtual ~NetAccept() { action_ = NULL; };
 };
+
+//
+// General case network connection accept code
+//
+// 这是一个通用的 accept_fn 函数
+// 当listen fd是non blocking的时候，blockable要传入false；否则传入true
+int
+net_accept(NetAccept *na, void *ep, bool blockable)
+{
+  Event *e = (Event *)ep;
+  int res = 0;
+  int count = 0;
+  int loop = accept_till_done;
+  UnixNetVConnection *vc = NULL;
+
+  // 非阻塞的IO要保证net_accept也是非阻塞的
+  // 尝试对 na->action_->mutex (通常就是上层状态机的mutex) 加锁
+  // 失败就要返回，避免阻塞
+  if (!blockable)
+    if (!MUTEX_TAKE_TRY_LOCK_FOR(na->action_->mutex, e->ethread, na->action_->continuation))
+      return 0;
+  // do-while for accepting all the connections
+  // added by YTS Team, yamsat
+  // 下面的代码主要是尝试在非阻塞IO的情况下，尽可能多的accept新连接
+  //     通常accept返回 EAGAIN 就表示已经没有新连接了
+  // 解释一下 alloc_cache 的功能：
+  //     我觉得这个 alloc_cache 设计的比较渣，把我的理解说明如下：
+  //     由于 na->server.accept(&vc->con) 要使用vc里的成员con，
+  //     所以就要先申请/分配一个vc，但是一旦server.accept()失败了，就要释放该vc
+  //     作者觉得这个方法是频繁调用的，因此就把vc保存到 alloc_cache 里，
+  //     每次要申请/分配一个vc的时候，先用 alloc_cache 这个
+  // 但是，在NetAccept析构的时候，没有释放这个 alloc_cache，因此存在内存泄漏的bug
+  // 为什么没有在析构函数里面释放这个 alloc_cache 呢？
+  //     因为要判断 vc 的类型，是 UnixNetVConnection，还是 SSLNetVConnection，还是...
+  //     才能调用对应类型的Allocator.free()方法，才能释放掉内存
+  //     但是，根本没有办法在NetAccept里进行判断，然并软...
+  do {
+    // 获得一个 VC
+    vc = (UnixNetVConnection *)na->alloc_cache;
+    if (!vc) {
+      // 从线程分配池里分配一个 VC，需要注意的是：
+      //     如果 na 是NetAccept的继承类，而getNetProcessor()在继承类内被改写，
+      //     那么返回的就不一定是UnixNetVConnection类型，这里只是进行了一个类型转换。
+      vc = (UnixNetVConnection *)na->getNetProcessor()->allocate_vc(e->ethread);
+      // 这里还有一个潜在的bug，就是没有判断 VC 是否分配成功了，对于分配失败的情况没有处理
+      NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, 1);
+      vc->id = net_next_connection_number();
+      na->alloc_cache = vc;
+    }
+    // 调用 na->server.accept() 方法获取新连接
+    if ((res = na->server.accept(&vc->con)) < 0) {
+      // 失败时进行判断
+      // 如果是 EAGAIN 等表示没有新连接了，此时就跳转到Ldone，返回调用者本次调用创建的新连接的数量（count）
+      if (res == -EAGAIN || res == -ECONNABORTED || res == -EPIPE)
+        goto Ldone;
+      // 其它出错情况，回调上层状态机，告知出现了错误
+      // 注：如果被cancel的话，server.fd 会被关闭，并设置为NO_FD，会导致 accept 返回值小于 0
+      if (na->server.fd != NO_FD && !na->action_->cancelled) {
+        if (!blockable)
+          na->action_->continuation->handleEvent(EVENT_ERROR, (void *)(intptr_t)res);
+        else {
+          SCOPED_MUTEX_LOCK(lock, na->action_->mutex, e->ethread);
+          na->action_->continuation->handleEvent(EVENT_ERROR, (void *)(intptr_t)res);
+        }
+      }
+      // count 设置为错误码，跳转到Ldone，返回调用者这个错误码
+      count = res;
+      goto Ldone;
+    }
+    
+    // 创建新连接的数量加 1
+    count++;
+    // 由于使用掉了 alloc_cache 保存的vc，因此将其置为 NULL
+    na->alloc_cache = NULL;
+
+    // 初始化 vc 的一些参数
+    vc->submit_time = Thread::get_hrtime();
+    ats_ip_copy(&vc->server_addr, &vc->con.addr);
+    vc->mutex = new_ProxyMutex();
+    vc->action_ = *na->action_;
+    vc->set_is_transparent(na->server.f_inbound_transparent);
+    vc->closed = 0;
+    
+    // 设置VC状态机的回调函数，注意这里，无论该VC是UnixNetVConnection还是SSLNetVConnection，
+    // 该回调函数总是：UnixNetVConnection::acceptEvent
+    SET_CONTINUATION_HANDLER(vc, (NetVConnHandler)&UnixNetVConnection::acceptEvent);
+
+    // 如果当前EThread支持此类型VC的处理，就同步回调VC状态机（acceptEvent）
+    // 例如：当ssl accept thread＝0的时候，ET_NET ＝ ET_SSL，
+    //       那么SSLUnixNetVConnection也会放在 ET_NET 的线程里运行
+    if (e->ethread->is_event_type(na->etype))
+      vc->handleEvent(EVENT_NONE, e);
+    // 如果不支持，就异步回调状态机，把VC状态机封装到一个Event里，放入可以处理它的 EThread 中
+    else
+      eventProcessor.schedule_imm(vc, na->etype);
+  } while (loop);
+
+Ldone:
+  // 解锁，其实这里不用写，因为是离开有效域的时候自动解锁
+  if (!blockable)
+    MUTEX_UNTAKE_LOCK(na->action_->mutex, e->ethread);
+  // 返回 count 值
+  return count;
+}
+
 ```
 
-NetAccept可以是一个独立的线程
+NetAccept可以是一个独立的线程（DEDICATED ETHREAD模式）
 
   - 内部是一个死循环
   - 通过netProcessor.accept(AcceptorCont, fd, opt)创建的DEDICATED ETHREAD。
   - CONFIG proxy.config.accept_threads INT 1
 
-也可以是一个周期性执行的Event封装的Continuation
+也可以是一个被周期性执行的Event封装的状态机，虽然只有一个状态（REGULAR ETHREAD模式）
 
   - 被EThread反复回调
   - 由于REGULAR ETHREAD也是一个死循环，因此实际上也是放在了一个大的死循环线程中执行。
@@ -340,7 +498,8 @@ EventProcessor::assign_thread(EventType etype)
 
 通过上面的分析，我们确认当新连接被Event封装之后，放入EThread线程的外部队列时，是通过对多个EThread采用轮询的负载算法进行选择的。
 
-那么会在哪些EThread中轮训呢？由 getEtype() 的返回值决定：
+那么会在哪些EThread中轮询呢？由 getEtype() 的返回值决定：
+
   - 该值对于UnixNetVConnection类型为ET_NET
   - 该值对于SSLNetVConnection类型为ET_SSL
 
@@ -348,6 +507,90 @@ EventProcessor::assign_thread(EventType etype)
 
 这样AcceptorCont则可以初始化更高级别的状态机。
 
+## DEDICATED ETHREAD 模式总结
+
+在netProcessor.accept()中
+
+  - 通过createNetAccept()创建了NetAccept的实例
+  - 通过init_accept_loop()创建DEDICATED ETHREAD
+
+DEDICATED ETHREAD
+
+  - init_accept_loop 创建DEDICATED ETHREAD
+    - acceptLoopEvent
+      - do_blocking_accept
+        - server.accept
+
+就渊源不断的接受并创建新的连接和 VC，最后调用 schedule_imm_signal(vc, getEtype())，将 VC 放入EventSystem对应类型的REGULAR ETHREAD线程组
+
+REGULAR ETHREAD
+
+  - External Local Queue
+    - UnixNetVConnection::acceptEvent
+      - action_->cont->handleEvent(NET_EVENT_ACCEPT, vc)
+  - Event Queue
+    - InactivityCop::check_inactivity
+      - vc->handleEvent(EVENT_IMMEDIATE, e) ==> UnixNetVConnection::mainEvent(EVENT_IMMEDIATE, e)
+
+上面看到 acceptEvent 会向上层状态机回调，传送 NET_EVENT_ACCEPT 事件，之后 VC 状态机的回调函数就切换到 mainEvent，与 Inactivity 状态机配合实现超时控制。
+
+## REGULAR ETHREAD 模式介绍
+
+通过 NetAccept::init_accept_per_thread 方法为指定的线程组，如ET_NET，创建NetAccept状态机
+
+  - init_accept_per_thread
+    - do_listen
+    - clone
+    - schedule_every(na, period, etype)
+
+这里设定回调函数通常为acceptFastEvent，回调时传入的Event为etype，如果 accept_fn 使用了用户自定义的函数，那么回调函数为acceptEvent。
+
+由于这里使用了thread->schedule_every，而且period小于0，因此事件直接放入了Negative Queue。
+
+REGULAR ETHREAD
+
+  - Negative Queue
+    - acceptFastEvent(etype, na)
+      - socketManager.accept
+      - nh->open_list.enqueue(vc)
+      - nh->read_ready_list.enqueue(vc)
+      - action_->cont->handlerEvent(NET_EVENT_ACCEPT, vc)
+
+调用 acceptFastEvent 就相当于包含了acceptEvent的处理部分，但是这里可能存在bug，因为操作 nh（NetHandler）队列时，并未得到NetHandler的mutex锁。
+
+  - Negative Queue
+    - acceptEvent(etype, na)
+      - accept_fn ==> net_accept 默认情况
+        - na->server.accept
+        - 同步 vc->handleEvent(EVENT_NONE, e) ==> UnixNetVConnection::acceptEvent(EVENT_NONE, e)
+          - action_->cont->handleEvent(NET_EVENT_ACCEPT, vc)
+        - 异步 eventProcessor.schedule_imm(vc, na->etype)
+  - External Local Queue
+    - UnixNetVConnection::acceptEvent(EVENT_IMMEDIATE, e)
+      - action_->cont->handleEvent(NET_EVENT_ACCEPT, vc)
+
+如果使用的是 acceptEvent 回调函数，仍然走 acceptEvent，由于在 acceptEvent 内对 NetHandler 进行了加锁的判断和上锁失败的重新调度，因此就不存在 acceptFastEvent 的bug。
+
+在对上层状态机进行 NET_EVENT_ACCEPT 回调时，支持 同步 和 异步 两种方式。
+
+## 创建单独的 NetAccept 状态机
+
+有时候，我们不需要为线程组里的每一个线程都创建一个 NetAccept 状态机，那么应该怎么做呢？
+
+如果你留意的话，上面的介绍中，还有一个NetAccept的方法没有介绍过：init_accept()
+
+当我们需要在指定的REGULAR ETHREAD内创建一个NetAccept状态机时，只要首先new一个指定类型的NetAccept实例。
+
+例如：想接受新连接后进行SSL的处理，那就：
+
+  - sslna = new SSLNetAccept
+  - sslna->init_accept(thread, isTransparent)
+
+需要注意的是，这里的 thread 一定要与 na->etype 是对应类型的，或者你可以偷懒，使用 NULL 代替 thread，此时会根据 etype 值找到一个适合的thread（assign_thread）。
+
+此时会生成一个周期性运行的事件，将NetAccept状态机放入线程中运行，回调函数被设置为NetAccept::acceptEvent。
+
+如果只想接受一个连接，那么在收到 NET_EVENT_ACCEPT 事件后，就可以调用 sslna->cancel() 来取消状态机了。
 
 ## 引导器（Acceptor）
 
@@ -372,3 +615,4 @@ EventProcessor::assign_thread(EventType etype)
 ## NO_FD 与 opt
 
 未完待续...
+
