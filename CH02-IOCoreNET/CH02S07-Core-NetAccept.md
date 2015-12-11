@@ -558,6 +558,12 @@ REGULAR ETHREAD
 
 调用 acceptFastEvent 就相当于包含了acceptEvent的处理部分，但是这里可能存在bug，因为操作 nh（NetHandler）队列时，并未得到NetHandler的mutex锁。
 
+虽然在操作这两个队列之前有一个 assert() 来确保出现这种异常操作时让ATS停止运行，但是为何不支持异步调用呢？
+
+```
+ink_assert(vc->nh->mutex->thread_holding == this_ethread());
+```
+
   - Negative Queue
     - acceptEvent(etype, na)
       - accept_fn ==> net_accept 默认情况
