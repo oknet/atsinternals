@@ -12,6 +12,133 @@ NetAccept是NetProcessor的一个子系统，是NetProcessor服务端的引导�
   - 一个引导器（Acceptor），用来接受客户端的连接，并且创建所需要类型的VConnection（SM）
   - 一个处理器（Processor），提供了大量的回调函数，用来处理每一个SM的状态（NetProcessor，HttpTransaction）
 
+# 定义
+
+```
+//
+// Default accept function
+//   Accepts as many connections as possible, returning the number accepted
+//   or -1 to stop accepting.
+//
+// 下面这两个typedef定义就是为了一个net_accept方法
+// 所有的netaccept操作基本都会调用这个底层的net_accept方法
+// 但是也有直接调用Server::accept()方法的情况
+typedef int(AcceptFunction)(NetAccept *na, void *e, bool blockable);
+typedef AcceptFunction *AcceptFunctionPtr;
+AcceptFunction net_accept;
+
+// TODO fix race between cancel accept and call back （这个注释是什么鬼？难道有个大坑没解决？）
+// 创建一个 NetAcceptAction，继承自Action和RefCountObj
+// 用于向NetAccept的调用者返回一个Action，在将来可以随时将此NetAccept操作cancel掉
+// 为何要支持引用计数？没看懂...
+struct NetAcceptAction : public Action, public RefCountObj {
+  // 指向NetAccept::server成员的指针
+  Server *server;
+
+  // 提供此Action唯一的方法cancel
+  void
+  cancel(Continuation *cont = NULL)
+  {
+    Action::cancel(cont);
+    // cancel操作，直接把listen fd给关闭了。感觉好野蛮！！！
+    // 这样在NetAccept的操作中就会出现错误，遇到错误，NetAccept就终止运行了。
+    server->close();
+  }
+
+  // 重载赋值操作符
+  // 由于继承自Action和RefCountObj两个类，
+  // 因此这里选择继承Action的操作符重载，来更改Continuation和mutex两个成员。
+  Continuation *operator=(Continuation *acont) { return Action::operator=(acont); }
+
+  // 析构函数
+  // 只是输出一个debug信息
+  ~NetAcceptAction() { Debug("net_accept", "NetAcceptAction dying\n"); }
+};
+
+
+//
+// NetAccept
+// Handles accepting connections.
+//
+// 为表述方便，调整了成员变量定义的顺序
+struct NetAccept : public Continuation {
+  ink_hrtime period;
+  // 仅用于net_accept方法内部，详细见net_accept方法的内部分析
+  void *alloc_cache;
+  // 用来标记listen fd在pd数组中的下标值，但是好像被废弃了
+  //     pd->pfd[ifd].df == server.fd
+  int ifd;
+  
+  // 在创建NetAccept实例之后，要填充下面的参数值，然后再启动NetAccept
+  // 定义了Server实例，其内保存有listen fd，ip_family，local_ip，local_port信息
+  Server server;
+  // 定义accept_fn指针函数
+  // 如果由 acceptFastEvent 调用accept_fn，则accept_fn必须指向net_accept
+  // 但是由 acceptEvent 调用accept_fn，则accept_fn可以指向net_accept，也可以指向用户自定义的方法
+  AcceptFunctionPtr accept_fn;
+  // True = 在调用do_listen()创建了listen fd之后，回调状态机，
+  // 传递NET_EVENT_ACCEPT_(SUCCEED|FAILED)事件，以及指向NetAccept实例的data指针
+  bool callback_on_open;
+  // True = 这是一个ATS内部的WebServer实现，只是内部使用，回头会详细介绍这个backdoor部分
+  bool backdoor;
+  // 返回给调用者的Action类型，同时其内也保存了指向上层状态机的Continuation
+  Ptr<NetAcceptAction> action_;
+  
+  // 在NetAccept运行中，如果得到了一个新的连接，
+  // 将会使用下面这些设置来设置新连接的socket属性。
+  int recv_bufsize;
+  int send_bufsize;
+  uint32_t sockopt_flags;
+  uint32_t packet_mark;
+  uint32_t packet_tos;
+
+  // 这个参数决定新的连接将被放入哪种类型的EThread里来处理
+  // 例如：ET_NET, ET_SSL, ...
+  EventType etype;
+  // 以上是需要在启动NetAccept之前，需要设置的参数
+
+  // 这个成员貌似被废弃了
+  UnixNetVConnection *epoll_vc; // only storage for epoll events
+  // 在accept_thread=0的时候，用来把Listen FD添加到对应EThread的epoll fd中。（参考：NetAccept::init_accept_per_thread())
+  // 但是在NetHandler::mainNetEvent()方法中，并未看到对epd->type==EVENTIO_NETACCEPT类型的处理
+  //     看上去是废弃了，但是并未废弃！！！
+  // 因为添加到epoll fd之后，一旦有新连接进入，
+  //     会让epoll_wait从阻塞等待中返回，这样就可以尽快回调NetAccept状态机
+  // 不过感觉这里没有必要使用一个类成员变量来处理，使用函数内的临时变量就可以了。
+  EventIO ep;
+
+  // 返回 etype 成员
+  virtual EventType getEtype() const;
+  
+  // 返回全局变量 netProcessor
+  virtual NetProcessor *getNetProcessor() const;
+
+  // 创建一个 DEDICATED ETHREAD, 回调NetAccept时运行acceptLoopEvent()
+  void init_accept_loop(const char *);
+  // 为指定的 REGULAR ETHREAD 添加一个定时回调的 NetAccept 状态机，回调时运行acceptEvent()
+  virtual void init_accept(EThread *t = NULL, bool isTransparent = false);
+  // 为每一个 ET_NET 组里的 REGULAR ETHREAD 添加一个定时回调的 NetAccept 状态机
+  // 如果accept_fn == net_accept，那么回调时运行acceptFastEvent()，否则运行acceptEvent()
+  // 所有的 NetAccept 状态机共享同一个listen fd
+  virtual void init_accept_per_thread(bool isTransparent);
+  // 克隆当前的 NetAccept 状态机，目前只有 init_accept_per_thread() 使用
+  virtual NetAccept *clone() const;
+  // 如果server.fd已经存在，那么就对其进行必要的设置，使其符合 listen fd 的要求
+  // 否则，创建一个设置好的 listen fd
+  // 0 == success
+  int do_listen(bool non_blocking, bool transparent = false);
+
+  int do_blocking_accept(EThread *t);
+  virtual int acceptEvent(int event, void *e);
+  virtual int acceptFastEvent(int event, void *e);
+  int acceptLoopEvent(int event, Event *e);
+  void cancel();
+
+  NetAccept();
+  virtual ~NetAccept() { action_ = NULL; };
+};
+```
+
 NetAccept可以是一个独立的线程
 
   - 内部是一个死循环
