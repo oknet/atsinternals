@@ -741,6 +741,27 @@ ATS通过将evfd添加到fd集合中实现了这个受控阻塞，这就是受�
 
 在schedule_*()中会通过```EventQueueExternal.enqueue(e, fast_signal＝true)```把event放入外部队列。
 
+```
+TS_INLINE Event *
+EventProcessor::schedule(Event *e, EventType etype, bool fast_signal)
+{
+  ink_assert(etype < MAX_EVENT_TYPES);
+  // assign_thread(etype) 负责从线程列表中返回指定etype类型的ethread线程指针
+  e->ethread = assign_thread(etype);
+  // 如果Cont有自己的mutex则Event继承Cont的mutex，否则Event和Cont都要继承ethread的mutex
+  if (e->continuation->mutex)
+    e->mutex = e->continuation->mutex;
+  else
+    e->mutex = e->continuation->mutex = e->ethread->mutex;
+
+  // 将Event压入所分配的ethread线程的外部队列
+  e->ethread->EventQueueExternal.enqueue(e, fast_signal);
+  return e;
+}
+```
+
+在阅读enqueue()方法的代码时，请一定看一下上面的schedule()方法，同时找一个大脑最清醒的时刻，否则很容易晕...
+
 EventQueueExternal 是一个 ProtectedQueue，那么它的enqueue方法如下：
 
 ```
@@ -784,9 +805,11 @@ ProtectedQueue::enqueue(Event *e, bool fast_signal)
       } else {
         // 如果当前EThread是REGULAR类型，而且ethreads_to_be_signalled不为空（就是支持signal的队列化）
 #ifdef EAGER_SIGNALLING
+        // 此处宏定义开关的含义：更及时的发送signal。（这样做好不好？见后面的分析）
         // 由于已经把event插入队列中，因此就要向持有此event的队列发送信号
         // 而这个队列必然是e->ethread->EventQueueExternal
-        // 这里简写为if(try_signal())是不是也是ok的？？？
+        // 这里应该可以简写为 if (try_signal())，因为当前调用的enqueue()方法就是通过：
+        //     e->ethread->EventQueueExternal.enqueue() 发起的。
         // Try to signal now and avoid deferred posting.
         if (e_ethread->EventQueueExternal.try_signal())
           return;
@@ -924,6 +947,28 @@ flush_signals(EThread *thr)
   thr->n_ethreads_to_be_signalled = 0;
 }
 ```
+
+## 关于 EAGER_SIGNALLING
+
+在 [ProtectedQueue.cc](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/ProtectedQueue.cc) 中对此进行了描述：
+
+```
+ 36 // The protected queue is designed to delay signaling of threads
+ 37 // until some amount of work has been completed on the current thread
+ 38 // in order to prevent excess context switches.
+ 39 //
+ 40 // Defining EAGER_SIGNALLING disables this behavior and causes                                                                      
+ 41 // threads to be made runnable immediately.
+ 42 //
+ 43 // #define EAGER_SIGNALLING
+```
+
+翻译如下：
+
+  - 保护队列被设计为：
+    - 在要通知的线程已经完成了一定量的工作时，才通知线程
+    - 采用延迟通知的方式，可以阻止/减少过度的上下文切换
+  - 但是可以定义宏 EAGER_SIGNALLING 来关闭上述行为，让通知立即发出
 
 ## 参考资料
 
