@@ -158,6 +158,7 @@ vc_server
 mutex
 
   - 对于状态机的mutex的引用
+  - 当VIO处于disable状态时，可能会指向VConnection的mutex。（例如：do_io_read(NULL, 0, NULL)，传入的cont==NULL）
   - 即使状态机已经关闭VConnection并且进行了回收，Processor仍然可以安全的锁定该操作
 
 ## 理解 VIO
