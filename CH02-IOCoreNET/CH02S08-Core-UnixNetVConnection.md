@@ -2,13 +2,20 @@
 
 实际上IOCoreNet子系统，与EventSystem是一样的，也有Thread，Processor和Event，只是名字不一样了：
 
-| EventSystem  |   NetSubSystem   |
-|:------------:|:----------------:|
-|     Event    |UnixNetVConnection|
-|    EThread   |    NetHandler    |
-|EventProcessor|   NetProcessor   |
+| EventSystem  |            NetSubSystem            |
+|:------------:|:----－－－－－－－－－------------:|
+|     Event    |         UnixNetVConnection         |
+|    EThread   |NetAccept，NetHandler，InactivityCop|
+|EventProcessor|            NetProcessor            |
 
-但是，从形态上来看，UnixNetVConnection 要比 Event 复杂的多。
+- 像 Event 一样，UnixNetVConnection 也提供了面向上层状态机的方法
+- 同时，UnixNetVConnection 也是状态机
+  - 因此它也有自己的handler（回调函数），有以下三条调用路径
+  - EThread  －－－  NetAccept  －－－ UnixNetVConnection
+  - EThread  －－－  NetHandler  －－－  UnixNetVConnection
+  - EThread  －－－  InactivityCop  －－－  UnixNetVConnection
+
+由于它既是Event，又是SM，所以从形态上来看，UnixNetVConnection 要比 Event 复杂的多。
 
 由于 SSLNetVConnection 继承自 UnixNetVConnection，因此在 UnixNetVConnection 的定义中也为支持 SSL 预留了部分内容。
 
