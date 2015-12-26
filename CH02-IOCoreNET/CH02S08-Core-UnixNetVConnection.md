@@ -3,7 +3,7 @@
 实际上IOCoreNet子系统，与EventSystem是一样的，也有Thread，Processor和Event，只是名字不一样了：
 
 |  EventSystem   |        NetSubSystem       |
-|:--－----------:|:-------------------------:|
+|:--------------:|:-------------------------:|
 |      Event     |     UnixNetVConnection    |
 |     EThread    | NetHandler，InactivityCop |
 | EventProcessor |        NetProcessor       |
