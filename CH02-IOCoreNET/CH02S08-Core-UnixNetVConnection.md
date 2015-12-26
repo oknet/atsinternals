@@ -2,18 +2,27 @@
 
 实际上IOCoreNet子系统，与EventSystem是一样的，也有Thread，Processor和Event，只是名字不一样了：
 
-| EventSystem  |            NetSubSystem            |
-|:------------:|:----------------------------------:|
-|     Event    |         UnixNetVConnection         |
-|    EThread   |NetAccept，NetHandler，InactivityCop|
-|EventProcessor|            NetProcessor            |
+|  EventSystem   |        NetSubSystem       |
+|:--－----------:|:-------------------------:|
+|      Event     |     UnixNetVConnection    |
+|     EThread    | NetHandler，InactivityCop |
+| EventProcessor |        NetProcessor       |
 
 - 像 Event 一样，UnixNetVConnection 也提供了面向上层状态机的方法
-- 同时，UnixNetVConnection 也是状态机
-  - 因此它也有自己的handler（回调函数），有以下三条调用路径
-  - EThread  －－－  NetAccept  －－－ UnixNetVConnection
-  - EThread  －－－  NetHandler  －－－  UnixNetVConnection
-  - EThread  －－－  InactivityCop  －－－  UnixNetVConnection
+  - do_io_* 系列
+  - (set|cancel)_*_timeout 系列
+  - (add|remove)_*_queue 系列
+- UnixNetVConnection 也提供了面向底层状态机的方法
+  - 大多数由NetHandler来调用
+- UnixNetVConnection 也是状态机
+  - 因此它也有自己的handler（回调函数）
+    - NetAccept调用acceptEvent
+    - InactivityCop调用mainEvent
+    - 构造函数会初始化为startEvent，用于调用connectUp()，这是面向NetProcessor的
+  - 大致有以下三条调用路径：
+    - EThread  －－－  NetAccept  －－－ UnixNetVConnection
+    - EThread  －－－  NetHandler  －－－  UnixNetVConnection
+    - EThread  －－－  InactivityCop  －－－  UnixNetVConnection
 
 由于它既是Event，又是SM，所以从形态上来看，UnixNetVConnection 要比 Event 复杂的多。
 
