@@ -440,7 +440,7 @@ read_from_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
   MUTEX_TRY_LOCK_FOR(lock, s->vio.mutex, thread, s->vio._cont);
   if (!lock.is_locked()) {
     // 如果没有拿到锁，就重新调度，等下一次再读取
-    // read_reschedule 会吧此vc放回到read_ready_link的队列尾部
+    // read_reschedule 会把此vc放回到read_ready_link的队列尾部
     // 由于NetHandler的处理方式，必然会在本次EventSystem回调NetHandler中完成所有的读操作
     //     不会延迟到下一次EventSystem对NetHandler的回调
     read_reschedule(nh, vc);
@@ -682,6 +682,7 @@ read_from_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 void
 write_to_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 {
+  // 这行可以删除，废弃的代码
   ProxyMutex *mutex = thread->mutex;
 
   NET_INCREMENT_DYN_STAT(net_calls_to_writetonet_stat);
@@ -704,86 +705,109 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
   NetState *s = &vc->write;
   ProxyMutex *mutex = thread->mutex;
 
+  // 尝试获取对此VC的VIO的Mutex锁
   MUTEX_TRY_LOCK_FOR(lock, s->vio.mutex, thread, s->vio._cont);
-
   if (!lock.is_locked() || lock.get_mutex() != s->vio.mutex.m_ptr) {
+    // 如果没有拿到锁，
+    //     或者拿到锁之后，该VIO的Mutex被异步更改了。
+    //     (这是比read_net_io多出来的一个判断，感觉好神奇，不太懂怎么会出现这种情况)
+    // 就重新调度，等下一次再读取
+    // write_reschedule 会把此vc放回到write_ready_link的队列尾部
+    // 由于NetHandler的处理方式，必然会在本次EventSystem回调NetHandler中完成所有的写操作，直到内核的写缓冲区都满了
+    //     不会延迟到下一次EventSystem对NetHandler的回调
     write_reschedule(nh, vc);
     return;
   }
 
   // This function will always return true unless
   // vc is an SSLNetVConnection.
+  // 判断当前vc是否是一个SSLVC，此处暂时跳过。
   if (!vc->getSSLHandShakeComplete()) {
-    int err, ret;
-
-    if (vc->getSSLClientConnection())
-      ret = vc->sslStartHandShake(SSL_EVENT_CLIENT, err);
-    else
-      ret = vc->sslStartHandShake(SSL_EVENT_SERVER, err);
-
-    if (ret == EVENT_ERROR) {
-      vc->write.triggered = 0;
-      write_signal_error(nh, vc, err);
-    } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
-      vc->read.triggered = 0;
-      nh->read_ready_list.remove(vc);
-      read_reschedule(nh, vc);
-    } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
-      vc->write.triggered = 0;
-      nh->write_ready_list.remove(vc);
-      write_reschedule(nh, vc);
-    } else if (ret == EVENT_DONE) {
-      vc->write.triggered = 1;
-      if (vc->write.enabled)
-        nh->write_ready_list.in_or_enqueue(vc);
-    } else
-      write_reschedule(nh, vc);
-    return;
+    // 此处略去了对SSLVC处理的代码
+    // ...
   }
+  
+  // 此处没有判断VC被异步关闭的情况？？？vc->closed ？？？
+  
   // If it is not enabled,add to WaitList.
+  // 如果，该vc的写操作被异步禁止了
+  // 或者，VIO的操作方法不是写操作（此处是比Read部分多出来的判断条件）
   if (!s->enabled || s->vio.op != VIO::WRITE) {
     write_disable(nh, vc);
     return;
   }
+  
   // If there is nothing to do, disable
+  // 在VIO中定义了总共需要发送的数据的总长度，还有已经完成的数据发送长度
+  // ntodo 是剩余的，还需要发送的数据长度
   int64_t ntodo = s->vio.ntodo();
   if (ntodo <= 0) {
+    // ntodo为0，表示VIO定义的写操作在之前就已经全部完成了
+    // 因此直接禁止此VC的写操作
     write_disable(nh, vc);
     return;
   }
 
+  // 下面才开始进入写操作前的准备工作
+  // 获取缓冲区，准备获取数据进行发送
   MIOBufferAccessor &buf = s->vio.buffer;
+  // 缓冲区如果不存在则报异常并crash
   ink_assert(buf.writer());
+  
+  // 对比read部分，是先判断缓冲区是否存在，再判断ntodo
+  // 因此，对于Write VIO处于禁止状态的时候，Write VIO MIOBuffer是可能为空的。
+  // 官方JIRA：https://issues.apache.org/jira/browse/TS-4055 描述的bug，就是由于没有判断Write VIO的MIOBuffer为空导致的
 
   // Calculate amount to write
+  // 查看MIOBuffer缓冲区中包含的可供读取的数据，作为本次即将发送的数据长度
   int64_t towrite = buf.reader()->read_avail();
+  // 如果 towrite 大于 ntodo，就调整一下 towrite 的值
+  // 需要注意：towrite 可能会等于 0
   if (towrite > ntodo)
     towrite = ntodo;
+
+  // 标记在本次调用中，是否已经回调过上层状态机
+  //     由于在写操作之前，可能会先回调一次上层状态机
+  //     在写操作之后，是否还要再次回调上层状态机，需要查看之前是否已经回调过
+  //     所以，通过一个临时变量记录一下。
   int signalled = 0;
 
   // signal write ready to allow user to fill the buffer
+  // 当 towrite < ntodo 并且 缓冲区中还有剩余空间，可以填充更多数据时
   if (towrite != ntodo && buf.writer()->write_avail()) {
+    // 回调上层状态机，传递WRITE_READY事件
+    // 让上层状态机在写操作之前填充一次缓冲区
     if (write_signal_and_update(VC_EVENT_WRITE_READY, vc) != EVENT_CONT) {
+      // 如果在上层状态机中发生了错误，就直接返回
       return;
     }
+    // 重新计算VIO的ntodo的值，因为在上层状态机中可能会重新设置VIO
     ntodo = s->vio.ntodo();
+    // 如果VIO被设置为已完成，就禁止vc的Write VIO，直接返回
     if (ntodo <= 0) {
       write_disable(nh, vc);
       return;
     }
+    
+    // 标记上层状态机已经被回调过了
     signalled = 1;
+    
+    // 重新计算towrite
     // Recalculate amount to write
     towrite = buf.reader()->read_avail();
     if (towrite > ntodo)
       towrite = ntodo;
   }
+  
   // if there is nothing to do, disable
   ink_assert(towrite >= 0);
+  // 此时towrite仍然可能为0，因此如果towrite为0，就禁止vc的Write VIO，直接返回
   if (towrite <= 0) {
     write_disable(nh, vc);
     return;
   }
 
+  // 调用 vc->load_buffer_and_write 完成实际的写操作
   int64_t total_written = 0, wattempted = 0;
   int needs = 0;
   int64_t r = vc->load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
