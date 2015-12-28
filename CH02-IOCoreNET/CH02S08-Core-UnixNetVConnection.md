@@ -142,37 +142,61 @@ public:
   {
     (void)state;
   }
+  // 进行读操作，从socket上读取数据，生产到Read VIO内的MIOBuffer
   virtual void net_read_io(NetHandler *nh, EThread *lthread);
+  // 进行写操作，由write_to_net_io调用，从Write VIO内的MIOBufferAccessor消费数据，然后写入socket，返回实际消费的字节数
   virtual int64_t load_buffer_and_write(int64_t towrite, int64_t &wattempted, int64_t &total_written, MIOBufferAccessor &buf,
                                         int &needs);
+  // 关闭当前VC的Read VIO
   void readDisable(NetHandler *nh);
+  // ??
   void readSignalError(NetHandler *nh, int err);
+  // ??
   int readSignalDone(int event, NetHandler *nh);
+  // ??
   int readSignalAndUpdate(int event);
+  // 重新调度当前VC的读写操作
   void readReschedule(NetHandler *nh);
   void writeReschedule(NetHandler *nh);
+  // ??
   void netActivity(EThread *lthread);
+  
   /**
    * If the current object's thread does not match the t argument, create a new
    * NetVC in the thread t context based on the socket and ssl information in the
    * current NetVC and mark the current NetVC to be closed.
    */
+  // 将VC从原来的EThread迁移到当前的EThread。
+  // 这是一个2015年10月才新增加的一个方法，由Yahoo团队实现，参考：
+  //     官方JIRA：TS-3797
+  //     官方Github：https://github.com/apache/trafficserver/commit/c181e7eea93592fa496247118f72e8323846fd5a
+  //     官方Wiki：https://cwiki.apache.org/confluence/display/TS/Threading+Issues+And+NetVC+Migration
   UnixNetVConnection *migrateToCurrentThread(Continuation *c, EThread *t);
 
+  // 指向上层状态机
   Action action_;
+  // 指示当前VC是否已经关闭
   volatile int closed;
+  // 读写两个状态，其内各包含一个VIO实例，对应读写操作
   NetState read;
   NetState write;
 
-  LINK(UnixNetVConnection, cop_link);
+  // 定义四种link的类型，但是此处并未定义实例，这些link的实例在NetHandler中声明
   LINKM(UnixNetVConnection, read, ready_link)
   SLINKM(UnixNetVConnection, read, enable_link)
   LINKM(UnixNetVConnection, write, ready_link)
   SLINKM(UnixNetVConnection, write, enable_link)
+
+  // 定义用于InActivityCop内部的链表节点
+  LINK(UnixNetVConnection, cop_link);
+  // 定义用于实现keepalive连接池管理的链表节点
   LINK(UnixNetVConnection, keep_alive_queue_link);
+  // 定义用于实现timeout操作的链表节点
   LINK(UnixNetVConnection, active_queue_link);
 
+  // 定义inactivity timeout，我理解为IDLE Timeout，就是这个连接上没有任何数据传输的时候，最长等待时间
   ink_hrtime inactivity_timeout_in;
+  // 定义active timeout，我理解为OPERATION Timeout，就是当进行一个异步读、写操作时，最长等待时间
   ink_hrtime active_timeout_in;
 #ifdef INACTIVITY_TIMEOUT
   Event *inactivity_timeout;
@@ -182,12 +206,17 @@ public:
   ink_hrtime next_activity_timeout_at;
 #endif
 
+  // 用于操作epoll的描述符
   EventIO ep;
+  // 指向管理此连接的NetHandler
   NetHandler *nh;
+  // 此连接的唯一ID，自增长值
   unsigned int id;
+  // 服务器端的地址，AMC大神在这里做了一个注释，觉得这儿重复定义了，其实可以使用con.addr
   // amc - what is this for? Why not use remote_addr or con.addr?
   IpEndpoint server_addr; /// Server address and port.
 
+  // 可以是一个flags，或者用来标记半关闭的状态
   union {
     unsigned int flags;
 #define NET_VC_SHUTDOWN_READ 1
@@ -198,10 +227,18 @@ public:
     } f;
   };
 
+  // 与当前VC实例对应的底层socket描述结构，其内包含文件描述符
   Connection con;
+  
+  // 统计UnixNetVConnection作为状态机时的重入情况
   int recursion;
+  // 记录当前实例的创建时间
   ink_hrtime submit_time;
+  // 带外数据的回调方法指针
   OOB_callback *oob_ptr;
+  
+  // true＝当前VC实例通过DEDICATED EThread模式的NetAccept创建
+  // 表示该VC的内存由全局空间分配，在释放时，需要直接调用全局空间释放
   bool from_accept_thread;
 
   // es - origin_trace associated connections
@@ -209,26 +246,45 @@ public:
   const sockaddr *origin_trace_addr;
   int origin_trace_port;
 
+  // 作为状态机时的回调方法
+  // startEvent通常由connectUp设置
   int startEvent(int event, Event *e);
+  // acceptEvent通常由NetAccept在创建VC后设置
   int acceptEvent(int event, Event *e);
+  // mainEvent通常由InactivityCop调用，用来实现超时控制
+  // startEvent和acceptEvent在执行完成之后，都会转入mainEvent
   int mainEvent(int event, Event *e);
+  
+  // 作为Client发起一个socket连接，状态机回调函数设置为startEvent
   virtual int connectUp(EThread *t, int fd);
+  
   /**
    * Populate the current object based on the socket information in in the
    * con parameter.
    * This is logic is invoked when the NetVC object is created in a new thread context
    */
+  // 这是一个2015年10月才新增加的一个方法，由Yahoo团队实现，参见上面的：migrateToCurrentThread
   virtual int populate(Connection &con, Continuation *c, void *arg);
+  
+  // 释放该VC，并不会释放内存，只是把内存归还到freelist内存池或者全局内存池
   virtual void free(EThread *t);
+
 
   virtual ink_hrtime get_inactivity_timeout();
   virtual ink_hrtime get_active_timeout();
 
+  // 设置本地地址
   virtual void set_local_addr();
+  // 设置远端地址
   virtual void set_remote_addr();
+  
+  // 设置 TCP 的 INIT CWND 参数
   virtual int set_tcp_init_cwnd(int init_cwnd);
+  
+  // 设置 TCP 的一些参数
   virtual void apply_options();
 
+  // 进行写操作，为了与SSL部分兼容，实际是调用load_buffer_and_write来完成socket的写操作
   friend void write_to_net_io(NetHandler *, UnixNetVConnection *, EThread *);
 
   void
