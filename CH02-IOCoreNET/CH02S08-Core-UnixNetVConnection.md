@@ -395,6 +395,268 @@ typedef int (UnixNetVConnection::*NetVConnHandler)(int, void *);
 
 数据是如何从Socket读取到MIOBuffer的？
 
+前面在介绍NetAccept的时候，我们知道：
+
+  - NetAccept负责接受一个新连接，并创建一个VC
+  - 然后向上层状态机的Acceptor传递EVENT_NET_ACCEPT事件
+  - 由上层状态机的Acceptor来创建对应的上层状态机
+  - 然后就由NetHandler来根据上层状态机注册的读、写VIO 和 收到的读、写等事件来回调上层状态机。
+
+因此，对于此问题的答案，要从NetHandler找起。
+
+回顾 NetHandler::mainNetEvent 的分析，我们知道：
+
+  - NetHandler 通过 epoll_wait 发现底层 socket 是否有数据可读取
+  - 然后把有数据可读取的vc放入read_ready_list
+  - 然后调用 vc->net_read_io(this, trigger_event->ethread) 实现数据的读取
+
+下面详细分析 net_read_io 函数：
+
+```
+// net_read_io 是一个封装函数，实际上调用了read_from_net()
+// 在ssl的实现里，会重载这个方法，调用ssl_read_from_net()
+void
+UnixNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
+{
+  read_from_net(nh, this, lthread);
+}
+
+// Read the data for a UnixNetVConnection.
+// Rescheduling the UnixNetVConnection by moving the VC
+// onto or off of the ready_list.
+// Had to wrap this function with net_read_io for SSL.
+// 这才是真正负责读取socket并且把读取到的数据放入MIOBuffer的方法
+static void
+read_from_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
+{
+  NetState *s = &vc->read;
+  ProxyMutex *mutex = thread->mutex;
+  int64_t r = 0;
+
+  // 尝试获取对此VC的VIO的Mutex锁
+  MUTEX_TRY_LOCK_FOR(lock, s->vio.mutex, thread, s->vio._cont);
+  if (!lock.is_locked()) {
+    // 如果没有拿到锁，就重新调度，等下一次再读取
+    // read_reschedule 会吧此vc放回到read_ready_link的队列尾部
+    // 由于NetHandler的处理方式，必然会在本次EventSystem回调NetHandler中完成所有的读操作
+    //     不会延迟到下一次EventSystem对NetHandler的回调
+    read_reschedule(nh, vc);
+    return;
+  }
+
+  // It is possible that the closed flag got set from HttpSessionManager in the
+  // global session pool case.  If so, the closed flag should be stable once we get the
+  // s->vio.mutex (the global session pool mutex).
+  // 拿到锁之后，首先判断该vc是否被异步关闭了，因为 HttpSessionManager 会管理一个全局的session池。
+  if (vc->closed) {
+    close_UnixNetVConnection(vc, thread);
+    return;
+  }
+  // if it is not enabled.
+  // 再判断，该vc的读操作是否被异步禁止了
+  if (!s->enabled || s->vio.op != VIO::READ) {
+    read_disable(nh, vc);
+    return;
+  }
+
+  // 下面才开始进入读操作前的准备工作
+  // 获取缓冲区，准备写入数据
+  MIOBufferAccessor &buf = s->vio.buffer;
+  // 缓冲区如果不存在则报异常并crash
+  ink_assert(buf.writer());
+
+  // if there is nothing to do, disable connection
+  // 在VIO中定义了总共需要读取的数据的总长度，还有已经完成的数据读取长度
+  // ntodo 是剩余的，还需要读取的数据长度
+  int64_t ntodo = s->vio.ntodo();
+  if (ntodo <= 0) {
+    // ntodo为0，表示VIO定义的读操作在之前就已经全部完成了
+    // 因此直接禁止此VC的读操作
+    read_disable(nh, vc);
+    return;
+  }
+  
+  // 查看MIOBuffer缓冲区剩余的可写空间，作为本次即将读取的数据长度
+  int64_t toread = buf.writer()->write_avail();
+  // 如果 toread 大于 ntodo，就调整一下 toread 的值
+  // 需要注意：toread 可能会等于 0
+  if (toread > ntodo)
+    toread = ntodo;
+
+  // read data
+  // 读取数据
+  // 因为MIOBuffer的底层可能会有多个IOBufferBlock，因此会使用readv系统调用，注册多个数据块到IOVec向量完成读取操作。
+  // total_read 表示实际读取到的数据长度
+  int64_t rattempted = 0, total_read = 0;
+  int niov = 0;
+  IOVec tiovec[NET_MAX_IOV];
+  // 只有 toread 大于 0 的时候才进行真正的读操作
+  if (toread) {
+    IOBufferBlock *b = buf.writer()->first_write_block();
+    do {
+      // niov 值被设置为本次IOVec向量的数量，表示使用了几个内存块来保存数据
+      niov = 0;
+      // rattempted 值被设置为本次计划读取的数据长度
+      rattempted = 0;
+      
+      // 根据底层的IOBufferBlock来构建IOVec向量数组
+      // 但是每次构建的IOVec向量数量最大值为 NET_MAX_IOV
+      // 如果要读的数据比较多，就分成多次调用readv
+      while (b && niov < NET_MAX_IOV) {
+        int64_t a = b->write_avail();
+        if (a > 0) {
+          tiovec[niov].iov_base = b->_end;
+          int64_t togo = toread - total_read - rattempted;
+          if (a > togo)
+            a = togo;
+          tiovec[niov].iov_len = a;
+          rattempted += a;
+          niov++;
+          if (a >= togo)
+            break;
+        }
+        b = b->next;
+      }
+
+      // 如果只有一个数据块，就调用read方法，否则调用readv方法
+      if (niov == 1) {
+        r = socketManager.read(vc->con.fd, tiovec[0].iov_base, tiovec[0].iov_len);
+      } else {
+        r = socketManager.readv(vc->con.fd, &tiovec[0], niov);
+      }
+      // 更新读操作次数计数器
+      NET_INCREMENT_DYN_STAT(net_calls_to_read_stat);
+
+      // 数据读取的调试追踪
+      if (vc->origin_trace) {
+        char origin_trace_ip[INET6_ADDRSTRLEN];
+
+        ats_ip_ntop(vc->origin_trace_addr, origin_trace_ip, sizeof(origin_trace_ip));
+
+        if (r > 0) {
+          TraceIn((vc->origin_trace), vc->get_remote_addr(), vc->get_remote_port(), "CLIENT %s:%d\tbytes=%d\n%.*s", origin_trace_ip,
+                  vc->origin_trace_port, (int)r, (int)r, (char *)tiovec[0].iov_base);
+
+        } else if (r == 0) {
+          TraceIn((vc->origin_trace), vc->get_remote_addr(), vc->get_remote_port(), "CLIENT %s:%d closed connection",
+                  origin_trace_ip, vc->origin_trace_port);
+        } else {
+          TraceIn((vc->origin_trace), vc->get_remote_addr(), vc->get_remote_port(), "CLIENT %s:%d error=%s", origin_trace_ip,
+                  vc->origin_trace_port, strerror(errno));
+        }
+      }
+
+      // 更新 total_read 计数器
+      total_read += rattempted;
+    // 如果数据读取成功(r == rattempted)，并且VIO的任务没有完成(total_read < toread)，则继续do-while循环读取数据
+    } while (rattempted && r == rattempted && total_read < toread);
+    // 如果读取出现了失败(r != rattempted)，则跳出do-while循环，停止读取操作，此时可能完成了部分数据的读取
+
+    // if we have already moved some bytes successfully, summarize in r
+    // 根据 r 的值对total_read计数器进行调整
+    if (total_read != rattempted) {
+      if (r <= 0)
+        r = total_read - rattempted;
+      else
+        r = total_read - rattempted + r;
+    }
+    // check for errors
+    // 当 r<=0 表示发生了错误
+    if (r <= 0) {
+      // EAGAIN 表示缓冲区读空了，没有数据可度，那么就准备下一次epoll_wait触发时再读取
+      if (r == -EAGAIN || r == -ENOTCONN) {
+        NET_INCREMENT_DYN_STAT(net_calls_to_read_nodata_stat);
+        vc->read.triggered = 0;
+        nh->read_ready_list.remove(vc);
+        return;
+      }
+
+      // 如果连接被关闭了，就触发EOS通知上层状态机
+      if (!r || r == -ECONNRESET) {
+        vc->read.triggered = 0;
+        nh->read_ready_list.remove(vc);
+        read_signal_done(VC_EVENT_EOS, nh, vc);
+        return;
+      }
+      
+      // 其它情况，触发ERROR通知上层状态机
+      vc->read.triggered = 0;
+      read_signal_error(nh, vc, (int)-r);
+      return;
+    }
+    
+    // 读取成功，更新数据读取计数器
+    NET_SUM_DYN_STAT(net_read_bytes_stat, r);
+
+    // Add data to buffer and signal continuation.
+    // 更新MIOBuffer的计数器，增加可供消费的数据量
+    buf.writer()->fill(r);
+#ifdef DEBUG
+    if (buf.writer()->write_avail() <= 0)
+      Debug("iocore_net", "read_from_net, read buffer full");
+#endif
+    // 更新VIO的计数器，增加已经完成的数据量
+    s->vio.ndone += r;
+    // 刷新超时计时器
+    net_activity(vc, thread);
+  } else
+    r = 0;
+  // 如果缓冲区写满了，则没有发生真正的读操作，设置 r 为 0
+
+  // Signal read ready, check if user is not done
+  // 当 r>0 时，表示本次读取到了数据
+  //     那么要回调上层状态机，但是需要判断应该传递什么样的事件
+  if (r) {
+    // If there are no more bytes to read, signal read complete
+    ink_assert(ntodo >= 0);
+    if (s->vio.ntodo() <= 0) {
+      // 如果 VIO 的要求全部完成了，那么回调READ_COMPLETE给上层状态机
+      read_signal_done(VC_EVENT_READ_COMPLETE, nh, vc);
+      Debug("iocore_net", "read_from_net, read finished - signal done");
+      return;
+    } else {
+      // 如果 VIO 的要求没有完成，那么回调READ_READY给上层状态机
+      // 如果返回值不为EVENT_CONT，那么就表示上层状态机关闭了vc，就不用再继续处理了。
+      if (read_signal_and_update(VC_EVENT_READ_READY, vc) != EVENT_CONT)
+        return;
+
+      // change of lock... don't look at shared variables!
+      // 如果上层状态机把VIO的mutex更换了，那么我们之前的锁定已经失效
+      // 因此不能再继续操作该VIO了，只能重新调度vc，把vc放回到read_ready_list等待下一次NetHandler的下一次调用
+      if (lock.get_mutex() != s->vio.mutex.m_ptr) {
+        read_reschedule(nh, vc);
+        return;
+      }
+    }
+  }
+  
+  // If here are is no more room, or nothing to do, disable the connection
+  // 如果：
+  //     MIOBuffer没有空间可写（没有发生真正的读操作）
+  // 或者：
+  //     读取了数据，但是没有完成全部的VIO操作，而且上层状态机没有关闭VC，也没有修改Mutex
+  // 那么，如果：
+  //     上层状态机可能取消了VIO的操作：s->vio.ntodo() <= 0
+  //     上层状态机可能禁止了读VIO：s->enabled == 0
+  //     上层状态机可能把MIOBuffer用光了：buf.writer()->write_avail() == 0
+  if (s->vio.ntodo() <= 0 || !s->enabled || !buf.writer()->write_avail()) {
+  // 那么就关闭此VC的读操作。
+    read_disable(nh, vc);
+    return;
+  }
+
+  // 其它情况：重新调度vc的读操作，此时，以下条件必然满足：
+  //     s->vio.ntodo() > 0
+  //     s->enabled == 1
+  //     buf.writer()->write_avail() > 0
+  read_reschedule(nh, vc);
+}
+```
+
+## 创建与Origin Server的连接
+
+如何创建与源服务器的连接？
+
 ## 从MIOBuffer到Socket
 
 数据是如何从MIOBuffer写入Socket的？
@@ -408,3 +670,4 @@ typedef int (UnixNetVConnection::*NetVConnHandler)(int, void *);
 - [P_UnixNetState.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNetState.h)
 - [P_UnixNet.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNet.h)
 - [P_UnixNetVConnection.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNetVConnection.h)
+- [UnixNetVConnection.cc](http://github.com/apache/trafficserver/tree/master/iocore/net/UnixNetVConnection.cc)
