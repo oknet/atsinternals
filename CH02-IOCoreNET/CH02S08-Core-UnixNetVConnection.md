@@ -409,9 +409,9 @@ typedef int (UnixNetVConnection::*NetVConnHandler)(int, void *);
   - NetHandler 通过 epoll_wait 发现底层 socket 是否有数据可读取
   - 然后把有数据可读取的vc放入read_ready_list
   - 然后遍历read_ready_list
-  - 对于Read VIO处于激活状态的vc，调用 vc->net_read_io(this, trigger_event->ethread) 实现数据的读取
+  - 对于Read VIO处于激活状态的vc，调用 vc->net_read_io(this, trigger_event->ethread) 实现数据的接收
   - 然后回调上层状态机
-  - 对于读取的状态：成功，失败，是否完成VIO，向上层状态机传递不同的事件，同时传递VC或VIO
+  - 对于接收的结果：成功，失败，是否完成VIO，向上层状态机传递不同的事件，同时传递VC或VIO
 
 下面详细分析 net_read_io 函数：
 
@@ -663,6 +663,288 @@ read_from_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 ## 从MIOBuffer到Socket
 
 数据是如何从MIOBuffer写入Socket的？
+
+回顾 NetHandler::mainNetEvent 的分析，我们知道：
+
+  - NetHandler 通过 epoll_wait 发现底层 socket 是否可写
+  - 然后把有数据可读取的vc放入write_ready_list
+  - 然后遍历write_ready_list
+  - 对于Write VIO处于激活状态的vc，调用 write_to_net(this, vc, trigger_event->ethread) 实现数据的发送
+  - 然后回调上层状态机
+  - 对于发送的结果：成功，失败，是否完成VIO，向上层状态机传递不同的事件，同时传递VC或VIO
+
+下面详细分析 write_to_net 函数：
+
+```
+// write_to_net 是一个封装函数，实际上调用了write_to_net_io()
+// 需要注意的是：write_to_net() 和 write_to_net_io() 都不是 UnixNetVConnection的内部方法
+// 对于SSLVC来说，同样也会调用这两个方法
+void
+write_to_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
+{
+  ProxyMutex *mutex = thread->mutex;
+
+  NET_INCREMENT_DYN_STAT(net_calls_to_writetonet_stat);
+  NET_INCREMENT_DYN_STAT(net_calls_to_writetonet_afterpoll_stat);
+
+
+  write_to_net_io(nh, vc, thread);
+}
+
+//
+// Write the data for a UnixNetVConnection.
+// Rescheduling the UnixNetVConnection when necessary.
+//
+// write_to_net_io 并不负责发送数据，它需要调用 load_buffer_and_write() 完成数据的发送
+// 但是它负责在数据发送前和发送之后，回调上层状态机
+// 对于 SSLNetVConnection，通过重载 load_buffer_and_write 实现数据的加密发送
+void
+write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
+{
+  NetState *s = &vc->write;
+  ProxyMutex *mutex = thread->mutex;
+
+  MUTEX_TRY_LOCK_FOR(lock, s->vio.mutex, thread, s->vio._cont);
+
+  if (!lock.is_locked() || lock.get_mutex() != s->vio.mutex.m_ptr) {
+    write_reschedule(nh, vc);
+    return;
+  }
+
+  // This function will always return true unless
+  // vc is an SSLNetVConnection.
+  if (!vc->getSSLHandShakeComplete()) {
+    int err, ret;
+
+    if (vc->getSSLClientConnection())
+      ret = vc->sslStartHandShake(SSL_EVENT_CLIENT, err);
+    else
+      ret = vc->sslStartHandShake(SSL_EVENT_SERVER, err);
+
+    if (ret == EVENT_ERROR) {
+      vc->write.triggered = 0;
+      write_signal_error(nh, vc, err);
+    } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
+      vc->read.triggered = 0;
+      nh->read_ready_list.remove(vc);
+      read_reschedule(nh, vc);
+    } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
+      vc->write.triggered = 0;
+      nh->write_ready_list.remove(vc);
+      write_reschedule(nh, vc);
+    } else if (ret == EVENT_DONE) {
+      vc->write.triggered = 1;
+      if (vc->write.enabled)
+        nh->write_ready_list.in_or_enqueue(vc);
+    } else
+      write_reschedule(nh, vc);
+    return;
+  }
+  // If it is not enabled,add to WaitList.
+  if (!s->enabled || s->vio.op != VIO::WRITE) {
+    write_disable(nh, vc);
+    return;
+  }
+  // If there is nothing to do, disable
+  int64_t ntodo = s->vio.ntodo();
+  if (ntodo <= 0) {
+    write_disable(nh, vc);
+    return;
+  }
+
+  MIOBufferAccessor &buf = s->vio.buffer;
+  ink_assert(buf.writer());
+
+  // Calculate amount to write
+  int64_t towrite = buf.reader()->read_avail();
+  if (towrite > ntodo)
+    towrite = ntodo;
+  int signalled = 0;
+
+  // signal write ready to allow user to fill the buffer
+  if (towrite != ntodo && buf.writer()->write_avail()) {
+    if (write_signal_and_update(VC_EVENT_WRITE_READY, vc) != EVENT_CONT) {
+      return;
+    }
+    ntodo = s->vio.ntodo();
+    if (ntodo <= 0) {
+      write_disable(nh, vc);
+      return;
+    }
+    signalled = 1;
+    // Recalculate amount to write
+    towrite = buf.reader()->read_avail();
+    if (towrite > ntodo)
+      towrite = ntodo;
+  }
+  // if there is nothing to do, disable
+  ink_assert(towrite >= 0);
+  if (towrite <= 0) {
+    write_disable(nh, vc);
+    return;
+  }
+
+  int64_t total_written = 0, wattempted = 0;
+  int needs = 0;
+  int64_t r = vc->load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
+
+  // if we have already moved some bytes successfully, summarize in r
+  if (total_written != wattempted) {
+    if (r <= 0)
+      r = total_written - wattempted;
+    else
+      r = total_written - wattempted + r;
+  }
+  // check for errors
+  if (r <= 0) { // if the socket was not ready,add to WaitList
+    if (r == -EAGAIN || r == -ENOTCONN) {
+      NET_INCREMENT_DYN_STAT(net_calls_to_write_nodata_stat);
+      if ((needs & EVENTIO_WRITE) == EVENTIO_WRITE) {
+        vc->write.triggered = 0;
+        nh->write_ready_list.remove(vc);
+        write_reschedule(nh, vc);
+      }
+      if ((needs & EVENTIO_READ) == EVENTIO_READ) {
+        vc->read.triggered = 0;
+        nh->read_ready_list.remove(vc);
+        read_reschedule(nh, vc);
+      }
+      return;
+    }
+    if (!r || r == -ECONNRESET) {
+      vc->write.triggered = 0;
+      write_signal_done(VC_EVENT_EOS, nh, vc);
+      return;
+    }
+    vc->write.triggered = 0;
+    write_signal_error(nh, vc, (int)-r);
+    return;
+  } else {
+    int wbe_event = vc->write_buffer_empty_event; // save so we can clear if needed.
+
+    NET_SUM_DYN_STAT(net_write_bytes_stat, r);
+
+    // Remove data from the buffer and signal continuation.
+    ink_assert(buf.reader()->read_avail() >= r);
+    buf.reader()->consume(r);
+    ink_assert(buf.reader()->read_avail() >= 0);
+    s->vio.ndone += r;
+
+    // If the empty write buffer trap is set, clear it.
+    if (!(buf.reader()->is_read_avail_more_than(0)))
+      vc->write_buffer_empty_event = 0;
+
+    net_activity(vc, thread);
+    // If there are no more bytes to write, signal write complete,
+    ink_assert(ntodo >= 0);
+    if (s->vio.ntodo() <= 0) {
+      write_signal_done(VC_EVENT_WRITE_COMPLETE, nh, vc);
+      return;
+    } else if (signalled && (wbe_event != vc->write_buffer_empty_event)) {
+      // @a signalled means we won't send an event, and the event values differing means we
+      // had a write buffer trap and cleared it, so we need to send it now.
+      if (write_signal_and_update(wbe_event, vc) != EVENT_CONT)
+        return;
+    } else if (!signalled) {
+      if (write_signal_and_update(VC_EVENT_WRITE_READY, vc) != EVENT_CONT) {
+        return;
+      }
+      // change of lock... don't look at shared variables!
+      if (lock.get_mutex() != s->vio.mutex.m_ptr) {
+        write_reschedule(nh, vc);
+        return;
+      }
+    }
+    if (!buf.reader()->read_avail()) {
+      write_disable(nh, vc);
+      return;
+    }
+
+    if ((needs & EVENTIO_WRITE) == EVENTIO_WRITE) {
+      write_reschedule(nh, vc);
+    }
+    if ((needs & EVENTIO_READ) == EVENTIO_READ) {
+      read_reschedule(nh, vc);
+    }
+    return;
+  }
+}
+
+// This code was pulled out of write_to_net so
+// I could overwrite it for the SSL implementation
+// (SSL read does not support overlapped i/o)
+// without duplicating all the code in write_to_net.
+// 在 SSLNetVConnection 通过重载此方法，完成SSL数据的加密发送
+int64_t
+UnixNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, int64_t &total_written, MIOBufferAccessor &buf,
+                                          int &needs)
+{
+  int64_t r = 0;
+
+  // XXX Rather than dealing with the block directly, we should use the IOBufferReader API.
+  int64_t offset = buf.reader()->start_offset;
+  IOBufferBlock *b = buf.reader()->block;
+
+  do {
+    IOVec tiovec[NET_MAX_IOV];
+    int niov = 0;
+    int64_t total_written_last = total_written;
+    while (b && niov < NET_MAX_IOV) {
+      // check if we have done this block
+      int64_t l = b->read_avail();
+      l -= offset;
+      if (l <= 0) {
+        offset = -l;
+        b = b->next;
+        continue;
+      }
+      // check if to amount to write exceeds that in this buffer
+      int64_t wavail = towrite - total_written;
+      if (l > wavail)
+        l = wavail;
+      if (!l)
+        break;
+      total_written += l;
+      // build an iov entry
+      tiovec[niov].iov_len = l;
+      tiovec[niov].iov_base = b->start() + offset;
+      niov++;
+      // on to the next block
+      offset = 0;
+      b = b->next;
+    }
+    wattempted = total_written - total_written_last;
+    if (niov == 1)
+      r = socketManager.write(con.fd, tiovec[0].iov_base, tiovec[0].iov_len);
+    else
+      r = socketManager.writev(con.fd, &tiovec[0], niov);
+
+    if (origin_trace) {
+      char origin_trace_ip[INET6_ADDRSTRLEN];
+      ats_ip_ntop(origin_trace_addr, origin_trace_ip, sizeof(origin_trace_ip));
+
+      if (r > 0) {
+        TraceOut(origin_trace, get_remote_addr(), get_remote_port(), "CLIENT %s:%d\tbytes=%d\n%.*s", origin_trace_ip,
+                 origin_trace_port, (int)r, (int)r, (char *)tiovec[0].iov_base);
+
+      } else if (r == 0) {
+        TraceOut(origin_trace, get_remote_addr(), get_remote_port(), "CLIENT %s:%d closed connection", origin_trace_ip,
+                 origin_trace_port);
+      } else {
+        TraceOut(origin_trace, get_remote_addr(), get_remote_port(), "CLIENT %s:%d error=%s", origin_trace_ip, origin_trace_port,
+                 strerror(errno));
+      }
+    }
+
+    ProxyMutex *mutex = thread->mutex;
+    NET_INCREMENT_DYN_STAT(net_calls_to_write_stat);
+  } while (r == wattempted && total_written < towrite);
+
+  needs |= EVENTIO_WRITE;
+
+  return (r);
+}
+```
 
 ## Inactivity Timeout 的实现
 
