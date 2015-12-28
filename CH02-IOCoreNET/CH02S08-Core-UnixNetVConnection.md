@@ -408,7 +408,10 @@ typedef int (UnixNetVConnection::*NetVConnHandler)(int, void *);
 
   - NetHandler 通过 epoll_wait 发现底层 socket 是否有数据可读取
   - 然后把有数据可读取的vc放入read_ready_list
-  - 然后调用 vc->net_read_io(this, trigger_event->ethread) 实现数据的读取
+  - 然后遍历read_ready_list
+  - 对于Read VIO处于激活状态的vc，调用 vc->net_read_io(this, trigger_event->ethread) 实现数据的读取
+  - 然后回调上层状态机
+  - 对于读取的状态：成功，失败，是否完成VIO，向上层状态机传递不同的事件，同时传递VC或VIO
 
 下面详细分析 net_read_io 函数：
 
