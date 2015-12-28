@@ -32,6 +32,40 @@
 
 以下内容为了描述方便，对代码行的顺序做了部分调整。
 
+首先看一下 [NetState](https://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNetState.h)，
+
+```
+struct NetState {
+  volatile int enabled;
+  VIO vio;
+  Link<UnixNetVConnection> ready_link;
+  SLink<UnixNetVConnection> enable_link;
+  int in_enabled_list;
+  int triggered;
+
+  NetState() : enabled(0), vio(VIO::NONE), in_enabled_list(0), triggered(0) {}
+};
+
+```
+
+然后是 UnixNetVConnection，
+
+```
+// 计算VIO成员在NetState实例中的内存偏移量
+#define STATE_VIO_OFFSET ((uintptr_t) & ((NetState *)0)->vio)
+// 返回指向包含指定VIO的NetState实例的指针
+#define STATE_FROM_VIO(_x) ((NetState *)(((char *)(_x)) - STATE_VIO_OFFSET))
+
+// 关闭指定VC的读写操作，实际是修改指定VC的NetState实例read或write里的enabled成员为0
+#define disable_read(_vc) (_vc)->read.enabled = 0
+#define disable_write(_vc) (_vc)->write.enabled = 0
+// 打开指定VC的读写操作，实际是修改指定VC的NetState实例read或write里的enabled成员为1
+#define enable_read(_vc) (_vc)->read.enabled = 1
+#define enable_write(_vc) (_vc)->write.enabled = 1
+```
+
+上面几个宏定义都是用于操作NetState结构的，下面会使用到。
+
 ```
 class UnixNetVConnection : public NetVConnection
 {
@@ -43,6 +77,8 @@ public:
   virtual void do_io_close(int lerrno = -1);
   virtual void do_io_shutdown(ShutdownHowTo_t howto);
 
+  // 专门给 TS API 提供的方法
+  // 由TSVConnReadVIOGet, TSVConnWriteVIOGet, TSVConnClosedGet, TSTransformOutputVConnGet调用
   virtual bool get_data(int id, void *data);
 
   // 发送带外数据的子状态机及对应的cancel方法
@@ -101,8 +137,12 @@ public:
   /////////////////////////////////////////////////////////////////
   // instances of UnixNetVConnection should be allocated         //
   // only from the free list using UnixNetVConnection::alloc().  //
-  // The constructor is public just to avoid compile errors.      //
+  // The constructor is public just to avoid compile errors.     //
   /////////////////////////////////////////////////////////////////
+  // UnixNetVConnection 实例只能通过alloc()方法分配
+  // 实际上是通过ProxyAllocator或者全局空间分配器完成分配
+  // 在全局空间分配器内有一个UnixNetVConnection的实例，它会运行这个构造函数完成初始化
+  // 通过 ProxyAllocator 或者 全局空间分配器 分配的实例都是直接copy内部实例的内存空间完成初始化
   UnixNetVConnection();
 
 private:
@@ -113,8 +153,13 @@ public:
   /////////////////////////
   // UNIX implementation //
   /////////////////////////
+  
+  // 设置包含该VIO实例的NetState实例的enabled成员为1
+  // 并且同时重新设置inactivity timeout的计时器
   void set_enabled(VIO *vio);
 
+  // 已经废弃不用了
+  // 看函数名字，猜测是获取本地Socket Address的结构
   void get_local_sa();
 
   // these are not part of the pure virtual interface.  They were
@@ -142,23 +187,49 @@ public:
   {
     (void)state;
   }
-  // 进行读操作，从socket上读取数据，生产到Read VIO内的MIOBuffer
+  
+  // 进行读操作，从socket上读取数据，生产到Read VIO内的MIOBuffer，直接调用read_from_net()实现
   virtual void net_read_io(NetHandler *nh, EThread *lthread);
   // 进行写操作，由write_to_net_io调用，从Write VIO内的MIOBufferAccessor消费数据，然后写入socket，返回实际消费的字节数
   virtual int64_t load_buffer_and_write(int64_t towrite, int64_t &wattempted, int64_t &total_written, MIOBufferAccessor &buf,
                                         int &needs);
-  // 关闭当前VC的Read VIO
+
+  // 关闭当前VC的Read VIO，直接调用read_disable()方法实现
+  //     取消超时控制，从NetHandler的read_ready_list中删除，从epoll中删除
   void readDisable(NetHandler *nh);
-  // ??
+  // 注意，在ATS中没有 writeDisable !!!
+
+  // 当VIO的读操作遇到错误时，此方法被调用，上层状态机会收到 ERROR 事件
+  //     设置vc->lerrno=err后，直接调用read_signal_done(VC_EVENT_ERROR)方法实现
   void readSignalError(NetHandler *nh, int err);
-  // ??
+  // 注意，UnixNetVConnection类中，没有 writeSignalError 方法，但是存在write_signal_error()函数
+
+  // 当VIO的读操作完成时，此方法被调用，上层状态机会收到 READ_COMPLETE 或 EOS 事件
+  //     直接调用read_signal_done(event)方法实现
+  //     如果上层状态机在回调中没有关闭VC，
+  //         那么会通过 read_reschedule 从NetHandler的read_ready_list移除对应的VC
+  //     如果该VC被关闭，则由close_UnixNetVConnection负责从NetHandler的read和write队列移除VC
   int readSignalDone(int event, NetHandler *nh);
-  // ??
+  // 注意，UnixNetVConnection类中，没有 writeSignalDone 方法，但是存在write_signal_done()函数
+
+  // 当完成一个VIO的读操作时，此方法被调用，上层状态机会收到 READ_READY 事件
+  //     直接调用read_signal_and_update(event)方法实现
   int readSignalAndUpdate(int event);
-  // 重新调度当前VC的读写操作
+  // 注意，UnixNetVConnection类中，没有 writeSignalAndUpdate 方法，但是存在write_signal_and_update()函数
+
+  // 重新调度当前VC的读操作
+  //     直接调用read_reschedule()方法实现
+  //     如果 read.triggered 和 read.enabled 都为 true 就会重新添加到NetHandler的read_ready_list队列
+  //     否则，从NetHandler的read_ready_list队列移除对应的vc
   void readReschedule(NetHandler *nh);
+  // 重新调度当前VC的写操作
+  //     直接调用write_reschedule()方法实现
+  //     如果 write.triggered 和 write.enabled 都为 true 就会重新添加到NetHandler的write_ready_list队列
+  //     否则，从NetHandler的write_ready_list队列移除对应的vc
   void writeReschedule(NetHandler *nh);
-  // ??
+  
+  // 更新inactivity timeout计时器，每次执行读写操作后，都要调用此方法来更新计时器
+  //     直接调用net_activity()方法实现
   void netActivity(EThread *lthread);
   
   /**
@@ -187,7 +258,7 @@ public:
   LINKM(UnixNetVConnection, write, ready_link)
   SLINKM(UnixNetVConnection, write, enable_link)
 
-  // 定义用于InActivityCop内部的链表节点
+  // 定义用于InactivityCop内部的链表节点
   LINK(UnixNetVConnection, cop_link);
   // 定义用于实现keepalive连接池管理的链表节点
   LINK(UnixNetVConnection, keep_alive_queue_link);
@@ -207,12 +278,16 @@ public:
 #endif
 
   // 用于操作epoll的描述符
+  //     在reenable, reenable_re, acceptEvent, connectUp中使用到
   EventIO ep;
   // 指向管理此连接的NetHandler
   NetHandler *nh;
-  // 此连接的唯一ID，自增长值
+  // 此连接的唯一ID，自增长值，通过UnixNetProcessor.cc::net_next_connection_number()分配
   unsigned int id;
-  // 服务器端的地址，AMC大神在这里做了一个注释，觉得这儿重复定义了，其实可以使用con.addr
+  // 服务器端的地址（感觉此处仅仅是为了兼容性）
+  //     在NetAccept中，在connect_re_internal中，都使用ats_ip_copy方法，从con.addr直接内存复制过来
+  //     在Connection::connect中调用setRemote方法，也使用ats_ip_copy方法，从target直接内存复制到con.addr
+  // AMC大神在这里做了一个注释，觉得这儿重复定义了，其实可以使用con.addr
   // amc - what is this for? Why not use remote_addr or con.addr?
   IpEndpoint server_addr; /// Server address and port.
 
@@ -241,6 +316,7 @@ public:
   // 表示该VC的内存由全局空间分配，在释放时，需要直接调用全局空间释放
   bool from_accept_thread;
 
+  // 用来调试和追踪数据传输的
   // es - origin_trace associated connections
   bool origin_trace;
   const sockaddr *origin_trace_addr;
@@ -267,21 +343,24 @@ public:
   virtual int populate(Connection &con, Continuation *c, void *arg);
   
   // 释放该VC，并不会释放内存，只是把内存归还到freelist内存池或者全局内存池
+  //     同时会释放该vc使用的mutex，上层状态机使用的mutex，读、写VIO使用的mutex
   virtual void free(EThread *t);
 
-
+  // 返回成员：inactivity_timeout_in
   virtual ink_hrtime get_inactivity_timeout();
+  // 返回成员：active_timeout_in
   virtual ink_hrtime get_active_timeout();
 
-  // 设置本地地址
+  // 设置本地地址，local_addr.sa
   virtual void set_local_addr();
-  // 设置远端地址
+  // 设置远端地址，remote_addr
   virtual void set_remote_addr();
   
   // 设置 TCP 的 INIT CWND 参数
   virtual int set_tcp_init_cwnd(int init_cwnd);
   
   // 设置 TCP 的一些参数
+  //     直接调用 con.apply_options(options) 实现
   virtual void apply_options();
 
   // 进行写操作，为了与SSL部分兼容，实际是调用load_buffer_and_write来完成socket的写操作
@@ -309,12 +388,23 @@ public:
 extern ClassAllocator<UnixNetVConnection> netVCAllocator;
 
 typedef int (UnixNetVConnection::*NetVConnHandler)(int, void *);
+
 ```
 
-## 方法
+## 从Socket到MIOBuffer
 
+数据是如何从Socket读取到MIOBuffer的？
 
+## 从MIOBuffer到Socket
+
+数据是如何从MIOBuffer写入Socket的？
+
+## Inactivity Timeout 的实现
+
+## InactivityCop 状态机
 
 ## 参考资料
 
+- [P_UnixNetState.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNetState.h)
+- [P_UnixNet.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNet.h)
 - [P_UnixNetVConnection.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNetVConnection.h)
