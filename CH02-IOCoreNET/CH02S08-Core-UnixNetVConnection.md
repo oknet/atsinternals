@@ -808,11 +808,15 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
   }
 
   // 调用 vc->load_buffer_and_write 完成实际的写操作
+  // wattempted 表示尝试写的数据量，total_written 表示实际写成功的数据量
   int64_t total_written = 0, wattempted = 0;
+  // ???
   int needs = 0;
+  // r 值为最后一次写操作的返回值，大于0表示实际写入的字节，小于等于0表示错误码
   int64_t r = vc->load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
 
   // if we have already moved some bytes successfully, summarize in r
+  // 如果部分写成功，调整 r 值，用于表示实际写成功的数据量。
   if (total_written != wattempted) {
     if (r <= 0)
       r = total_written - wattempted;
@@ -820,14 +824,19 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
       r = total_written - wattempted + r;
   }
   // check for errors
+  // 当 r<=0 表示没有任何数据发送，因为没有一次成功的写操作
   if (r <= 0) { // if the socket was not ready,add to WaitList
+    // 判断EAGAIN的情况，表示写缓冲满了
     if (r == -EAGAIN || r == -ENOTCONN) {
       NET_INCREMENT_DYN_STAT(net_calls_to_write_nodata_stat);
+      // 从write_ready_list中删除，等下一次epoll_wait事件再继续写
       if ((needs & EVENTIO_WRITE) == EVENTIO_WRITE) {
         vc->write.triggered = 0;
         nh->write_ready_list.remove(vc);
         write_reschedule(nh, vc);
       }
+      // 对于UnixNetVConnection，needs只在load_buffer_and_write中设置EVENTIO_WRITE
+      // 下面的判断用于SSLNetVConnection
       if ((needs & EVENTIO_READ) == EVENTIO_READ) {
         vc->read.triggered = 0;
         nh->read_ready_list.remove(vc);
@@ -835,15 +844,21 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
       }
       return;
     }
+    
+    // 如果 r==0 或者 连接关闭，回调上层状态机传递EOS事件
     if (!r || r == -ECONNRESET) {
       vc->write.triggered = 0;
       write_signal_done(VC_EVENT_EOS, nh, vc);
       return;
     }
+    
+    // 其它情况，回调上层状态机传递ERROR事件，并将 -r 作为data传递
     vc->write.triggered = 0;
     write_signal_error(nh, vc, (int)-r);
     return;
-  } else {
+  } else {  // 当 r >= 0 时
+    // WBE = Write Buffer Empty
+    // 这是一个特殊的机制
     int wbe_event = vc->write_buffer_empty_event; // save so we can clear if needed.
 
     NET_SUM_DYN_STAT(net_write_bytes_stat, r);
