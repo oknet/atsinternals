@@ -858,30 +858,38 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
     return;
   } else {  // 当 r >= 0 时
     // WBE = Write Buffer Empty
-    // 这是一个特殊的机制
+    // 这是一个特殊的机制，当写操作把数据源的MIOBuffer完全消费掉了，会再次回调上层状态机，并传递wbe_event事件
+    // 这个机制是一次性有效，每次触发后，都要在上层状态机重新设置，否则，下一次写操作完成之后就不会触发这个机制了。
+    // 但是如果遇到 VIO 同时完成了，那么就不会回调上层状态机
     int wbe_event = vc->write_buffer_empty_event; // save so we can clear if needed.
 
     NET_SUM_DYN_STAT(net_write_bytes_stat, r);
 
     // Remove data from the buffer and signal continuation.
+    // 根据实际发送的数据，对MIOBuffer中的数据进行消费
     ink_assert(buf.reader()->read_avail() >= r);
     buf.reader()->consume(r);
+    // 同时更新完成发送的数据量到VIO计数器中
     ink_assert(buf.reader()->read_avail() >= 0);
     s->vio.ndone += r;
 
     // If the empty write buffer trap is set, clear it.
+    // 如果数据源的MIOBuffer完全被消费掉了，那么重置wbe_event为0
     if (!(buf.reader()->is_read_avail_more_than(0)))
       vc->write_buffer_empty_event = 0;
 
+    // 刷新超时计时器
     net_activity(vc, thread);
+    
     // If there are no more bytes to write, signal write complete,
     ink_assert(ntodo >= 0);
     if (s->vio.ntodo() <= 0) {
+      // 如果 VIO 的要求全部完成了，那么回调WRITE_COMPLETE给上层状态机
       write_signal_done(VC_EVENT_WRITE_COMPLETE, nh, vc);
       return;
     } else if (signalled && (wbe_event != vc->write_buffer_empty_event)) {
       // @a signalled means we won't send an event, and the event values differing means we
-      // had a write buffer trap and cleared it, so we need to send it now.
+      // had a write buffer trap and cleared it, so we need to send it now. 
       if (write_signal_and_update(wbe_event, vc) != EVENT_CONT)
         return;
     } else if (!signalled) {
