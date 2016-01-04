@@ -625,7 +625,7 @@ read_from_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 
       // change of lock... don't look at shared variables!
       // 如果上层状态机把VIO的mutex更换了，那么我们之前的锁定已经失效
-      // 因此不能再继续操作该VIO了，只能重新调度vc，把vc放回到read_ready_list等待下一次NetHandler的下一次调用
+      // 因此不能再继续操作该VIO了，只能重新调度vc，把vc放回到read_ready_list等待下一次NetHandler的调用
       if (lock.get_mutex() != s->vio.mutex.m_ptr) {
         read_reschedule(nh, vc);
         return;
@@ -643,7 +643,7 @@ read_from_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
   //     上层状态机可能禁止了读VIO：s->enabled == 0
   //     上层状态机可能把MIOBuffer用光了：buf.writer()->write_avail() == 0
   if (s->vio.ntodo() <= 0 || !s->enabled || !buf.writer()->write_avail()) {
-  // 那么就关闭此VC的读操作。
+    // 那么就关闭此VC的读操作。
     read_disable(nh, vc);
     return;
   }
@@ -773,7 +773,8 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
   int signalled = 0;
 
   // signal write ready to allow user to fill the buffer
-  // 当 towrite < ntodo 并且 缓冲区中还有剩余空间，可以填充更多数据时
+  // 如果 towrite < ntodo : 那么本次一定不会回调WRITE_COMPLETE到上层状态机
+  // 并且 缓冲区中还有剩余空间，可以填充更多数据时
   if (towrite != ntodo && buf.writer()->write_avail()) {
     // 回调上层状态机，传递WRITE_READY事件
     // 让上层状态机在写操作之前填充一次缓冲区
@@ -810,13 +811,15 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
   // 调用 vc->load_buffer_and_write 完成实际的写操作
   // wattempted 表示尝试写的数据量，total_written 表示实际写成功的数据量
   int64_t total_written = 0, wattempted = 0;
-  // ???
+  // 使用 needs 表示在执行完本次写操作之后，通过 或运算 设置对应的标志位，标记是否需要重新调度读、写操作：
+  //     用来实现SSLNetVC在握手过程中需要的多次读写过程，
+  //     对于UnixNetVC，当VIO未完成并且源MIOBuffer有数据可读时，总是设置EVENTIO_WRITE
   int needs = 0;
   // r 值为最后一次写操作的返回值，大于0表示实际写入的字节，小于等于0表示错误码
   int64_t r = vc->load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
 
   // if we have already moved some bytes successfully, summarize in r
-  // 如果部分写成功，调整 r 值，用于表示实际写成功的数据量。
+  // 如果部分写成功，调整 r 值，用于表示实际发送成功的数据量。
   if (total_written != wattempted) {
     if (r <= 0)
       r = total_written - wattempted;
@@ -856,7 +859,9 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
     vc->write.triggered = 0;
     write_signal_error(nh, vc, (int)-r);
     return;
-  } else {  // 当 r >= 0 时
+  } else {
+    // 当 r >= 0 时，表示数据发送成功了，至少发送出去一部分数据
+    //
     // WBE = Write Buffer Empty
     // 这是一个特殊的机制，当写操作把数据源的MIOBuffer完全消费掉了，会再次回调上层状态机，并传递wbe_event事件
     // 这个机制是一次性有效，每次触发后，都要在上层状态机重新设置，否则，下一次写操作完成之后就不会触发这个机制了。
@@ -882,34 +887,59 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
     net_activity(vc, thread);
     
     // If there are no more bytes to write, signal write complete,
+    // 此处：由于 ntodo=s->vio.ntodo() 是在发送数据之前做的赋值，
+    // 所以，ntodo表示VIO内剩余需要发送的总数据量，运行到此处时应该是大于 0 的
+    // 但是，s->vio.ntodo() 则是实时获取发送之后的值，若为 0 则表示完成了 VIO
     ink_assert(ntodo >= 0);
     if (s->vio.ntodo() <= 0) {
-      // 如果 VIO 的要求全部完成了，那么回调WRITE_COMPLETE给上层状态机
+      // 如果 VIO 的要求全部完成了，那么回调WRITE_COMPLETE给上层状态机，并返回
       write_signal_done(VC_EVENT_WRITE_COMPLETE, nh, vc);
       return;
+    // 如果 VIO 的要求还没有完成：
     } else if (signalled && (wbe_event != vc->write_buffer_empty_event)) {
       // @a signalled means we won't send an event, and the event values differing means we
       // had a write buffer trap and cleared it, so we need to send it now. 
+      // ！！！此处的注释信息与代码不一致，应该是注释写错了！！！
+      // 按照代码含义解释为：
+      //     如果之前回调过上层状态机，而且设置了wbe_event，那么则回调wbe_event给上层状态机
+      // 如果返回值不为EVENT_CONT，那么就表示上层状态机关闭了vc，就不用再继续处理了。
       if (write_signal_and_update(wbe_event, vc) != EVENT_CONT)
         return;
+      // ！！！此处存在问题，上层状态机可能会修改mutex，如果此处继续运行可能会出现问题！！！
     } else if (!signalled) {
+      // 如果之前没有回调上层状态机，那么回调WRITE_READY给上层状态机
+      // 如果返回值不为EVENT_CONT，那么就表示上层状态机关闭了vc，就不用再继续处理了。
       if (write_signal_and_update(VC_EVENT_WRITE_READY, vc) != EVENT_CONT) {
         return;
       }
+      
       // change of lock... don't look at shared variables!
+      // 如果上层状态机把VIO的mutex更换了，那么我们之前的锁定已经失效
+      // 因此不能再继续操作该VIO了，只能重新调度vc，把vc放回到write_ready_list等待下一次NetHandler的调用
       if (lock.get_mutex() != s->vio.mutex.m_ptr) {
         write_reschedule(nh, vc);
         return;
       }
     }
+    
+    // 当前 VIO 的要求还没有完成，如果：
+    //     写操作之前回调过上层状态机，但是没有设置wbe_event，写操作之后并未回调过上层状态机
+    // 或者：
+    //     写操作之后回调了上层状态机，但是上层状态机没有关闭VC，也没有修改Mutex
+    // 那么，如果：
+    //     源MIOBuffer内的数据已经全部发送了：buf.reader()->read_avail() == 0
     if (!buf.reader()->read_avail()) {
+      // 那么就关闭此VC的写操作，并返回
       write_disable(nh, vc);
       return;
     }
 
+    // 源MIOBuffer内的数据没有发送完成时，根据needs值，重新调度读、写操作
+    // 对于UnixNetVC，此时needs总是设置EVENTIO_WRITE
     if ((needs & EVENTIO_WRITE) == EVENTIO_WRITE) {
       write_reschedule(nh, vc);
     }
+    // 对于SSLNetVC，可能会同时设置EVENTIO_READ
     if ((needs & EVENTIO_READ) == EVENTIO_READ) {
       read_reschedule(nh, vc);
     }
