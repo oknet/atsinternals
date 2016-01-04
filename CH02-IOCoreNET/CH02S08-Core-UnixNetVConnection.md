@@ -1161,15 +1161,27 @@ VIO::reenable()
 void
 UnixNetVConnection::reenable(VIO *vio)
 {
+  // 获取包含此VIO的NetState对象
+  // 对应NetState对象的enabled为true，表示已经处于激活状态了
   if (STATE_FROM_VIO(vio)->enabled)
     return;
+  // 设置enabled为true，同时重置inactivity timeout
   set_enabled(vio);
+  // thread成员在基类NetVConnection中定义，用来指向管理该vc的EThread
+  // 在NetAccept或acceptEvent中初始化thread为e->ethread
+  // 如果该vc还没有交付给一个EThread来管理，说明还没有被NetHandler管理，因此无法激活。
   if (!thread)
     return;
+  
+  // 执行reenable之前必须对vio上锁（对该vio上锁的线程必须是调用此方法的线程）
   EThread *t = vio->mutex->thread_holding;
   ink_assert(t == this_ethread());
+  // 不能对已经关闭的 vc 执行 reenable 操作
   ink_assert(!closed);
+  // 如果nethandler已经被当前线程上锁
   if (nh->mutex->thread_holding == t) {
+    // 判断vio是read vio还是writevio
+    // 根据triggered，放入ready_list中
     if (vio == &read.vio) {
       ep.modify(EVENTIO_READ);
       ep.refresh(EVENTIO_READ);
@@ -1186,8 +1198,11 @@ UnixNetVConnection::reenable(VIO *vio)
         nh->write_ready_list.remove(this);
     }
   } else {
+    // 可能没上锁，可能被其它线程上锁
+    // 因此，尝试在当前线程中对nethandler上锁
     MUTEX_TRY_LOCK(lock, nh->mutex, t);
     if (!lock.is_locked()) {
+      // 上锁失败，放入enable_list等待下一次nethandler被eventsystem回调时处理
       if (vio == &read.vio) {
         if (!read.in_enabled_list) {
           read.in_enabled_list = 1;
@@ -1199,9 +1214,12 @@ UnixNetVConnection::reenable(VIO *vio)
           nh->write_enable_list.push(this);
         }
       }
+      // 如果存在需要尽快处理的Signal Event，就调用signal_hook通知到对应的线程
       if (nh->trigger_event && nh->trigger_event->ethread->signal_hook)
         nh->trigger_event->ethread->signal_hook(nh->trigger_event->ethread);
     } else {
+      // 上锁成功
+      // 根据triggered，放入ready_list
       if (vio == &read.vio) {
         ep.modify(EVENTIO_READ);
         ep.refresh(EVENTIO_READ);
@@ -1224,12 +1242,24 @@ UnixNetVConnection::reenable(VIO *vio)
 void
 UnixNetVConnection::reenable_re(VIO *vio)
 {
+  // 与 reenable 相比，少了对 enabled 为 true 的判断
+  // thread成员在基类NetVConnection中定义，用来指向管理该vc的EThread
+  // 在NetAccept或acceptEvent中初始化thread为e->ethread
+  // 如果该vc还没有交付给一个EThread来管理，说明还没有被NetHandler管理，因此无法激活。
   if (!thread)
     return;
+
+  // 执行reenable_re之前必须对vio上锁（对该vio上锁的线程必须是调用此方法的线程）
   EThread *t = vio->mutex->thread_holding;
   ink_assert(t == this_ethread());
+  // 与 reenable 相比，没有判断vc->closed
+  // 如果nethandler已经被当前线程上锁
   if (nh->mutex->thread_holding == t) {
+    // 设置enabled为true，同时重置inactivity timeout
     set_enabled(vio);
+    // 判断vio是read vio还是writevio
+    // 如果 triggered 为 true，则直接触发读、写操作
+    // 否则从 ready_list 中删除
     if (vio == &read.vio) {
       ep.modify(EVENTIO_READ);
       ep.refresh(EVENTIO_READ);
@@ -1245,10 +1275,32 @@ UnixNetVConnection::reenable_re(VIO *vio)
       else
         nh->write_ready_list.remove(this);
     }
-  } else
+  } else {
+    // 可能没上锁，可能被其它线程上锁
+    // 调用reenable来完成
     reenable(vio);
+  }
 }
 ```
+
+对比 reenable 和 reenable_re：
+
+  - reenable_re 可以立即触发vio的读写操作，可实现同步操作，而且可以在enabled状态重复触发读写操作
+  - reenable 则只是把vc放入enable_list或者ready_list，需要等nethandle在下一次遍历中处理
+
+所以当需要立即触发读、写操作时，调用reenable_re
+
+  - 但是仍然可能会出现nethandler已经被其它线程上锁而出现的异步操作。
+  - 调用reenable_re之后，可能会出现上层状态机的重入（我想这才是re后缀的真正含义）。
+
+使用场景：
+
+  - 当我们希望一个VIO操作立即完成时
+  - 在 READY 事件中，调用reenable_re，可以让操作继续立即执行
+  - 直到状态机收到 COMPLETE 事件，然后逐层返回
+  - 但是这中间也会遇到异步的情况，reenable_re只是保证尽可能的同步执行
+
+由于此方法会导致潜在的阻塞问题，在ATS中只有很少的地方使用到了reenable_re这个方法。
 
 ## Inactivity Timeout 的实现
 
