@@ -1050,6 +1050,206 @@ UnixNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, 
 }
 ```
 
+## 对上层状态机的回调处理
+
+如果设置了读、写VIO，那么在读、写操作中，都会产生对上层状态机的回调：
+
+  - 传递COMPLETE事件：read_signal_done，write_signal_done
+  - 传递ERROR事件：read_signal_error，write_signal_error
+  - 传递READY事件：read_signal_and_update，write_signal_and_update
+
+而 signal_error 和 signal_done 又都是调用 signal_and_update 作为底层实现，因此接下来以read_signal_and_update来说明（write_signal_and_update的流程跟它完全一致）。
+
+```
+static inline int
+read_signal_and_update(int event, UnixNetVConnection *vc)
+{
+  // 增加 vc 重入计数器
+  vc->recursion++;
+  if (vc->read.vio._cont) {
+    // 如果上层状态机设置了VIO，那么回调VIO关联的上层状态机
+    vc->read.vio._cont->handleEvent(event, &vc->read.vio);
+  } else {
+    // 如果上层状态机没有设置VIO，那么执行缺省处理
+    switch (event) {
+    case VC_EVENT_EOS:
+    case VC_EVENT_ERROR:
+    case VC_EVENT_ACTIVE_TIMEOUT:
+    case VC_EVENT_INACTIVITY_TIMEOUT:
+      // 出现EOS，错误，超时，设置vc关闭
+      // 其中：EOS和ERROR为IOCoreNET产生，Timeout由InactivityCop产生
+      Debug("inactivity_cop", "event %d: null read.vio cont, closing vc %p", event, vc);
+      vc->closed = 1;
+      break;
+    default:
+      Error("Unexpected event %d for vc %p", event, vc);
+      ink_release_assert(0);
+      break;
+    }
+  }
+  // 只有重入计数器为1，并且vc设置为关闭时，才执行关闭vc的操作
+  if (!--vc->recursion && vc->closed) {
+    /* BZ  31932 */
+    ink_assert(vc->thread == this_ethread());
+    close_UnixNetVConnection(vc, vc->thread);
+    return EVENT_DONE;
+  } else {
+    return EVENT_CONT;
+  }
+}
+
+```
+
+## 关于 VC 回调的重入
+
+在Proxy的实现里，由ClientSide的ServerVC，和ServerSide的ClientVC组成一个Tunnel：
+
+  - ServerVC接受来自Client的数据，然后通过ClientVC发送给Origin Server
+  - 此时ServerVC是主动的，而ClientVC是被动的
+  - ClientVC接受来自Origin Server的数据，然后通过ServerVC发送给Client
+  - 此时ClientVC是主动的，而ServerVC是被动的
+
+考虑一个可能的场景：
+
+  - 如果ServerVC由ET_NET 0管理，ClientVC由ET_NET 1管理
+  - ServerVC接收到了来自Client的数据，正在写入ClientVC
+  - 而此时ClientVC也接受到了来自Origin Server的数据，正在读取数据
+  - 当然这两个操作是有两个不同的状态机负责，但是VC却都是同一个：ClientVC
+
+那么对于ClientVC，就出现了并发的读、写操作，如果其中一方认为该VC需要关闭：
+
+  - 就必须等待所有使用此VC的状态机都结束
+  - 此时，就遇到了VC的回调重入问题
+
+ATS通过给VC设置一个重入计数器来解决这个问题。
+
+问题: 为什么回调状态机时，不对vc的mutex上锁？
+
+  - 使用mutex应该遵循一个原则：访问一个对象的内部资源时，才对此对象的mutex上锁，因此：
+    - 在nethandler执行读、写操作之前，对vio.mutex进行了上锁，因为它要操作vio内的MIOBuffer
+    - 在nethandler在执行读、写操作之前或之后，回调上层状态机时，也是同归vio._cont对上层状态机进行回调
+  - 在回调状态机时，没有访问任何的vc对象的内部资源，因此不需要对vc的mutex进行上锁
+
+## 激活 VIO & VC
+
+在UnixNetVConnection中提供了 reenable 和 reenable_re 两个方法，分别对应了在[P_VIO.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_VIO.h)中定义的VIO的 reenable 和 reenable_re 两个方法。
+
+```
+TS_INLINE void
+VIO::reenable()
+{
+  if (vc_server)
+    vc_server->reenable(this);
+}
+TS_INLINE void
+VIO::reenable()
+{
+  if (vc_server)
+    vc_server->reenable(this);
+}
+```
+
+我们知道VIO的一端是VC，另一端是MIOBuffer，而VC总是主动端，由IOCore驱动，因此对VIO的reenable就是VC的reenable。
+
+那么 reenable 和 reenable_re 有什么样的区别？分别在什么场景使用？带着问题，先来注释和分析这两个方法。
+
+```
+//
+// Function used to reenable the VC for reading or
+// writing.
+//
+void
+UnixNetVConnection::reenable(VIO *vio)
+{
+  if (STATE_FROM_VIO(vio)->enabled)
+    return;
+  set_enabled(vio);
+  if (!thread)
+    return;
+  EThread *t = vio->mutex->thread_holding;
+  ink_assert(t == this_ethread());
+  ink_assert(!closed);
+  if (nh->mutex->thread_holding == t) {
+    if (vio == &read.vio) {
+      ep.modify(EVENTIO_READ);
+      ep.refresh(EVENTIO_READ);
+      if (read.triggered)
+        nh->read_ready_list.in_or_enqueue(this);
+      else
+        nh->read_ready_list.remove(this);
+    } else {
+      ep.modify(EVENTIO_WRITE);
+      ep.refresh(EVENTIO_WRITE);
+      if (write.triggered)
+        nh->write_ready_list.in_or_enqueue(this);
+      else
+        nh->write_ready_list.remove(this);
+    }
+  } else {
+    MUTEX_TRY_LOCK(lock, nh->mutex, t);
+    if (!lock.is_locked()) {
+      if (vio == &read.vio) {
+        if (!read.in_enabled_list) {
+          read.in_enabled_list = 1;
+          nh->read_enable_list.push(this);
+        }
+      } else {
+        if (!write.in_enabled_list) {
+          write.in_enabled_list = 1;
+          nh->write_enable_list.push(this);
+        }
+      }
+      if (nh->trigger_event && nh->trigger_event->ethread->signal_hook)
+        nh->trigger_event->ethread->signal_hook(nh->trigger_event->ethread);
+    } else {
+      if (vio == &read.vio) {
+        ep.modify(EVENTIO_READ);
+        ep.refresh(EVENTIO_READ);
+        if (read.triggered)
+          nh->read_ready_list.in_or_enqueue(this);
+        else
+          nh->read_ready_list.remove(this);
+      } else {
+        ep.modify(EVENTIO_WRITE);
+        ep.refresh(EVENTIO_WRITE);
+        if (write.triggered)
+          nh->write_ready_list.in_or_enqueue(this);
+        else
+          nh->write_ready_list.remove(this);
+      }
+    }
+  }
+}
+
+void
+UnixNetVConnection::reenable_re(VIO *vio)
+{
+  if (!thread)
+    return;
+  EThread *t = vio->mutex->thread_holding;
+  ink_assert(t == this_ethread());
+  if (nh->mutex->thread_holding == t) {
+    set_enabled(vio);
+    if (vio == &read.vio) {
+      ep.modify(EVENTIO_READ);
+      ep.refresh(EVENTIO_READ);
+      if (read.triggered)
+        net_read_io(nh, t);
+      else
+        nh->read_ready_list.remove(this);
+    } else {
+      ep.modify(EVENTIO_WRITE);
+      ep.refresh(EVENTIO_WRITE);
+      if (write.triggered)
+        write_to_net(nh, this, t);
+      else
+        nh->write_ready_list.remove(this);
+    }
+  } else
+    reenable(vio);
+}
+```
+
 ## Inactivity Timeout 的实现
 
 ## InactivityCop 状态机
