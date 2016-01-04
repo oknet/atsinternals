@@ -951,6 +951,16 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 // I could overwrite it for the SSL implementation
 // (SSL read does not support overlapped i/o)
 // without duplicating all the code in write_to_net.
+// 通过MIOBufferAccessor buf消费MIOBuffer内指定长度为towrite的数据，
+// 参数，调用前必须初始化为0：
+//     wattempted 为一个地址，在返回时设置为最后一次调用write/writev时，尝试发送的数据长度
+//  total_written 为一个地址，在返回时设置为尝试发送的数据长度，调用者需要根据返回值来计算发送成功的数据长度。
+//                    r  < 0 : total_written - wattempted;
+//                    r >= 0 : total_written - wattempted + r;
+//          needs 为一个地址，在返回时设置为接下来需要进行测操作，通过 或操作 可分别标记读（EVENTIO_READ）、写（EVENTIO_WRITE）
+// 返回值：
+//     最后一次调用write/writev的返回值。
+//
 // 在 SSLNetVConnection 通过重载此方法，完成SSL数据的加密发送
 int64_t
 UnixNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, int64_t &total_written, MIOBufferAccessor &buf,
@@ -959,12 +969,17 @@ UnixNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, 
   int64_t r = 0;
 
   // XXX Rather than dealing with the block directly, we should use the IOBufferReader API.
+  // 获取数据在MIOBuffer的起始位置及第一个数据块
   int64_t offset = buf.reader()->start_offset;
   IOBufferBlock *b = buf.reader()->block;
 
+  // 通过一个 do-while 循环，至少运行一次write/writev操作
+  // 写操作成功则继续循环，在遇到任何一次错误时停止循环
   do {
+    // 为了支持多个IOBufferBlock，通过writev来完成写操作，需要构建IOVec向量数组
     IOVec tiovec[NET_MAX_IOV];
     int niov = 0;
+    // total_written_last 为上一次write/writev调用完成后的total_written值
     int64_t total_written_last = total_written;
     while (b && niov < NET_MAX_IOV) {
       // check if we have done this block
@@ -990,12 +1005,16 @@ UnixNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, 
       offset = 0;
       b = b->next;
     }
+    // 注意，在IOVec向量数组构建完成后total_written已经被累加了即将发送的数据长度
+    // 设置wattempted为 本轮循环 / 本次调用write/writev 时，尝试发送的数据长度
     wattempted = total_written - total_written_last;
+    // 如果只有一个数据块，就使用write，否则使用writev
     if (niov == 1)
       r = socketManager.write(con.fd, tiovec[0].iov_base, tiovec[0].iov_len);
     else
       r = socketManager.writev(con.fd, &tiovec[0], niov);
 
+    // 调试数据发送
     if (origin_trace) {
       char origin_trace_ip[INET6_ADDRSTRLEN];
       ats_ip_ntop(origin_trace_addr, origin_trace_ip, sizeof(origin_trace_ip));
@@ -1013,12 +1032,20 @@ UnixNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, 
       }
     }
 
+    // 更新写操作次数计数器
     ProxyMutex *mutex = thread->mutex;
     NET_INCREMENT_DYN_STAT(net_calls_to_write_stat);
+    // 如果数据读取成功(r == rattempted)，并且发送任务没有完成(total_written < towrite)，则继续do-while循环读取数据
   } while (r == wattempted && total_written < towrite);
+  // 如果读取出现了失败(r != rattempted)：
+  //     则跳出do-while循环，停止读取操作，此时可能完成了部分数据的发送
+  // 也可能是完成了发送任务(total_written == towrite)
 
+  // 设置后续需要写操作的标志
   needs |= EVENTIO_WRITE;
 
+  // 返回最后一次write/writev的返回值
+  // 调用者需要根据 r 值，来修正 total_written 值
   return (r);
 }
 ```
