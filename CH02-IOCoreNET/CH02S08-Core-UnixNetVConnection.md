@@ -12,8 +12,11 @@
   - do_io_* 系列
   - (set|cancel)_*_timeout 系列
   - (add|remove)_*_queue 系列
+  - 还有一部分面向上层状态机的方法在NetProcessor中定义
 - UnixNetVConnection 也提供了面向底层状态机的方法
-  - 大多数由NetHandler来调用
+  - 通常由NetHandler来调用
+  - 可以把这些方法视作NetHandler状态机的专用回调函数
+  - 我个人觉得，应该把所有跟socket打交道的函数都放在NetHandler里面
 - UnixNetVConnection 也是状态机
   - 因此它也有自己的handler（回调函数）
     - NetAccept调用acceptEvent
@@ -391,7 +394,7 @@ typedef int (UnixNetVConnection::*NetVConnHandler)(int, void *);
 
 ```
 
-## 从Socket到MIOBuffer
+## NetHandler的延伸：从Socket到MIOBuffer
 
 数据是如何从Socket读取到MIOBuffer的？
 
@@ -656,11 +659,7 @@ read_from_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 }
 ```
 
-## 创建与Origin Server的连接
-
-如何创建与源服务器的连接？
-
-## 从MIOBuffer到Socket
+## NetHandler的延伸：从MIOBuffer到Socket
 
 数据是如何从MIOBuffer写入Socket的？
 
@@ -687,7 +686,6 @@ write_to_net(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 
   NET_INCREMENT_DYN_STAT(net_calls_to_writetonet_stat);
   NET_INCREMENT_DYN_STAT(net_calls_to_writetonet_afterpoll_stat);
-
 
   write_to_net_io(nh, vc, thread);
 }
@@ -1050,7 +1048,7 @@ UnixNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, 
 }
 ```
 
-## 对上层状态机的回调处理
+## NetHandler的延伸：对上层状态机的回调处理
 
 如果设置了读、写VIO，那么在读、写操作中，都会产生对上层状态机的回调：
 
@@ -1100,7 +1098,7 @@ read_signal_and_update(int event, UnixNetVConnection *vc)
 
 ```
 
-## 关于 VC 回调的重入
+## NetHandler的延伸：关于 VC 回调的重入
 
 在Proxy的实现里，由ClientSide的ServerVC，和ServerSide的ClientVC组成一个Tunnel：
 
@@ -1116,6 +1114,8 @@ read_signal_and_update(int event, UnixNetVConnection *vc)
   - 而此时ClientVC也接受到了来自Origin Server的数据，正在读取数据
   - 当然这两个操作是有两个不同的状态机负责，但是VC却都是同一个：ClientVC
 
+PS：这个场景是我的想象，我还没有去代码中寻找回调重入的场景，如果你能提供ATS中与此相关的代码，请提交pull request，谢谢！
+
 那么对于ClientVC，就出现了并发的读、写操作，如果其中一方认为该VC需要关闭：
 
   - 就必须等待所有使用此VC的状态机都结束
@@ -1130,7 +1130,253 @@ ATS通过给VC设置一个重入计数器来解决这个问题。
     - 在nethandler在执行读、写操作之前或之后，回调上层状态机时，也是同归vio._cont对上层状态机进行回调
   - 在回调状态机时，没有访问任何的vc对象的内部资源，因此不需要对vc的mutex进行上锁
 
-## 激活 VIO & VC
+## NetHandler的延伸：小节
+
+在 NetHandler::mainNetEvent 中，通过以下嵌套调用：
+
+  - UnixNetVConnection::net_read_io(this, trigger_event->ethread)
+    - read_from_net(nh, this, lthread)
+  - write_to_net(nh, vc, thread)
+    - write_to_net_io(nh, vc, thread)
+      - load_buffer_and_write
+
+实现了数据流在socket与buffer之间的传递，因此我更觉的read_from_net，write_to_net和write_to_net_io是NetHandler的一部分，而只有 net_read_io，load_buffer_and_write 才算是 UnixNetVConnection的方法，因为继承自它的SSLNetVConnection需要重载这两个方法来实现数据的加解密。
+
+## UnixNetVConnection 状态机的回调函数
+
+UnixNetVConnection 具有多态性，它除了具有与Event类型相似的传递事件的功能，同时也是一个状态机，有它自己的回调函数。
+
+### 接受新链接（acceptEvent）
+
+回调函数 acceptEvent 是 NetAccept 在 NetVConnection 里的延伸。
+
+当ATS设置了独立的 accept 线程，一个新的 socket 连接建立后，
+
+  - 就新建一个 vc 与此 socket 关联，
+  - 并设置此 vc 的回调函数为acceptEvent，
+  - 然后根据轮训算法从对应的线程组中找到一个线程，
+  - 把此 vc 交给该线程管理，
+  - 在第一次回调时，会调用acceptEvent
+
+下面来看看acceptEvent的流程分析：
+
+```
+int
+UnixNetVConnection::acceptEvent(int event, Event *e)
+{
+  // 设置 vc 的thread，将有该thread管理此 vc，直到 vc 关闭
+  thread = e->ethread;
+
+  // 尝试对NetHandler上锁
+  MUTEX_TRY_LOCK(lock, get_NetHandler(thread)->mutex, e->ethread);
+  // 如果上锁失败
+  if (!lock.is_locked()) {
+    // 在 NetAccept::acceptEvent()中会调用 net_accept 方法，在 net_accept 方法中会同步回调 vc 状态机
+    // 当event == EVENT_NONE则表示这是来自 net_accept 方法的同步回调
+    // 通常只有 Management，Cluster 部分才会使用 NetAccept::init_accept 创建使用 net_accept 方法的 NetAccept 实例
+    if (event == EVENT_NONE) {
+      // 这里使用ethread调度函数来重新调度事件，因为这可能是一个跨线程调用，也就是：e->ethread != this_ethread()
+      // 因此要使用支持原子操作的ethread里提供的调度方法，此时把此 vc 放入了 EThread 的外部队列
+      thread->schedule_in(this, HRTIME_MSECONDS(net_retry_delay));
+      // 由于是同步回调，要告知调用者此次调用已经完成，因为已经把该事件放入到管理此 vc 的线程中，由该线程接管后续工作了
+      return EVENT_DONE;
+    } else {
+      // 如果是来自eventsystem的回调，则传递的应该是 EVENT_IMMEDIATE 事件
+      // 因为 vc 在创建之后第一次放入线程时，是通过 schedule_imm 方法
+      // 由于是来自eventsystem，也就是：e->ethread == this_ethread()
+      // 只需要通过传递进来的 event 重新调度该事件在 net_retry_delay 时间之后再次回调即可
+      // 此时是将此 vc 放入了 EThread 外部队列的本地队列
+      e->schedule_in(HRTIME_MSECONDS(net_retry_delay));
+      return EVENT_CONT;
+    }
+  }
+
+  // 如果成功上锁
+  
+  // 判断是否被取消
+  if (action_.cancelled) {
+    free(thread);
+    return EVENT_DONE;
+  }
+
+  // 设置回调函数为 mainEvent，之后IOCoreNet对此 vc 的回调都是mainEvent，直到 vc 关闭
+  SET_HANDLER((NetVConnHandler)&UnixNetVConnection::mainEvent);
+
+  // 通过PollDescriptor和EventIO把vc放入epoll_wait的监控中
+  nh = get_NetHandler(thread);
+  PollDescriptor *pd = get_PollDescriptor(thread);
+  if (ep.start(pd, this, EVENTIO_READ | EVENTIO_WRITE) < 0) {
+    // 错误处理
+    Debug("iocore_net", "acceptEvent : failed EventIO::start\n");
+    close_UnixNetVConnection(this, e->ethread);
+    return EVENT_DONE;
+  }
+
+  // 加入到NetHandler管理的open_list，所有打开的vc都会放入open_list，接受超时管理
+  nh->open_list.enqueue(this);
+
+  // 如果采用EDGE模式，当然，我们使用epoll就是这种模式
+#ifdef USE_EDGE_TRIGGER
+  // Set the vc as triggered and place it in the read ready queue in case there is already data on the socket.
+  Debug("iocore_net", "acceptEvent : Setting triggered and adding to the read ready queue");
+  // 因为我们之前可能对socket设置了TCP_DEFER_ACCEPT，所以这儿可能已经有数据可读了
+  // 直接模拟被epoll_wait激活时的操作，设置triggered，并将vc放入ready_list
+  read.triggered = 1;
+  nh->read_ready_list.enqueue(this);
+#endif
+
+  // 设置inactivity timeout
+  if (inactivity_timeout_in) {
+    UnixNetVConnection::set_inactivity_timeout(inactivity_timeout_in);
+  }
+
+  // 设置active timeout
+  if (active_timeout_in) {
+    UnixNetVConnection::set_active_timeout(active_timeout_in);
+  }
+
+  // 回调上层状态低，发送 NET_EVENT_ACCEPT 事件
+  action_.continuation->handleEvent(NET_EVENT_ACCEPT, this);
+  return EVENT_DONE;
+}
+```
+
+### 发起新链接（startEvent）
+
+当需要向外部发起一个连接时，首先创建一个 vc，然后设置好相关参数，就可以把 vc 放入eventsystem里了。
+
+当startEvent被回掉的时候，就会调用connectUp，由connectUp完成后续的操作，在后面的部分会介绍connectUp方法。
+
+```
+int
+UnixNetVConnection::startEvent(int /* event ATS_UNUSED */, Event *e)
+{
+  // 尝试对NetHandler上锁
+  MUTEX_TRY_LOCK(lock, get_NetHandler(e->ethread)->mutex, e->ethread);
+  if (!lock.is_locked()) {
+    // 上锁失败则重新调度
+    e->schedule_in(HRTIME_MSECONDS(net_retry_delay));
+    return EVENT_CONT;
+  }
+  // 没有被取消时，调用connectUp
+  if (!action_.cancelled)
+    connectUp(e->ethread, NO_FD);
+  else
+    free(e->ethread);
+  return EVENT_DONE;
+}
+```
+
+### 主处理函数（mainEvent）
+
+mainEvent 主要用来实现超时控制，Inactivity Timeout 和 Active Timeout的控制都在这里
+
+由于 ```#define INACTIVITY_TIMEOUT``` 这一行在[P_UnixNet.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNet.h)中被注释掉了，因此，为了便于分析，下面的代码删除了相关的内容。
+
+在ATS中，对TIMEOUT的处理分为两种模式：
+
+  - 通过active_timeout和inactivity_timeout两个 Event 来完成
+    - 就是把每一个 vc 的超时控制封装成一个定时执行的 Event 放入 EventSystem 来处理
+    - 这会导致一个 vc 生成两个 Event，对EventSystem的处理压力非常的大，因此ATS设计了InactivityCop
+    - 这种方式，如果你有兴趣可以自己分析一下，比较简单
+  - 通过InactivityCop来完成
+    - 这是一个专门管理连接超时的状态机
+    - ATS 默认采用这种方式
+
+```
+//
+// The main event for UnixNetVConnections.
+// This is called by the Event subsystem to initialize the UnixNetVConnection
+// and for active and inactivity timeouts.
+//
+int
+UnixNetVConnection::mainEvent(int event, Event *e)
+{
+  // assert 判断
+  //     EVENT_IMMEDIATE 来自 InactivityCop 对Inactivity Timeout的回调
+  //     EVENT_INTERVAL 来自 eventsystem 对Active Timeout的回调
+  ink_assert(event == EVENT_IMMEDIATE || event == EVENT_INTERVAL);
+  // 只有当前ethread就是管理该 vc 的thread，才可以回调此方法
+  ink_assert(thread == this_ethread());
+
+  // 由于是超时控制，因此要尝试加一堆的锁，要把所有使用到vc的各个方面都锁定
+  // 这些关联的各个部分包括：NetHandler，Read VIO，Write VIO
+  //     通常VIO的mutex会引用注册VIO的上层状态机的mutex
+  MUTEX_TRY_LOCK(hlock, get_NetHandler(thread)->mutex, e->ethread);
+  MUTEX_TRY_LOCK(rlock, read.vio.mutex ? (ProxyMutex *)read.vio.mutex : (ProxyMutex *)e->ethread->mutex, e->ethread);
+  MUTEX_TRY_LOCK(wlock, write.vio.mutex ? (ProxyMutex *)write.vio.mutex : (ProxyMutex *)e->ethread->mutex, e->ethread);
+  // 判断上面三个部分是否都上锁成功了
+  if (!hlock.is_locked() || !rlock.is_locked() || !wlock.is_locked() ||
+  // 判断Read VIO没有被更改
+      (read.vio.mutex.m_ptr && rlock.get_mutex() != read.vio.mutex.m_ptr) ||
+  // 判断Write VIO没有被更改
+      (write.vio.mutex.m_ptr && wlock.get_mutex() != write.vio.mutex.m_ptr)) {
+    // 上述判断若有一个失败，则需要重新调度
+      e->schedule_in(HRTIME_MSECONDS(net_retry_delay));
+    return EVENT_CONT;
+  }
+
+  // 全部上锁成功，并且VIO没有被更改
+  // 判断 Event 是否被取消
+  if (e->cancelled) {
+    return EVENT_DONE;
+  }
+
+  // 接下来要判断是Active Timeout还是Inactivity Timeout
+  int signal_event;
+  Event **signal_timeout;
+  Continuation *reader_cont = NULL;
+  Continuation *writer_cont = NULL;
+  ink_hrtime *signal_timeout_at = NULL;
+  Event *t = NULL;
+  signal_timeout = &t;
+
+  if (event == EVENT_IMMEDIATE) {
+    // Inactivity Timeout
+    /* BZ 49408 */
+    // ink_assert(inactivity_timeout_in);
+    // ink_assert(next_inactivity_timeout_at < ink_get_hrtime());
+    if (!inactivity_timeout_in || next_inactivity_timeout_at > Thread::get_hrtime())
+      return EVENT_CONT;
+    signal_event = VC_EVENT_INACTIVITY_TIMEOUT;
+    signal_timeout_at = &next_inactivity_timeout_at;
+  } else {
+    // event == EVENT_INTERVAL
+    // Active Timeout
+    signal_event = VC_EVENT_ACTIVE_TIMEOUT;
+    signal_timeout_at = &next_activity_timeout_at;
+  }
+
+  *signal_timeout = 0;
+  *signal_timeout_at = 0;
+  writer_cont = write.vio._cont;
+
+  if (closed) {
+    close_UnixNetVConnection(this, thread);
+    return EVENT_DONE;
+  }
+
+  if (read.vio.op == VIO::READ && !(f.shutdown & NET_VC_SHUTDOWN_READ)) {
+    reader_cont = read.vio._cont;
+    if (read_signal_and_update(signal_event, this) == EVENT_DONE)
+      return EVENT_DONE;
+  }
+
+  if (!*signal_timeout && !*signal_timeout_at && !closed && write.vio.op == VIO::WRITE && !(f.shutdown & NET_VC_SHUTDOWN_WRITE) &&
+      reader_cont != write.vio._cont && writer_cont == write.vio._cont)
+    if (write_signal_and_update(signal_event, this) == EVENT_DONE)
+      return EVENT_DONE;
+  return EVENT_DONE;
+}
+```
+
+## 方法
+
+### 创建与Origin Server的连接（connectUp）
+
+如何创建与源服务器的连接？
+
+### 激活 VIO & VC
 
 在UnixNetVConnection中提供了 reenable 和 reenable_re 两个方法，分别对应了在[P_VIO.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_VIO.h)中定义的VIO的 reenable 和 reenable_re 两个方法。
 
@@ -1286,11 +1532,11 @@ UnixNetVConnection::reenable_re(VIO *vio)
 对比 reenable 和 reenable_re：
 
   - reenable_re 可以立即触发vio的读写操作，可实现同步操作，而且可以在enabled状态重复触发读写操作
-  - reenable 则只是把vc放入enable_list或者ready_list，需要等nethandle在下一次遍历中处理
+  - reenable 则只是把vc放入enable_list或者ready_list，需要等NetHandler在下一次遍历中处理
 
 所以当需要立即触发读、写操作时，调用reenable_re
 
-  - 但是仍然可能会出现nethandler已经被其它线程上锁而出现的异步操作。
+  - 但是仍然可能会出现NetHandler已经被其它线程上锁而出现的异步操作。
   - 调用reenable_re之后，可能会出现上层状态机的重入（我想这才是re后缀的真正含义）。
 
 使用场景：
