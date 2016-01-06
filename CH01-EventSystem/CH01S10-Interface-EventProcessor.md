@@ -260,7 +260,7 @@ EventProcessor::spawn_thread(Continuation *cont, const char *thr_name, size_t st
 
 ## 创建 REGULAR 类型的EThread
 
-EventProcessor 提供了专门用于创建 DEDICATED 类型的EThread组的方法，此方法一次创建一批线程来实现并发处理某种功能的事件（Event）：
+EventProcessor 提供了专门用于创建 REGULAR 类型的EThread组的方法，此方法一次创建一批线程来实现并发处理某种功能的事件（Event）：
 
 ```
 EventType
