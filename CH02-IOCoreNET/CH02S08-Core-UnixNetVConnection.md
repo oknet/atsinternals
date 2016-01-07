@@ -1275,12 +1275,12 @@ mainEvent 主要用来实现超时控制，Inactivity Timeout 和 Active Timeout
 
 在ATS中，对TIMEOUT的处理分为两种模式：
 
-  - 通过active_timeout和inactivity_timeout两个 Event 来完成
+  - 通过 active_timeout 和 inactivity_timeout 两个 Event 来完成
     - 就是把每一个 vc 的超时控制封装成一个定时执行的 Event 放入 EventSystem 来处理
     - 这会导致一个 vc 生成两个 Event，对EventSystem的处理压力非常的大，因此ATS设计了InactivityCop
     - 这种方式，如果你有兴趣可以自己分析一下，比较简单
   - 通过InactivityCop来完成
-    - 这是一个专门管理连接超时的状态机
+    - 这是一个专门管理连接超时的状态机，后面会专门介绍这个状态机
     - ATS 默认采用这种方式
 
 ```
@@ -1324,11 +1324,12 @@ UnixNetVConnection::mainEvent(int event, Event *e)
 
   // 接下来要判断是Active Timeout还是Inactivity Timeout
   int signal_event;
-  Event **signal_timeout;
   Continuation *reader_cont = NULL;
   Continuation *writer_cont = NULL;
   ink_hrtime *signal_timeout_at = NULL;
   Event *t = NULL;
+  // signal_timeout 是用来支持老的超时控制模式的，在新模式下固定的指向 t
+  Event **signal_timeout;
   signal_timeout = &t;
 
   if (event == EVENT_IMMEDIATE) {
@@ -1336,36 +1337,66 @@ UnixNetVConnection::mainEvent(int event, Event *e)
     /* BZ 49408 */
     // ink_assert(inactivity_timeout_in);
     // ink_assert(next_inactivity_timeout_at < ink_get_hrtime());
+    // 如果：
+    //     没有设置Inactivity Timeout (inactivity_timeout_in==0)
+    //     没有出现Inactivity Timeout (next_inactivity_timeout_at > Thread::get_hrtime())
+    // 直接返回 EVENT_CONT
     if (!inactivity_timeout_in || next_inactivity_timeout_at > Thread::get_hrtime())
       return EVENT_CONT;
+    // 超时了，设置回调上层状态机的 event 类型为 INACTIVITY_TIMEOUT
     signal_event = VC_EVENT_INACTIVITY_TIMEOUT;
+    // 指针指向超时时间，这样后面就不用再根据超时类型判断应该取那个超时时间了
     signal_timeout_at = &next_inactivity_timeout_at;
   } else {
     // event == EVENT_INTERVAL
     // Active Timeout
+    // EVENT_INTERVAL 是来自EventSystem的回调，通常这是一个一次性的定时回调
+    // 实现了Active Timeout，因此设置回调上层状态机的 event 类型为 ACTIVE_TIMEOUT
     signal_event = VC_EVENT_ACTIVE_TIMEOUT;
+    // 指针指向超时时间
     signal_timeout_at = &next_activity_timeout_at;
   }
 
+  // *signal_timeout 是指向 t 的指针，t == NULL
   *signal_timeout = 0;
+  // 重置超时时间的值
   *signal_timeout_at = 0;
+  // 记录 writer_cont
   writer_cont = write.vio._cont;
 
+  // 判断vc已经关闭的话，直接调用close_UnixNetVConnection关闭该vc
   if (closed) {
     close_UnixNetVConnection(this, thread);
     return EVENT_DONE;
   }
 
+  // 如果：
+  //     设置了Read VIO，op值可能为：VIO::READ 或者 VIO::NONE
+  //     并且没有对读取端做半关闭，就是VC对应的Socket处于可读状态
   if (read.vio.op == VIO::READ && !(f.shutdown & NET_VC_SHUTDOWN_READ)) {
+    // 记录 reader_cont
     reader_cont = read.vio._cont;
+    // 向上层状态机回调超时事件，此时reader_cont已经被回调过了
     if (read_signal_and_update(signal_event, this) == EVENT_DONE)
       return EVENT_DONE;
   }
 
+  // 前三个条件没什么用：
+  //     第一个条件永远为true：!*signal_timeout
+  //     第二个条件永远为true：!*signal_timeout_at
+  //     第三个条件永远为true：!closed，之前判断过，回调reader_cont时如果关闭了VC，那么会在上面返回EVENT_DONE
+  // 如果：
+  //     设置了Write VIO，op值可能为：VIO::WRITE 或者 VIO::NONE
+  //     并且没有对发送端做半关闭，就是VC对应的Socket处于可写状态
+  //     并且Write VIO对应的状态机不是刚刚回调过的reader_cont
+  //     并且当前的Write VIO仍然是之前记录的writer_cont，因为前面回调reader_cont的时候，Write VIO状态机可能会被重设
   if (!*signal_timeout && !*signal_timeout_at && !closed && write.vio.op == VIO::WRITE && !(f.shutdown & NET_VC_SHUTDOWN_WRITE) &&
       reader_cont != write.vio._cont && writer_cont == write.vio._cont)
+    // 向上层状态机回调超时事件
     if (write_signal_and_update(signal_event, this) == EVENT_DONE)
       return EVENT_DONE;
+
+  // 最后总是返回 EVENT_DONE
   return EVENT_DONE;
 }
 ```
@@ -1376,7 +1407,7 @@ UnixNetVConnection::mainEvent(int event, Event *e)
 
 如何创建与源服务器的连接？
 
-### 激活 VIO & VC
+### 激活 VIO & VC（reenable & reenable_re）
 
 在UnixNetVConnection中提供了 reenable 和 reenable_re 两个方法，分别对应了在[P_VIO.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_VIO.h)中定义的VIO的 reenable 和 reenable_re 两个方法。
 
@@ -1547,8 +1578,6 @@ UnixNetVConnection::reenable_re(VIO *vio)
   - 但是这中间也会遇到异步的情况，reenable_re只是保证尽可能的同步执行
 
 由于此方法会导致潜在的阻塞问题，在ATS中只有很少的地方使用到了reenable_re这个方法。
-
-## Inactivity Timeout 的实现
 
 ## InactivityCop 状态机
 
