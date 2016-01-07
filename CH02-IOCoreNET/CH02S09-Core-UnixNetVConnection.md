@@ -1579,8 +1579,6 @@ UnixNetVConnection::reenable_re(VIO *vio)
 
 由于此方法会导致潜在的阻塞问题，在ATS中只有很少的地方使用到了reenable_re这个方法。
 
-## InactivityCop 状态机
-
 ## 参考资料
 
 - [P_UnixNetState.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNetState.h)
