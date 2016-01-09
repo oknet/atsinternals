@@ -1407,6 +1407,115 @@ UnixNetVConnection::mainEvent(int event, Event *e)
 
 如何创建与源服务器的连接？
 
+```
+int
+UnixNetVConnection::connectUp(EThread *t, int fd)
+{
+  int res;
+
+  // 设置新vc的管理线程为 t
+  thread = t;
+  
+  // 如果超出了允许的最大连接数，则立即宣告失败
+  // 回调创建此vc的状态机，状态机需要关闭此vc
+  if (check_net_throttle(CONNECT, submit_time)) {
+    check_throttle_warning();
+    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, (void *)-ENET_THROTTLING);
+    free(t);
+    return CONNECT_FAILURE;
+  }
+
+  // Force family to agree with remote (server) address.
+  options.ip_family = server_addr.sa.sa_family;
+
+  //
+  // Initialize this UnixNetVConnection
+  //
+  // 打印调试信息
+  if (is_debug_tag_set("iocore_net")) {
+    char addrbuf[INET6_ADDRSTRLEN];
+    Debug("iocore_net", "connectUp:: local_addr=%s:%d [%s]\n",
+          options.local_ip.isValid() ? options.local_ip.toString(addrbuf, sizeof(addrbuf)) : "*", options.local_port,
+          NetVCOptions::toString(options.addr_binding));
+  }
+
+  // If this is getting called from the TS API, then we are wiring up a file descriptor
+  // provided by the caller. In that case, we know that the socket is already connected.
+  // 如果没有创建底层的socket fd，那么就创建一个
+  if (fd == NO_FD) {
+    res = con.open(options);
+    if (res != 0) {
+      goto fail;
+    }
+  } else {
+    // 通常，来自TS API的调用，底层的socket fd已经创建好了
+    int len = sizeof(con.sock_type);
+
+    // This call will fail if fd is not a socket (e.g. it is a
+    // eventfd or a regular file fd.  That is ok, because sock_type
+    // is only used when setting up the socket.
+    // 只需要设置一下 con 对象的成员
+    safe_getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *)&con.sock_type, &len);
+    safe_nonblocking(fd);
+    con.fd = fd;
+    con.is_connected = true;
+    con.is_bound = true;
+  }
+
+  // Must connect after EventIO::Start() to avoid a race condition
+  // when edge triggering is used.
+  // 通过 EventIO::start 把 vc 放入 epoll_wait 的监控下，READ & WRITE
+  //     这里的注释说，当采用EPOLL ET模式时，必须先执行start再执行connect，来避免一个竞争条件
+  //     但是我没看懂，到底是什么竞争条件？？？
+  if (ep.start(get_PollDescriptor(t), this, EVENTIO_READ | EVENTIO_WRITE) < 0) {
+    lerrno = errno;
+    Debug("iocore_net", "connectUp : Failed to add to epoll list\n");
+    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, (void *)0); // 0 == res
+    free(t);
+    return CONNECT_FAILURE;
+  }
+
+  // 对于底层socket fd没有创建的情况，才需要调用connect来发起连接
+  // 注意，这里是非阻塞IO，所以后面要在状态机里判断socket fd可写才算是连接建立成功
+  //     这里再去看上面提到的竞争条件，如果socket fd已经创建时，那么就出现了connect在EventIO::start之前的情况
+  //     那么此处的竞争条件到底是什么？？？
+  if (fd == NO_FD) {
+    res = con.connect(&server_addr.sa, options);
+    if (res != 0) {
+      goto fail;
+    }
+  }
+
+  check_emergency_throttle(con);
+
+  // start up next round immediately
+
+  // 切换vc的handler为mainEvent
+  SET_HANDLER(&UnixNetVConnection::mainEvent);
+
+  // 放入 open_list 队列
+  nh = get_NetHandler(t);
+  nh->open_list.enqueue(this);
+
+  ink_assert(!inactivity_timeout_in);
+  ink_assert(!active_timeout_in);
+  this->set_local_addr();
+  // 回调创建此vc的状态机，NET_EVENT_OPEN，创建此vc的状态机会继续回调上层状态机
+  // 在上层状态机，可以设置VIO，之后上层状态机就可以收到READ|WRITE_READY的事件了
+  // 注意，这里并未判断非阻塞的connect方法是否成功打开了连接
+  action_.continuation->handleEvent(NET_EVENT_OPEN, this);
+  return CONNECT_SUCCESS;
+
+fail:
+  // 失败处理，保存errno的值
+  lerrno = errno;
+  // 回调创建此vc的状态机，状态机需要关闭此vc
+  action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, (void *)(intptr_t)res);
+  free(t);
+  return CONNECT_FAILURE;
+}
+```
+
 ### 激活 VIO & VC（reenable & reenable_re）
 
 在UnixNetVConnection中提供了 reenable 和 reenable_re 两个方法，分别对应了在[P_VIO.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_VIO.h)中定义的VIO的 reenable 和 reenable_re 两个方法。
@@ -1578,6 +1687,187 @@ UnixNetVConnection::reenable_re(VIO *vio)
   - 但是这中间也会遇到异步的情况，reenable_re只是保证尽可能的同步执行
 
 由于此方法会导致潜在的阻塞问题，在ATS中只有很少的地方使用到了reenable_re这个方法。
+
+关于上锁的总结：
+
+  - 调用reenable之前要首先对VIO上锁，通常VIO的锁就是上层状态机的锁，基本都会上锁
+  - 在reenable执行时会对NetHandler上锁，这是因为：
+    - 在A线程中可能会reenable一个在B线程中管理的vc
+    - 而此时，NetHandler可能正在调用processor_enabled_list来批量处理B线程中管理的所有 vc
+    - 这样就会出现资源访问的竞争条件
+
+### 关闭和释放（close & free）
+
+所有的NetVC及其继承类，都会调用close_UnixNetVConnection这个函数，它不是某个NetVC类的成员函数。
+
+因此，对于SSLNetVConnection的关闭也会调用此函数，但是由于free方法是成员函数，所以```vc->free(t)```执行了对应NetVConnection继承类型的释放操作。
+
+```
+//
+// Function used to close a UnixNetVConnection and free the vc
+//
+// 传入两个变量，一个是想要关闭的vc，另一个是当前EThread
+void
+close_UnixNetVConnection(UnixNetVConnection *vc, EThread *t)
+{
+  NetHandler *nh = vc->nh;
+  
+  // 取消带外数据的发送状态机
+  vc->cancel_OOB();
+  // 让epoll_wait停止监控此vc的socket fd
+  vc->ep.stop();
+  // 关闭socket fd
+  vc->con.close();
+
+  // 这里没有异步处理策略，必须保证是由管理此vc的线程发起调用
+  // 事实上这里 t == this_ethread()，可以查阅ATS代码中调用close_UnixNetVConnection的地方来确认
+  ink_release_assert(vc->thread == t);
+
+  // 清理超时计数器
+  vc->next_inactivity_timeout_at = 0;
+  vc->next_activity_timeout_at = 0;
+  vc->inactivity_timeout_in = 0;
+  vc->active_timeout_in = 0;
+
+  // 之前的版本没有判断nh是否为空，存在bug
+  // 当nh不为空，就要将vc从几个队列中删除
+  if (nh) {
+    // 四个本地队列
+    nh->open_list.remove(vc);
+    nh->cop_list.remove(vc);
+    nh->read_ready_list.remove(vc);
+    nh->write_ready_list.remove(vc);
+    
+    // 两个enable_list是原子队列
+    // 但是 in_enable_list 的操作却无法与原子操作同步，此处我觉得存在问题！！！
+    if (vc->read.in_enabled_list) {
+      nh->read_enable_list.remove(vc);
+      vc->read.in_enabled_list = 0;
+    }
+    if (vc->write.in_enabled_list) {
+      nh->write_enable_list.remove(vc);
+      vc->write.in_enabled_list = 0;
+    }
+    
+    // 两个仅用于InactivityCop本地队列
+    vc->remove_from_keep_alive_queue();
+    vc->remove_from_active_queue();
+  }
+  
+  // 最后调用vc的free方法
+  vc->free(t);
+}
+```
+
+在vc关闭后，就需要对资源进行回收，由于vc的内存资源是通过allocate_vc函数分配的，因此在回收时也要将内存归还到内存池。
+
+每一种类型的NetVC的继承类，都会有匹配的NetProcessor继承类提供allocate_vc函数和其自身提供的free函数。
+
+```
+void
+UnixNetVConnection::free(EThread *t)
+{
+  // 只有当前线程可以释放vc资源
+  // 这里 t == thread，与close_UnixNetVConnection是一样的。
+  ink_release_assert(t == this_ethread());
+  NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, -1);
+  
+  // clear variables for reuse
+  // 释放vc的mutex
+  this->mutex.clear();
+  // 释放上层状态机的mutex
+  action_.mutex.clear();
+  got_remote_addr = 0;
+  got_local_addr = 0;
+  attributes = 0;
+  // 释放vio的mutex，可能等于上层状态机的mutex，有判断，不会重复释放内存
+  read.vio.mutex.clear();
+  write.vio.mutex.clear();
+  // 重置半关闭状态
+  flags = 0;
+  // 重置回调函数
+  SET_CONTINUATION_HANDLER(this, (NetVConnHandler)&UnixNetVConnection::startEvent);
+  // NetHandler 为空
+  nh = NULL;
+  // 重置 NetState 
+  read.triggered = 0;
+  write.triggered = 0;
+  read.enabled = 0;
+  write.enabled = 0;
+  // 重置VIO
+  read.vio._cont = NULL;
+  write.vio._cont = NULL;
+  read.vio.vc_server = NULL;
+  write.vio.vc_server = NULL;
+  // 重置options
+  options.reset();
+  // 重置 close 状态
+  closed = 0;
+  // 必须不在ready_link和enable_link中，在close_UnixNetVConnection中已经移除
+  ink_assert(!read.ready_link.prev && !read.ready_link.next);
+  ink_assert(!read.enable_link.next);
+  ink_assert(!write.ready_link.prev && !write.ready_link.next);
+  ink_assert(!write.enable_link.next);
+  ink_assert(!link.next && !link.prev);
+  // socket fd 已经关闭，在close_UnixNetVConnection中调用con.close()完成了关闭
+  ink_assert(con.fd == NO_FD);
+  ink_assert(t == this_ethread());
+
+  // 判断allocate_vc方法为vc分配内存时，是由全局内存分配还是线程本地分配
+  // 选择对应的方法归还内存资源
+  if (from_accept_thread) {
+    netVCAllocator.free(this);
+  } else {
+    THREAD_FREE(this, netVCAllocator, t);
+  }
+}
+```
+
+由于close_UnixNetVConnection和free都是不可重入的，所以在很多地方，我们都看到使用vc的重入计数器对重入进行判断。
+
+例如，在do_io_close中：
+
+```
+void
+UnixNetVConnection::do_io_close(int alerrno /* = -1 */)
+{
+  disable_read(this);
+  disable_write(this);
+  read.vio.buffer.clear();
+  read.vio.nbytes = 0;
+  read.vio.op = VIO::NONE;
+  read.vio._cont = NULL;
+  write.vio.buffer.clear();
+  write.vio.nbytes = 0;
+  write.vio.op = VIO::NONE;
+  write.vio._cont = NULL;
+
+  EThread *t = this_ethread();
+  // 通过重入计数器判断是否可以直接调用close_UnixNetVConnection
+  bool close_inline = !recursion && (!nh || nh->mutex->thread_holding == t);
+
+  INK_WRITE_MEMORY_BARRIER;
+  if (alerrno && alerrno != -1)
+    this->lerrno = alerrno;
+  if (alerrno == -1)
+    closed = 1;
+  else
+    closed = -1;
+
+  if (close_inline)
+    close_UnixNetVConnection(this, t);
+  // 此处对于不能立即关闭vc的情况没有任何操作了，也没有重新调度来延迟关闭vc
+  // 那么什么时候调用close_UnixNetVConnection来关闭vc呢？答案是：在InactivityCop中会做出处理
+}
+```
+
+### 关于 in_enable_list 操作的原子性问题的备忘录
+
+在close_UnixNetVConnection中直接对in_enable_list进行判断和置0的操作
+
+  - 如果没有对NetHandler上锁，那么就无法与原子操作同步
+  - 此处我觉得可能存在问题！！！
+  - 回头再仔细看过代码后，再回来更新
 
 ## 参考资料
 
