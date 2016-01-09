@@ -556,6 +556,8 @@ ATS这种设计是否有问题呢？
 
 ## 参考资料
 
+![NetHandler - NetVC - VIO - UpperSM](https://cdn.rawgit.com/oknet/atsinternals/master/CH02-IOCoreNET/CH02-IOCoreNet-001.svg)
+
 - [P_UnixNet.h]
 (http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNet.h)
 - [P_UnixPollDescriptor.h]
@@ -564,4 +566,4 @@ ATS这种设计是否有问题呢？
 (http://github.com/apache/trafficserver/tree/master/iocore/net/UnixNetVConnection.cc)
 - [UnixNet.cc]
 (http://github.com/apache/trafficserver/tree/master/iocore/net/UnixNet.cc)
-- [NetHandler - NetVC - VIO - UpperSM](CH02-IOCoreNet-001.svg)
+
