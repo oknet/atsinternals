@@ -1866,8 +1866,10 @@ UnixNetVConnection::do_io_close(int alerrno /* = -1 */)
 在close_UnixNetVConnection中直接对in_enable_list进行判断和置0的操作
 
   - 如果没有对NetHandler上锁，那么就无法与原子操作同步
-  - 此处我觉得可能存在问题！！！
-  - 回头再仔细看过代码后，再回来更新
+  - 那么到底NetHandler有没有上锁呢？答案是上锁了！
+  - 但是在哪儿上锁的呢？
+
+提示：NetAccept的mutex在init_accept_per_thread里面为何被设置为```get_NetHandler(t)->mutex``` ?
 
 ## 参考资料
 
