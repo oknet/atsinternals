@@ -8,3 +8,4 @@ InactivityCop是对早期的超时机制的改进，这个改进降低了EventSy
 
 因此ATS或者是更早的Inktomi公司，重构了超时管理，提出了InactivityCop状态机，专门用来支持 NetVConnection 的两种超时。
 
+![How the InactivityCop works](https://cdn.rawgit.com/oknet/atsinternals/master/CH02-IOCoreNET/CH02-IOCoreNet-002.svg)
