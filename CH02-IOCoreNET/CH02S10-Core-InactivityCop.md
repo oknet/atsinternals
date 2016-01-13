@@ -179,9 +179,8 @@ NetHandler::manage_active_queue()
   int total_idle_count = 0;
   // 遍历active_queue，主动关闭超时的连接
   for (; vc != NULL; vc = vc_next) {
-    // 在分析此部分代码时，发现下面这个条件判断有问题，开了Issue：TS-4125
-    // 我觉得应该都是小于等于now才对
-    if ((vc->next_inactivity_timeout_at > now) || (vc->next_activity_timeout_at > now)) {
+    vc_next = vc->active_queue_link.next;
+    if ((vc->next_inactivity_timeout_at <= now) || (vc->next_activity_timeout_at <= now)) {
       _close_vc(vc, now, handle_event, closed, total_idle_time, total_idle_count);
     }
     // 恢复到最大连接之下，则不对后面的vc进行处理了
@@ -238,7 +237,7 @@ NetHandler::manage_keep_alive_queue()
   // 因为是keep_alive连接，关闭之后，只是影响一点性能
   // 如果active_queue把所有的连接都用光了，那么keep_alive_queue就会是空的
   for (UnixNetVConnection *vc = keep_alive_queue.head; vc != NULL; vc = vc_next) {
-    vc_next = vc->active_queue_link.next;
+    vc_next = vc->keep_alive_queue_link.next;
     _close_vc(vc, now, handle_event, closed, total_idle_time, total_idle_count);
 
     // 恢复到最大连接之下，则不对后面的vc进行处理了
