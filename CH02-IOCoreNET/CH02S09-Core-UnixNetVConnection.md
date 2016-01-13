@@ -2098,6 +2098,51 @@ NetVCTest::start_test()
 
 设置的 active_timeout 要多出5秒，由此可以猜测，active_timeout 要比 inactivity_timeout 的时间长。
 
+在 iocore/net/I_NetVConnection.h 中的注释，说明了差别(配上简单翻译)：
+
+```
+  /**
+    在状态机使用此NetVC一定时间之后，会收到VC_EVENT_ACTIVE_TIMEOUT事件。
+    如果读、写都未在此NetVC激活，那么此值会被忽略。
+    这个功能防止状态机较长时间的保持连接的打开状态。
+    
+    Sets time after which SM should be notified.
+    Sets the amount of time (in nanoseconds) after which the state
+    machine using the NetVConnection should receive a
+    VC_EVENT_ACTIVE_TIMEOUT event. The timeout is value is ignored
+    if neither the read side nor the write side of the connection
+    is currently active. The timer is reset if the function is
+    called repeatedly This call can be used by SMs to make sure
+    that it does not keep any connections open for a really long
+    time.
+    ...
+   */
+  virtual void set_active_timeout(ink_hrtime timeout_in) = 0;
+    
+  /**
+    当状态机请求在此NetVC执行的IO操作没有完成时，
+    在读写都处于IDLE状态一定时间之后，状态机会收到VC_EVENT_INACTIVITY_TIMEOUT事件
+    任何读写操作的发生，都会导致计时器被重置。
+    如果读、写都未在此NetVC激活，那么此值会被忽略。
+    
+    Sets time after which SM should be notified if the requested
+    IO could not be performed. Sets the amount of time (in nanoseconds),
+    if the NetVConnection is idle on both the read or write side,
+    after which the state machine using the NetVConnection should
+    receive a VC_EVENT_INACTIVITY_TIMEOUT event. Either read or
+    write traffic will cause timer to be reset. Calling this function
+    again also resets the timer. The timeout is value is ignored
+    if neither the read side nor the write side of the connection
+    is currently active. See section on timeout semantics above.
+   */
+  virtual void set_inactivity_timeout(ink_hrtime timeout_in) = 0;
+```
+
+所以，
+
+ - Active Timeout，是设置一个NetVC的最大生存时间
+ - Inactivity Timeout，是设置一个最长的IDLE时间
+
 ## 参考资料
 
 - [P_UnixNetState.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNetState.h)
