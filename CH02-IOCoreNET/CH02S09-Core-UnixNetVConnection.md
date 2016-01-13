@@ -269,8 +269,10 @@ public:
   LINK(UnixNetVConnection, active_queue_link);
 
   // 定义inactivity timeout，我理解为IDLE Timeout，就是这个连接上没有任何数据传输的时候，最长等待时间
+  // 每次读、写操作都会重置IDLE Timeout的计时器
   ink_hrtime inactivity_timeout_in;
-  // 定义active timeout，我理解为OPERATION Timeout，就是当进行一个异步读、写操作时，最长等待时间
+  // 定义active timeout，我理解为NetVC LifeCycle Timeout，就是一个NetVC可以生存多久
+  // 重设可以延长NetVC的寿命
   ink_hrtime active_timeout_in;
 #ifdef INACTIVITY_TIMEOUT
   Event *inactivity_timeout;
