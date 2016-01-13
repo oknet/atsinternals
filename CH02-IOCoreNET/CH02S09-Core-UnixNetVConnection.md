@@ -1336,8 +1336,9 @@ UnixNetVConnection::mainEvent(int event, Event *e)
       (write.vio.mutex.m_ptr && wlock.get_mutex() != write.vio.mutex.m_ptr)) {
     // 上述判断若有一个失败，则需要重新调度
 #ifdef INACTIVITY_TIMEOUT
-    //     但是只有由active_timeout事件回调才重新调度
-    //     为什么inactivity_timeout事件的回调在上锁失败后就直接返回了，而不进行重新调度呢？？？
+    // 但是只有由active_timeout事件回调才重新调度
+    // 为什么inactivity_timeout事件的回调在上锁失败后就直接返回了，而不进行重新调度呢？？？
+    //     因为出现上锁失败的时候，那就意味着有一个能够重置inactivity_timeout计时器的操作正在进行，所以就没有必要再重新调度了
     if (e == active_timeout)
 #endif
       e->schedule_in(HRTIME_MSECONDS(net_retry_delay));
