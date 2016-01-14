@@ -13,6 +13,7 @@ InactivityCop是对早期的超时机制的改进，这个改进降低了EventSy
   - [TS-3313 New World order for connection management and timeouts](https://issues.apache.org/jira/browse/TS-3313)
   - [TS-1405 apply time-wheel scheduler about event system](https://issues.apache.org/jira/browse/TS-1405)
 
+对于InactivityCop管理的几个队列的介绍，可以参见 NetHandler 的章节。
 
 ## 定义
 
@@ -152,6 +153,56 @@ update_cop_config(const char *name, RecDataT data_type ATS_UNUSED, RecData data,
 #endif
 ```
 
+## NetHandler的延伸：(add_to|remote_from)_active_queue
+
+添加NetVC到active_queue，或从active_queue中移除NetVC
+
+```
+bool
+NetHandler::add_to_active_queue(UnixNetVConnection *vc)
+{
+  Debug("net_queue", "NetVC: %p", vc);
+  Debug("net_queue", "max_connections_per_thread_in: %d active_queue_size: %d keep_alive_queue_size: %d",
+        max_connections_per_thread_in, active_queue_size, keep_alive_queue_size);
+
+  // 首先整理active_queue，看看是否超出最大连接的限制
+  // if active queue is over size then close inactive connections
+  if (manage_active_queue() == false) {
+    // 超出限制，直接返回失败
+    // there is no room left in the queue
+    return false;
+  }
+
+  if (active_queue.in(vc)) {
+    // 如果已经在队列中，则从队列移除，后面在添加进去之后就放在头部，可以被尽快处理
+    // already in the active queue, move the head
+    active_queue.remove(vc);
+  } else {
+    // 如果不在队列中，则要尝试从active_queue里移除，因为一个NetVC不能同时出现在active_queue和keep_alive_queue
+    // in the keep-alive queue or no queue, new to this queue
+    remove_from_keep_alive_queue(vc);
+    // 因为之前此NetVC不在keep_alive_queue里，所以次数要对计数器做增量
+    ++active_queue_size;
+  }
+  // 将NetVC放入active_queue
+  active_queue.enqueue(vc);
+
+  return true;
+}
+
+void
+NetHandler::remove_from_active_queue(UnixNetVConnection *vc)
+{
+  Debug("net_queue", "NetVC: %p", vc);
+  if (active_queue.in(vc)) {
+    // 如果已经在队列中，则从队列移除
+    active_queue.remove(vc);
+    // 并对计数器做递减
+    --active_queue_size;
+  }
+}
+```
+
 ## NetHandler的延伸：manage_active_queue
 
 对active_queue的管理，在InactivityCop的主流程里只看到了对Inactivity Timeout的检查和处理，那么Active Timeout的处理是在哪里完成的呢？
@@ -202,6 +253,48 @@ NetHandler::manage_active_queue()
   // 返回 false 表示不能再接受新vc了，达到了连接的最大值
   // 在ATS的代码里，只有add_to_active_queue()会对此值进行判断
   return false; // failed to make room in the queue, all connections are active
+}
+```
+
+## NetHandler的延伸：（add_to|remove_from)_keep_alive_queue
+
+添加NetVC到keep_alive_queue，或从keep_alive_queue中移除NetVC
+
+```
+void
+NetHandler::add_to_keep_alive_queue(UnixNetVConnection *vc)
+{
+  Debug("net_queue", "NetVC: %p", vc);
+
+  if (keep_alive_queue.in(vc)) {
+    // 如果已经在队列中，则从队列移除，后面在添加进去之后就放在头部，可以被尽快处理
+    // already in the keep-alive queue, move the head
+    keep_alive_queue.remove(vc);
+  } else {
+    // 如果不在队列中，则要尝试从active_queue里移除，因为一个NetVC不能同时出现在active_queue和keep_alive_queue
+    // in the active queue or no queue, new to this queue
+    remove_from_active_queue(vc);
+    // 因为之前此NetVC不在keep_alive_queue里，所以次数要对计数器做增量
+    ++keep_alive_queue_size;
+  }
+  // 将NetVC放入keep_alive_queue
+  keep_alive_queue.enqueue(vc);
+
+  // 整理keep_alive_queue
+  // if keep-alive queue is over size then close connections
+  manage_keep_alive_queue();
+}
+
+void
+NetHandler::remove_from_keep_alive_queue(UnixNetVConnection *vc)
+{
+  Debug("net_queue", "NetVC: %p", vc);
+  if (keep_alive_queue.in(vc)) {
+    // 如果已经在队列中，则从队列移除
+    keep_alive_queue.remove(vc);
+    // 并对计数器做递减
+    --keep_alive_queue_size;
+  }
 }
 ```
 
