@@ -10,8 +10,8 @@ InactivityCop是对早期的超时机制的改进，这个改进降低了EventSy
 
 对于此部分改进的一些讨论，可以参阅官方JIRA的两个Issue：
 
-  - [TS-3313](https://issues.apache.org/jira/browse/TS-3313)
-  - [TS-1405](https://issues.apache.org/jira/browse/TS-1405)
+  - [TS-3313 New World order for connection management and timeouts](https://issues.apache.org/jira/browse/TS-3313)
+  - [TS-1405 apply time-wheel scheduler about event system](https://issues.apache.org/jira/browse/TS-1405)
 
 
 ## 定义
@@ -155,6 +155,10 @@ update_cop_config(const char *name, RecDataT data_type ATS_UNUSED, RecData data,
 ## NetHandler的延伸：manage_active_queue
 
 对active_queue的管理，在InactivityCop的主流程里只看到了对Inactivity Timeout的检查和处理，那么Active Timeout的处理是在哪里完成的呢？
+
+下面的 manage_active_queue 并未实现Active Timeout的处理，只是在active_queue达到上限值时，主动遍历active_queue关掉Inactivity Timeout和Active Timeout的NetVC。
+
+通过阅读代码，我觉得在InactivityCop的实现中，Active Timeout好像被弄坏了，不能用了。
 
 ```
 bool
