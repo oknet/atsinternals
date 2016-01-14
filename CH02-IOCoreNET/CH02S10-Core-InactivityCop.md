@@ -8,6 +8,12 @@ InactivityCop是对早期的超时机制的改进，这个改进降低了EventSy
 
 因此ATS或者是更早的Inktomi公司，重构了超时管理，提出了InactivityCop状态机，专门用来支持 NetVConnection 的两种超时。
 
+对于此部分改进的一些讨论，可以参阅官方JIRA的两个Issue：
+
+  - [TS-3313](https://issues.apache.org/jira/browse/TS-3313)
+  - [TS-1405](https://issues.apache.org/jira/browse/TS-1405)
+
+
 ## 定义
 
 ```
