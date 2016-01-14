@@ -1144,6 +1144,231 @@ ATS通过给VC设置一个重入计数器来解决这个问题。
 
 实现了数据流在socket与buffer之间的传递，因此我更觉的read_from_net，write_to_net和write_to_net_io是NetHandler的一部分，而只有 net_read_io，load_buffer_and_write 才算是 UnixNetVConnection的方法，因为继承自它的SSLNetVConnection需要重载这两个方法来实现数据的加解密。
 
+## 超时控制和管理
+
+对于Active Timeout 和 Inactivity Timeout，ATS分别提供了下面的方法：
+
+  - get_(inactivity|active)_timeout
+  - set_(inactivity|active)_timeout
+  - cancel_(inactivity|active)_timeout
+
+```
+// get方法比较简单，直接返回成员的值
+// 这里的后缀 _in 跟 schedule_in 的后缀是一个意思，是相对当前时间的，相对超时时间
+TS_INLINE ink_hrtime
+UnixNetVConnection::get_active_timeout()
+{
+  return active_timeout_in;
+}
+
+TS_INLINE ink_hrtime
+UnixNetVConnection::get_inactivity_timeout()
+{
+  return inactivity_timeout_in;
+}
+
+// set方法需要根据超时机制的方式，由宏定义确定
+// 但是无论哪种方式都需要设置 inactivity_timeout_in 的值
+TS_INLINE void
+UnixNetVConnection::set_inactivity_timeout(ink_hrtime timeout)
+{
+  Debug("socket", "Set inactive timeout=%" PRId64 ", for NetVC=%p", timeout, this);
+  inactivity_timeout_in = timeout;
+#ifdef INACTIVITY_TIMEOUT
+  // 如果之前设置了inactivity_timeout，就要先取消之前设置的
+  if (inactivity_timeout)
+    inactivity_timeout->cancel_action(this);
+
+  // 然后再判断是否要设置新的超时控制，inactivity_timeout_in == 0 表示取消超时控制
+  if (inactivity_timeout_in) {
+    if (read.enabled) {
+      // 读操作激活，设置读操作的超时事件
+      ink_assert(read.vio.mutex->thread_holding == this_ethread() && thread);
+      // 分为同步调度和异步调度，设定在 inactivity_timeout_in 时间之后回调VC状态机的mainEvent
+      if (read.vio.mutex->thread_holding == thread)
+        inactivity_timeout = thread->schedule_in_local(this, inactivity_timeout_in);
+      else
+        inactivity_timeout = thread->schedule_in(this, inactivity_timeout_in);
+    } else if (write.enabled) {
+      // 在读操作没有设置的情况下，判断
+      // 写操作激活，设置写操作的超时事件
+      ink_assert(write.vio.mutex->thread_holding == this_ethread() && thread);
+      // 分为同步调度和异步调度，设定在 inactivity_timeout_in 时间之后回调VC状态机的mainEvent
+      if (write.vio.mutex->thread_holding == thread)
+        inactivity_timeout = thread->schedule_in_local(this, inactivity_timeout_in);
+      else
+        inactivity_timeout = thread->schedule_in(this, inactivity_timeout_in);
+    } else {
+      // 读写操作都未设置，超时设置不生效
+      // 清除指向event的指针
+      inactivity_timeout = 0;
+    }
+  } else {
+    // 清除指向event的指针
+    inactivity_timeout = 0;
+  }
+#else
+  // 设置 inactivity_timeout 对应的超时时间的绝对值
+  next_inactivity_timeout_at = Thread::get_hrtime() + timeout;
+#endif
+}
+
+// set方法需要根据超时机制的方式，由宏定义确定
+// 但是无论哪种方式都需要设置 active_timeout_in 的值
+// 流程上与 set_inactivity_timeout 完全一致
+TS_INLINE void
+UnixNetVConnection::set_active_timeout(ink_hrtime timeout)
+{
+  Debug("socket", "Set active timeout=%" PRId64 ", NetVC=%p", timeout, this);
+  active_timeout_in = timeout;
+#ifdef INACTIVITY_TIMEOUT
+  if (active_timeout)
+    active_timeout->cancel_action(this);
+  if (active_timeout_in) {
+    if (read.enabled) {
+      ink_assert(read.vio.mutex->thread_holding == this_ethread() && thread);
+      if (read.vio.mutex->thread_holding == thread)
+        active_timeout = thread->schedule_in_local(this, active_timeout_in);
+      else
+        active_timeout = thread->schedule_in(this, active_timeout_in);
+    } else if (write.enabled) {
+      ink_assert(write.vio.mutex->thread_holding == this_ethread() && thread);
+      if (write.vio.mutex->thread_holding == thread)
+        active_timeout = thread->schedule_in_local(this, active_timeout_in);
+      else
+        active_timeout = thread->schedule_in(this, active_timeout_in);
+    } else
+      active_timeout = 0;
+  } else
+    active_timeout = 0;
+#else
+  next_activity_timeout_at = Thread::get_hrtime() + timeout;
+#endif
+}
+
+// 取消超时设置
+// cancel方法也需要根据超时机制的方式，由宏定义确定
+// 但是无论哪种方式都需要对 inactivity_timeout_in 的值清零
+TS_INLINE void
+UnixNetVConnection::cancel_inactivity_timeout()
+{
+  Debug("socket", "Cancel inactive timeout for NetVC=%p", this);
+  inactivity_timeout_in = 0;
+#ifdef INACTIVITY_TIMEOUT
+  // 取消事件
+  if (inactivity_timeout) {
+    Debug("socket", "Cancel inactive timeout for NetVC=%p", this);
+    inactivity_timeout->cancel_action(this);
+    inactivity_timeout = NULL;
+  }
+#else
+  // 设置 inactivity_timeout 对应的超时时间的绝对值为 0
+  next_inactivity_timeout_at = 0;
+#endif
+}
+
+// cancel方法也需要根据超时机制的方式，由宏定义确定
+// 但是无论哪种方式都需要对 active_timeout_in 的值清零
+// 流程上与 cancel_inactivity_timeout 完全一致
+TS_INLINE void
+UnixNetVConnection::cancel_active_timeout()
+{
+  Debug("socket", "Cancel active timeout for NetVC=%p", this);
+  active_timeout_in = 0;
+#ifdef INACTIVITY_TIMEOUT
+  if (active_timeout) {
+    Debug("socket", "Cancel active timeout for NetVC=%p", this);
+    active_timeout->cancel_action(this);
+    active_timeout = NULL;
+  }
+#else
+  next_activity_timeout_at = 0;
+#endif
+}
+```
+
+不管是 Inactivity Timeout 还是 Active Timeout 都要求激活了读、写操作才能设置，那么这两种Timeout到底有什么区别？
+
+在 iocore/net/NetVCTest.cc 文件中：
+
+```
+void
+NetVCTest::start_test()
+{
+  test_vc->set_inactivity_timeout(HRTIME_SECONDS(timeout));
+  test_vc->set_active_timeout(HRTIME_SECONDS(timeout + 5));
+
+  read_buffer = new_MIOBuffer();
+  write_buffer = new_MIOBuffer();
+
+  reader_for_rbuf = read_buffer->alloc_reader();
+  reader_for_wbuf = write_buffer->alloc_reader();
+
+  if (nbytes_read > 0) {
+    read_vio = test_vc->do_io_read(this, nbytes_read, read_buffer);
+  } else {
+    read_done = true;
+  }
+
+  if (nbytes_write > 0) {
+    write_vio = test_vc->do_io_write(this, nbytes_write, reader_for_wbuf);
+  } else {
+    write_done = true;
+  }
+}
+```
+
+设置的 active_timeout 要多出5秒，由此可以猜测，active_timeout 要比 inactivity_timeout 的时间长。
+
+在 iocore/net/I_NetVConnection.h 中的注释，说明了差别(配上简单翻译)：
+
+```
+  /**
+    在状态机使用此NetVC一定时间之后，会收到VC_EVENT_ACTIVE_TIMEOUT事件。
+    如果读、写都未在此NetVC激活，那么此值会被忽略。
+    这个功能防止状态机较长时间的保持连接的打开状态。
+    
+    Sets time after which SM should be notified.
+    Sets the amount of time (in nanoseconds) after which the state
+    machine using the NetVConnection should receive a
+    VC_EVENT_ACTIVE_TIMEOUT event. The timeout is value is ignored
+    if neither the read side nor the write side of the connection
+    is currently active. The timer is reset if the function is
+    called repeatedly This call can be used by SMs to make sure
+    that it does not keep any connections open for a really long
+    time.
+    ...
+   */
+  virtual void set_active_timeout(ink_hrtime timeout_in) = 0;
+    
+  /**
+    当状态机请求在此NetVC执行的IO操作没有完成时，
+    在读写都处于IDLE状态一定时间之后，状态机会收到VC_EVENT_INACTIVITY_TIMEOUT事件
+    任何读写操作的发生，都会导致计时器被重置。
+    如果读、写都未在此NetVC激活，那么此值会被忽略。
+    
+    Sets time after which SM should be notified if the requested
+    IO could not be performed. Sets the amount of time (in nanoseconds),
+    if the NetVConnection is idle on both the read or write side,
+    after which the state machine using the NetVConnection should
+    receive a VC_EVENT_INACTIVITY_TIMEOUT event. Either read or
+    write traffic will cause timer to be reset. Calling this function
+    again also resets the timer. The timeout is value is ignored
+    if neither the read side nor the write side of the connection
+    is currently active. See section on timeout semantics above.
+   */
+  virtual void set_inactivity_timeout(ink_hrtime timeout_in) = 0;
+```
+
+所以，
+
+ - Active Timeout，是设置一个NetVC的最大生存时间
+ - Inactivity Timeout，是设置一个最长的IDLE时间
+
+上面介绍了获取超时设置，设置超时时间，取消超时控制的方法，那么在ATS中是由谁具体实现了超时的功能呢？
+
+请继续阅读下面mainEvent回调函数的分析。
+
 ## UnixNetVConnection 状态机的回调函数
 
 UnixNetVConnection 具有多态性，它除了具有与Event类型相似的传递事件的功能，同时也是一个状态机，有它自己的回调函数。
@@ -1396,7 +1621,7 @@ UnixNetVConnection::mainEvent(int event, Event *e)
     // 当传入的event为EVENT_INTERVAL
     // 这表示发生了Active Timeout
     // 通常只有EventSystem对于定时、周期性执行的事件的回调才会传入EVENT_INTERVAL
-    //     但是没有看到有任何地方做schedule，如果由EventSystem回调，那么传入的event是在哪里创建的？
+    //     但是没有看到有任何地方做schedule，如果由EventSystem回调，那么传入的event是在哪里创建的？？？
     // event == EVENT_INTERVAL
     // Active Timeout
     // 出现了Active Timeout，因此设置回调上层状态机的 event 类型为 ACTIVE_TIMEOUT
@@ -1452,8 +1677,6 @@ UnixNetVConnection::mainEvent(int event, Event *e)
   return EVENT_DONE;
 }
 ```
-
-对于超时部分的讲解放在本章后面，详细描述超时的设置，如何调用mainEvent等。
 
 ## 方法
 
@@ -1924,227 +2147,6 @@ UnixNetVConnection::do_io_close(int alerrno /* = -1 */)
   - 但是在哪儿上锁的呢？
 
 提示：NetAccept的mutex在init_accept_per_thread里面为何被设置为```get_NetHandler(t)->mutex``` ?
-
-### 超时
-
-对于ACTIVE Timeout 和 Inactivity Timeout，ATS分别提供了下面的方法：
-
-  - get_(inactivity|active)_timeout
-  - set_(inactivity|active)_timeout
-  - cancel_(inactivity|active)_timeout
-
-```
-// get方法比较简单，直接返回成员的值
-// 这里的后缀 _in 跟 schedule_in 的后缀是一个意思，是相对当前时间的，相对超时时间
-TS_INLINE ink_hrtime
-UnixNetVConnection::get_active_timeout()
-{
-  return active_timeout_in;
-}
-
-TS_INLINE ink_hrtime
-UnixNetVConnection::get_inactivity_timeout()
-{
-  return inactivity_timeout_in;
-}
-
-// set方法需要根据超时机制的方式，由宏定义确定
-// 但是无论哪种方式都需要设置 inactivity_timeout_in 的值
-TS_INLINE void
-UnixNetVConnection::set_inactivity_timeout(ink_hrtime timeout)
-{
-  Debug("socket", "Set inactive timeout=%" PRId64 ", for NetVC=%p", timeout, this);
-  inactivity_timeout_in = timeout;
-#ifdef INACTIVITY_TIMEOUT
-  // 如果之前设置了inactivity_timeout，就要先取消之前设置的
-  if (inactivity_timeout)
-    inactivity_timeout->cancel_action(this);
-
-  // 然后再判断是否要设置新的超时控制，inactivity_timeout_in == 0 表示取消超时控制
-  if (inactivity_timeout_in) {
-    if (read.enabled) {
-      // 读操作激活，设置读操作的超时事件
-      ink_assert(read.vio.mutex->thread_holding == this_ethread() && thread);
-      // 分为同步调度和异步调度，设定在 inactivity_timeout_in 时间之后回调VC状态机的mainEvent
-      if (read.vio.mutex->thread_holding == thread)
-        inactivity_timeout = thread->schedule_in_local(this, inactivity_timeout_in);
-      else
-        inactivity_timeout = thread->schedule_in(this, inactivity_timeout_in);
-    } else if (write.enabled) {
-      // 在读操作没有设置的情况下，判断
-      // 写操作激活，设置写操作的超时事件
-      ink_assert(write.vio.mutex->thread_holding == this_ethread() && thread);
-      // 分为同步调度和异步调度，设定在 inactivity_timeout_in 时间之后回调VC状态机的mainEvent
-      if (write.vio.mutex->thread_holding == thread)
-        inactivity_timeout = thread->schedule_in_local(this, inactivity_timeout_in);
-      else
-        inactivity_timeout = thread->schedule_in(this, inactivity_timeout_in);
-    } else {
-      // 读写操作都未设置，超时设置不生效
-      // 清除指向event的指针
-      inactivity_timeout = 0;
-    }
-  } else {
-    // 清除指向event的指针
-    inactivity_timeout = 0;
-  }
-#else
-  // 设置 inactivity_timeout 对应的超时时间的绝对值
-  next_inactivity_timeout_at = Thread::get_hrtime() + timeout;
-#endif
-}
-
-// set方法需要根据超时机制的方式，由宏定义确定
-// 但是无论哪种方式都需要设置 active_timeout_in 的值
-// 流程上与 set_inactivity_timeout 完全一致
-TS_INLINE void
-UnixNetVConnection::set_active_timeout(ink_hrtime timeout)
-{
-  Debug("socket", "Set active timeout=%" PRId64 ", NetVC=%p", timeout, this);
-  active_timeout_in = timeout;
-#ifdef INACTIVITY_TIMEOUT
-  if (active_timeout)
-    active_timeout->cancel_action(this);
-  if (active_timeout_in) {
-    if (read.enabled) {
-      ink_assert(read.vio.mutex->thread_holding == this_ethread() && thread);
-      if (read.vio.mutex->thread_holding == thread)
-        active_timeout = thread->schedule_in_local(this, active_timeout_in);
-      else
-        active_timeout = thread->schedule_in(this, active_timeout_in);
-    } else if (write.enabled) {
-      ink_assert(write.vio.mutex->thread_holding == this_ethread() && thread);
-      if (write.vio.mutex->thread_holding == thread)
-        active_timeout = thread->schedule_in_local(this, active_timeout_in);
-      else
-        active_timeout = thread->schedule_in(this, active_timeout_in);
-    } else
-      active_timeout = 0;
-  } else
-    active_timeout = 0;
-#else
-  next_activity_timeout_at = Thread::get_hrtime() + timeout;
-#endif
-}
-
-// 取消超时设置
-// cancel方法也需要根据超时机制的方式，由宏定义确定
-// 但是无论哪种方式都需要对 inactivity_timeout_in 的值清零
-TS_INLINE void
-UnixNetVConnection::cancel_inactivity_timeout()
-{
-  Debug("socket", "Cancel inactive timeout for NetVC=%p", this);
-  inactivity_timeout_in = 0;
-#ifdef INACTIVITY_TIMEOUT
-  // 取消事件
-  if (inactivity_timeout) {
-    Debug("socket", "Cancel inactive timeout for NetVC=%p", this);
-    inactivity_timeout->cancel_action(this);
-    inactivity_timeout = NULL;
-  }
-#else
-  // 设置 inactivity_timeout 对应的超时时间的绝对值为 0
-  next_inactivity_timeout_at = 0;
-#endif
-}
-
-// cancel方法也需要根据超时机制的方式，由宏定义确定
-// 但是无论哪种方式都需要对 active_timeout_in 的值清零
-// 流程上与 cancel_inactivity_timeout 完全一致
-TS_INLINE void
-UnixNetVConnection::cancel_active_timeout()
-{
-  Debug("socket", "Cancel active timeout for NetVC=%p", this);
-  active_timeout_in = 0;
-#ifdef INACTIVITY_TIMEOUT
-  if (active_timeout) {
-    Debug("socket", "Cancel active timeout for NetVC=%p", this);
-    active_timeout->cancel_action(this);
-    active_timeout = NULL;
-  }
-#else
-  next_activity_timeout_at = 0;
-#endif
-}
-```
-
-不管是 Inactivity Timeout 还是 Active Timeout 都要求激活了读、写操作才能设置，那么这两种Timeout到底有什么区别？
-
-在 iocore/net/NetVCTest.cc 文件中：
-
-```
-void
-NetVCTest::start_test()
-{
-  test_vc->set_inactivity_timeout(HRTIME_SECONDS(timeout));
-  test_vc->set_active_timeout(HRTIME_SECONDS(timeout + 5));
-
-  read_buffer = new_MIOBuffer();
-  write_buffer = new_MIOBuffer();
-
-  reader_for_rbuf = read_buffer->alloc_reader();
-  reader_for_wbuf = write_buffer->alloc_reader();
-
-  if (nbytes_read > 0) {
-    read_vio = test_vc->do_io_read(this, nbytes_read, read_buffer);
-  } else {
-    read_done = true;
-  }
-
-  if (nbytes_write > 0) {
-    write_vio = test_vc->do_io_write(this, nbytes_write, reader_for_wbuf);
-  } else {
-    write_done = true;
-  }
-}
-```
-
-设置的 active_timeout 要多出5秒，由此可以猜测，active_timeout 要比 inactivity_timeout 的时间长。
-
-在 iocore/net/I_NetVConnection.h 中的注释，说明了差别(配上简单翻译)：
-
-```
-  /**
-    在状态机使用此NetVC一定时间之后，会收到VC_EVENT_ACTIVE_TIMEOUT事件。
-    如果读、写都未在此NetVC激活，那么此值会被忽略。
-    这个功能防止状态机较长时间的保持连接的打开状态。
-    
-    Sets time after which SM should be notified.
-    Sets the amount of time (in nanoseconds) after which the state
-    machine using the NetVConnection should receive a
-    VC_EVENT_ACTIVE_TIMEOUT event. The timeout is value is ignored
-    if neither the read side nor the write side of the connection
-    is currently active. The timer is reset if the function is
-    called repeatedly This call can be used by SMs to make sure
-    that it does not keep any connections open for a really long
-    time.
-    ...
-   */
-  virtual void set_active_timeout(ink_hrtime timeout_in) = 0;
-    
-  /**
-    当状态机请求在此NetVC执行的IO操作没有完成时，
-    在读写都处于IDLE状态一定时间之后，状态机会收到VC_EVENT_INACTIVITY_TIMEOUT事件
-    任何读写操作的发生，都会导致计时器被重置。
-    如果读、写都未在此NetVC激活，那么此值会被忽略。
-    
-    Sets time after which SM should be notified if the requested
-    IO could not be performed. Sets the amount of time (in nanoseconds),
-    if the NetVConnection is idle on both the read or write side,
-    after which the state machine using the NetVConnection should
-    receive a VC_EVENT_INACTIVITY_TIMEOUT event. Either read or
-    write traffic will cause timer to be reset. Calling this function
-    again also resets the timer. The timeout is value is ignored
-    if neither the read side nor the write side of the connection
-    is currently active. See section on timeout semantics above.
-   */
-  virtual void set_inactivity_timeout(ink_hrtime timeout_in) = 0;
-```
-
-所以，
-
- - Active Timeout，是设置一个NetVC的最大生存时间
- - Inactivity Timeout，是设置一个最长的IDLE时间
 
 ## 参考资料
 
