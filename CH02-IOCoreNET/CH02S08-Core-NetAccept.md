@@ -625,3 +625,8 @@ ink_assert(vc->nh->mutex->thread_holding == this_ethread());
   - 可以参考 ProtocolProbeSessionAccept 的相关设计
 
 引导器作为服务器端（Server Side）接受新连接时，被动创建状态机的前置状态机；如果在ATS内部需要作为客户端（Client Side）主动发起对外的连接，又是如何处理的呢？请查看UnixNetVConnection的介绍章节。
+
+## 参考资料
+
+- [P_NetAccept.h](https://github.com/apache/trafficserver/tree/master/iocore/net/P_NetAccept.h)
+- [UnixNetAccept.cc](https://github.com/apache/trafficserver/tree/master/iocore/net/UnixNetAccept.cc)
