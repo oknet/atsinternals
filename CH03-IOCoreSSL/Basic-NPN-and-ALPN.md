@@ -179,6 +179,20 @@ enum {
   - Application Layer Protocol Negotiation 扩展编号为：16 (0x10)
   - OpenSSL 1.0.2 版本开始支持 NPN 功能
 
+## NPN / ALPN 与 SSL 和上层协议之间的关系
+
+```
+ SPDY <------- HTTP/1.x
+   |
+   |
+   V
+  SSL <------- NPN/ALPN
+   |
+   |
+   V
+  TCP
+```
+
 ## 参考资料
 
 - [NPN and ALPN](https://www.imperialviolet.org/2013/03/20/alpn.html)
