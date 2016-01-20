@@ -4,12 +4,26 @@
 
   - 在建立SSL会话之后，解析出来的明文，是什么协议？
 
-于是 TLS-NPN 就诞生了，TLS-NPN全称是Transport Layer Security - Next Protocol Negotiation。
+在OSI的7层模型里，SSL 被普遍理解为处于第6层的位置，并且被广泛用于很多场景，但是：
 
-TLS-NPN 是 Google 为了支持 SPDY 协议作为一个应用层协议使用，而为TLS定义的一个扩展。
+  - 对于解密后的管道内的协议是什么协议？怎么使用？
+  - 只能由Client与Server约定好。
+  - 例如在443端口上，约定了使用SSL协议来加密HTTP/1.x的流量。
 
-所以正式的名字叫做 TLS-NPN，简写为 NPN （不是电子元件三极管，哈哈～）
+随着 SPDY 协议的诞生，在同一个端口上使用多种可能的协议进行通信的需求被提出，
 
+  - 由于数据内容已经被加密了，无法直接判断，只能解密数据之后才能知道协议类型
+  - 需要在数据解密之前就知道是哪种类型的协议数据被加密了
+  - 于是 TLS-NPN 就诞生了
+
+TLS-NPN 扩展实现了在SSL握手过程中：
+
+  - 由Server告知Client它可以在SSL会话解密后识别哪些协议，
+  - 然后Client再告知Server它的这次通信会把哪种协议加密后传送给Server。
+
+TLS-NPN 全称是Transport Layer Security - Next Protocol Negotiation，它是 Google 为了支持 SPDY 协议作为一个应用层协议使用，而为TLS定义的一个扩展。
+
+TLS-NPN 可以简写为 NPN （不是电子元件三极管，哈哈～）
 
 ## TLS-NPN 扩展
 
@@ -18,23 +32,23 @@ TLS-NPN 是 Google 为了支持 SPDY 协议作为一个应用层协议使用，�
 首先是 SSL Full HandShake 过程，如何附带 NPN 扩展
 
 ```
-Client                                               Server
+Client                                                 Server
 
 ClientHello (带有NP扩展标志)  -------->
-                                                 ServerHello (带有NP扩展标志 & 支持的协议列表)
-                                                Certificate*
-                                          ServerKeyExchange*
-                                         CertificateRequest*
-                             <--------       ServerHelloDone
+                                                  ServerHello (带有NP扩展标志 & 支持的协议列表)
+                                                 Certificate*
+                                           ServerKeyExchange*
+                                          CertificateRequest*
+                              <--------       ServerHelloDone
 Certificate*
 ClientKeyExchange
 CertificateVerify*
 [ChangeCipherSpec]
 EncryptedExtensions（包含NP信息）
-Finished                     -------->
-                                          [ChangeCipherSpec]
-                             <--------              Finished
-Application Data             <------->      Application Data
+Finished                      -------->
+                                           [ChangeCipherSpec]
+                              <--------              Finished
+Application Data              <------->      Application Data
 ```
 
 然后是 SSL Abbreviated HandShake 过程，如何附带 NPN 扩展
@@ -42,7 +56,7 @@ Application Data             <------->      Application Data
 ```
 Client                                                Server
 
-ClientHello (带有NP扩展标志)    -------->
+ClientHello (带有NP扩展标志)  -------->
                                                  ServerHello (带有NP扩展标志 & 支持的协议列表)
                                           [ChangeCipherSpec]
                               <--------             Finished
@@ -63,9 +77,17 @@ struct {
 
 这个结构体的长度是32字节的整数倍，selected_protocol是一个字符串，表示选择的协议类型，目前支持：
 
+  - http/1.0
   - http/1.1
   - spdy/1
   - spdy/2
+  - spdy/3
+  - spdy/3.1
+
+这个NPN扩展就是在SSL会话握手过程中，
+
+  - 客户端发送 ChangeCipherSpec 之后 Finished 之前，增加了一个发送 EncryptedExtensions 信息的部分
+  - EncryptedExtensions 则包含了NextProtocol结构体
 
 但是需要注意的是，NP扩展，只针对连接，而不是会话：
 
@@ -74,17 +96,99 @@ struct {
 
 其它信息：
 
-  - Next protocol negotiation 扩展编号为：13172
-  - NextProtocol handshake 消息编号为：67
+  - Next protocol negotiation 扩展编号为：13172 (0x3374)
+  - NextProtocol handshake 消息编号为：67 (0x43)
+  - OpenSSL 1.0.0d 版本开始支持 NPN 功能
+
+
 
 ## TLS-ALPN 扩展
 
+ALPN 的全称为 Application Layer Protocol Negotiation，被设计为 NPN 的替代者。
+
+以下有关支持 ALPN 扩展的 SSL 握手的详细流程请参考：[RFC 7301 Section 3.1](https://tools.ietf.org/html/rfc7301#section-3.1) 
+
+首先是 SSL Full HandShake 过程，如何附带 ALPN 扩展：
+
+```
+Client                                                                     Server
+
+ClientHello (带有ALPN扩展标志 & 支持的协议列表)   -------->
+                                                                      ServerHello (带有ALPN扩展标志 & 选中的协议)
+                                                                     Certificate*
+                                                               ServerKeyExchange*
+                                                              CertificateRequest*
+                                                  <--------       ServerHelloDone
+Certificate*
+ClientKeyExchange
+CertificateVerify*
+[ChangeCipherSpec]
+Finished                                          -------->
+                                                               [ChangeCipherSpec]
+                                                  <--------              Finished
+Application Data                                  <------->      Application Data
+```
+
+然后是 SSL Abbreviated HandShake 过程，如何附带 ALPN 扩展
+
+```
+Client                                                                     Server
+
+ClientHello (带有ALPN扩展标志 & 支持的协议列表)   -------->
+                                                                      ServerHello (带有ALPN扩展标志 & 选中的协议)
+                                                               [ChangeCipherSpec]
+                                                  <--------              Finished
+[ChangeCipherSpec]
+Finished                                          -------->
+Application Data                                  <------->      Application Data
+```
+
+这个ALPN扩展就是在SSL会话握手过程中，
+
+  - 客户端发送 ClientHello 时，包含了一个客户端支持的协议列表（协议类型及名称与NPN一样）
+  - 服务端发送 ServerHello 时，从客户端提供的协议中选择一个将结果告诉客户端
+
+客户端的ClientHello中包含的列表格式如下：
+
+```
+   opaque ProtocolName<1..2^8-1>;
+
+   struct {
+       ProtocolName protocol_name_list<2..2^16-1>
+   } ProtocolNameList;
+```
+
+服务端ServerHello包含的选中协议，跟上面的格式一样，但是只能含有一项。
+
+如果客户端发送的协议列表，服务端都不支持，ServerHello 中泽包含：
+
+```
+enum {
+       no_application_protocol(120),
+       (255)
+   } AlertDescription;
+```
+
+但是需要注意的是，ALPN扩展，同样只针对连接，而不是会话：
+
+  - 因此在会话重用的时候（Abbreviated HandShake）也需要重新进行ALPN协商过程。
+  - 同样的，在出现会话重协商（Renegotiation）时，也需要重新进行ALPN协商过程。
+
+其它信息：
+
+  - Application Layer Protocol Negotiation 扩展编号为：16 (0x10)
+  - OpenSSL 1.0.2 版本开始支持 NPN 功能
+
 ## 参考资料
 
-- [Draft NPN](http://tools.ietf.org/html/draft-agl-tls-nextprotoneg-04)
-- [Draft ALPN](http://tools.ietf.org/html/draft-friedl-tls-applayerprotoneg-00)
-- [RFC7301 ALPN](https://tools.ietf.org/html/rfc7301)
-- [GoogleCode technotes](https://github.com/agl/technotes.git)
 - [NPN and ALPN](https://www.imperialviolet.org/2013/03/20/alpn.html)
 - [NPN 与 ALPN](https://zlb.me/2013/07/19/npn-and-alpn/)
 - [SPDY简介](https://zlb.me/2013/01/07/spdy-intro/)
+- NPN
+  - [Draft NPN](http://tools.ietf.org/html/draft-agl-tls-nextprotoneg-04)
+  - [GoogleCode technotes](https://github.com/agl/technotes.git)
+  - [NPN protocol and explanation about its need to tunnel SPDY over HTTPS](https://tools.ietf.org/agenda/82/slides/tls-3.pdf)
+- ALPN
+  - [Draft ALPN](http://tools.ietf.org/html/draft-friedl-tls-applayerprotoneg-00)
+  - [RFC7301 ALPN](https://tools.ietf.org/html/rfc7301)
+  - [Wikipedia APLN](https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation)
