@@ -168,10 +168,12 @@ public:
   // 记录ssl总共发送的字节数，由load_buffer_and_write在数据发送之后更新
   int64_t sslTotalBytesSent;
 
-  // 实现 NPN 方式的状态机协议流转
+  // 实现 NPN/ALPN 方式的状态机协议流转
   // 使用一个 NPN 状态机的入口来测试当前接收的数据，是否能够被该状态机处理
+  //     通过 SSL_CTX_set_next_protos_advertised_cb() 设置
   static int advertise_next_protocol(SSL *ssl, const unsigned char **out, unsigned *outlen, void *);
-  // 选择下一个 NPN 状态机
+  // 选择下一个 ALPN 状态机
+  //     通过 SSL_CTX_set_alpn_select_cb() 设置
   static int select_next_protocol(SSL *ssl, const unsigned char **out, unsigned char *outlen, const unsigned char *in,
                                   unsigned inlen, void *);
 
@@ -228,18 +230,26 @@ public:
   };
 
   // Copy up here so we overload but don't override
+  // 复用UnixNetVConnection::reenable(VIO *vio)
   using super::reenable;
 
-  /// Reenable the VC after a pre-accept or SNI hook is called.
+  // Reenable the VC after a pre-accept or SNI hook is called.
+  // 注意这里的reenable与上面的不同，因此SSLNetVConnection::reenable()是多态的
   virtual void reenable(NetHandler *nh);
-  /// Set the SSL context.
-  /// @note This must be called after the SSL endpoint has been created.
+  
+  // Set the SSL context.
+  // @note This must be called after the SSL endpoint has been created.
+  // 设置SSL的上下文
   virtual bool sslContextSet(void *ctx);
 
   /// Set by asynchronous hooks to request a specific operation.
   TSSslVConnOp hookOpRequested;
 
+  // 直接从socket fd读取未解密的原始数据，放入handShakeBuffer这个MIOBuffer
   int64_t read_raw_data();
+  
+  // 初始化handShakeBuffer这个MIOBuffer，以及对应的Reader: handShakeReader 和 handShakeHolder
+  //     handShakeBioStored 用来表示当前handShakeBuffer内可消费的数据长度
   void
   initialize_handshake_buffers()
   {
@@ -248,6 +258,7 @@ public:
     this->handShakeHolder = this->handShakeReader->clone();
     this->handShakeBioStored = 0;
   }
+  // 释放handShakeBuffer这个MIOBuffer，还有对应的Reader
   void
   free_handshake_buffers()
   {
@@ -265,25 +276,31 @@ public:
     this->handShakeBuffer = NULL;
     this->handShakeBioStored = 0;
   }
+  
   // Returns true if all the hooks reenabled
+  // 回调SSL的Hook，返回true表示所有hooks都执行完了，允许进入下一个流程
   bool callHooks(TSHttpHookID eventId);
 
   // Returns true if we have already called at
   // least some of the hooks
+  // 是否已经开始了对Hook的回调过程
   bool calledHooks(TSHttpHookID /* eventId */) { return (this->sslHandshakeHookState != HANDSHAKE_HOOKS_PRE); }
 
+  // 获取 iobuf
+  // iobuf 用来保存解密后的数据，对应的时VIO里的MIOBuffer
   MIOBuffer *
   get_ssl_iobuf()
   {
     return iobuf;
   }
 
+  // 设置 iobuf
   void
   set_ssl_iobuf(MIOBuffer *buf)
   {
     iobuf = buf;
   }
-
+  // 这个reader是对应iobuf的MIOBufferReader
   IOBufferReader *
   get_ssl_reader()
   {
