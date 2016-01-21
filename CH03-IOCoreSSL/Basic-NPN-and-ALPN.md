@@ -106,6 +106,8 @@ struct {
 
 ALPN 的全称为 Application Layer Protocol Negotiation，被设计为 NPN 的替代者。
 
+由于 NPN 需要在 Finished 之前插入一个流程，实现的不够完美，因此 ALPN 的实现，完全在 ClientHello 和 ServerHello 中进行。
+
 以下有关支持 ALPN 扩展的 SSL 握手的详细流程请参考：[RFC 7301 Section 3.1](https://tools.ietf.org/html/rfc7301#section-3.1) 
 
 首先是 SSL Full HandShake 过程，如何附带 ALPN 扩展：
