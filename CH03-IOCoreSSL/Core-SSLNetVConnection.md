@@ -12,12 +12,12 @@ SSLNetVConnection 继承自 UnixNetVConnection，对部分方法进行了重载�
   - setSSLHandShakeComplete
   - getSSLClientConnection
   - setSSLClientConnection
-  - getSSLSessionCacheHit
-  - setSSLSessionCacheHit
 
 同时增加了一些方法：
 
   - enableRead
+  - getSSLSessionCacheHit
+  - setSSLSessionCacheHit
   - read_raw_data
   - initialize_handshake_buffers
   - free_handshake_buffers
@@ -307,26 +307,33 @@ public:
     return reader;
   }
 
+  // 如果遇到了SSL关闭的情况，设置eosRcvd为true
+  // 此方法返回这个状态
   bool
   isEosRcvd()
   {
     return eosRcvd;
   }
 
+  // 获取sslTrace状态
+  // 这个是一个debug调试SSL的开关
   bool
   getSSLTrace() const
   {
     return sslTrace || super::origin_trace;
   };
-
+  // 设置sslTrace状态
   void
   setSSLTrace(bool state)
   {
     sslTrace = state;
   };
 
+  // 根据特定条件激活sslTrace
+  // 例如需要对特定ip，特定域名进行SSL调试的时候
   bool computeSSLTrace();
 
+  // 获得SSL会话的协议版本
   const char *
   getSSLProtocol(void) const
   {
@@ -335,6 +342,7 @@ public:
     return SSL_get_version(ssl);
   };
 
+  // 获得SSL会话的密钥算法套件
   const char *
   getSSLCipherSuite(void) const
   {
@@ -348,49 +356,70 @@ public:
    * con parameter and the ssl object in the arg parameter
    * This is logic is invoked when the NetVC object is created in a new thread context
    */
+  // 跟UnixNetVConnection里的一样，这个也是2015年10月新增的方法
   virtual int populate(Connection &con, Continuation *c, void *arg);
 
 private:
   SSLNetVConnection(const SSLNetVConnection &);
   SSLNetVConnection &operator=(const SSLNetVConnection &);
 
+  // true = SSL握手完成设置
   bool sslHandShakeComplete;
+  // true = 这是一个Client与ATS之间的SSL连接
   bool sslClientConnection;
+  // true = 重新协商时被设置禁止，SSL会话讲终止
   bool sslClientRenegotiationAbort;
+  // true = 本次TCP连接的SSL会话，是复用了之前的SSL会话
   bool sslSessionCacheHit;
+  // 用于SSL握手过程中，存放临时数据的MIOBuffer
   MIOBuffer *handShakeBuffer;
+  // handShakeBuffer的reader
   IOBufferReader *handShakeHolder;
   IOBufferReader *handShakeReader;
+  // handShakeBuffer内数据的长度
   int handShakeBioStored;
 
+  // true = tr-pass
   bool transparentPassThrough;
 
   /// The current hook.
   /// @note For @C SSL_HOOKS_INVOKE, this is the hook to invoke.
+  // 当前hook点
   class APIHook *curHook;
 
+  // 此处用于标记PreAccept Hook的执行状态
   enum {
     SSL_HOOKS_INIT,     ///< Initial state, no hooks called yet.
+                        ///< 初始状态，没有任何hook被调用过
     SSL_HOOKS_INVOKE,   ///< Waiting to invoke hook.
+                        ///< 等待对hook的回调，通常在当前hook点没有返回reenable的时候，就停在这个状态
     SSL_HOOKS_ACTIVE,   ///< Hook invoked, waiting for it to complete.
+                        ///< 这个没有实现
     SSL_HOOKS_CONTINUE, ///< All hooks have been called and completed
+                        ///< 这个也没有实现
     SSL_HOOKS_DONE      ///< All hooks have been called and completed
+                        ///< 表示PreAccept Hook执行完了
   } sslPreAcceptHookState;
 
+  // 此处用于标记SNI/CERT Hook的执行状态
   enum SSLHandshakeHookState {
-    HANDSHAKE_HOOKS_PRE,
-    HANDSHAKE_HOOKS_CERT,
-    HANDSHAKE_HOOKS_POST,
-    HANDSHAKE_HOOKS_INVOKE,
-    HANDSHAKE_HOOKS_DONE
+    HANDSHAKE_HOOKS_PRE,     ///< 初始状态，没有任何
+    HANDSHAKE_HOOKS_CERT,    ///< 中间状态，只在openssl回调cert callback func的时候，存在
+    HANDSHAKE_HOOKS_POST,    ///< 未实现
+    HANDSHAKE_HOOKS_INVOKE,  ///< 等待对hook的回调，通常在当前hook点没有返回reenable的时候，就停在这个状态
+    HANDSHAKE_HOOKS_DONE     ///< 表示SNI/CERT Hook执行完了
   } sslHandshakeHookState;
 
   const SSLNextProtocolSet *npnSet;
   Continuation *npnEndpoint;
+  // 这个SessionAccept好像没用到？
   SessionAccept *sessionAcceptPtr;
+  // iobuf 和对应的 reader
   MIOBuffer *iobuf;
   IOBufferReader *reader;
+  // 是否接收到了eos
   bool eosRcvd;
+  // 是否开启了sslTrace
   bool sslTrace;
 };
 
