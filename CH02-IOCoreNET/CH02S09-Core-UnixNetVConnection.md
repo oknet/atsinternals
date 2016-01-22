@@ -1805,10 +1805,10 @@ VIO::reenable()
     vc_server->reenable(this);
 }
 TS_INLINE void
-VIO::reenable()
+VIO::reenable_re()
 {
   if (vc_server)
-    vc_server->reenable(this);
+    vc_server->reenable_re(this);
 }
 ```
 
