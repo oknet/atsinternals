@@ -1,0 +1,42 @@
+# 基础部件：SSLNextProtocolSet
+
+# 定义
+
+class SSLNextProtocolSet
+{
+public:
+  SSLNextProtocolSet();
+  ~SSLNextProtocolSet();
+
+  bool registerEndpoint(const char *, Continuation *);
+  bool unregisterEndpoint(const char *, Continuation *);
+  bool advertiseProtocols(const unsigned char **out, unsigned *len) const;
+
+  Continuation *findEndpoint(const unsigned char *, unsigned) const;
+
+  struct NextProtocolEndpoint {
+    // NOTE: the protocol and endpoint are NOT copied. The caller is
+    // responsible for ensuring their lifetime.
+    NextProtocolEndpoint(const char *protocol, Continuation *endpoint);
+    ~NextProtocolEndpoint();
+
+    const char *protocol;
+    Continuation *endpoint;
+    LINK(NextProtocolEndpoint, link);
+
+    typedef DLL<NextProtocolEndpoint> list_type;
+  };
+
+private:
+  SSLNextProtocolSet(const SSLNextProtocolSet &);            // disabled
+  SSLNextProtocolSet &operator=(const SSLNextProtocolSet &); // disabled
+
+  mutable unsigned char *npn;
+  mutable size_t npnsz;
+
+  NextProtocolEndpoint::list_type endpoints;
+};
+
+## 参考资料
+
+- [P_SSLNextProtocolSet.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_SSLNetVConnection.h)
