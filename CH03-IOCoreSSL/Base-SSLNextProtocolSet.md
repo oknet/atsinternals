@@ -11,6 +11,7 @@ SSLNextProtocolSet 主要用来生成支持的协议列表
 
 ## 定义
 
+```
 class SSLNextProtocolSet
 {
 public:
@@ -77,6 +78,7 @@ private:
   // 这里为啥不用 DLL<NextProtocolEndpoint> endpoints; ？非要用个typedef ？
   NextProtocolEndpoint::list_type endpoints;
 };
+```
 
 ## 参考资料
 
