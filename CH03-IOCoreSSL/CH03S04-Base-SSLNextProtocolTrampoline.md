@@ -4,9 +4,11 @@ Trampoline 在英语里是“蹦床”的意思，非常形象的勾勒出这个
 
 在前面我们介绍NetAccept时，提到Acceptor和NetVC与SM的关系，需要Acceptor接受新的NetVC，然后创建SM对象，并与NetVC关联。
 
-在SSL的实现里要增加一个步骤，在Acceptor之前有一个“蹦床”，由蹦床根据NPN/ALPN的协商再跳到对应的Acceptor。
+在SSL的实现里要增加一个步骤，在Acceptor之后有一个“蹦床”，由蹦床根据NPN/ALPN的协商再跳到对应的SessionAcceptor。
 
-而多个不同的 Acceptor 被注册到蹦床里，通过 SSLNextProtocolSet 来管理。
+而多个不同的 SessionAcceptor 被注册到蹦床里，通过 SSLNextProtocolSet 来管理。
+
+这里的 SessionAcceptor 实际上已经是上层状态机的一部分了，SessionAcceptor会负责创建对应的状态机。
 
 ## 定义
 
@@ -24,11 +26,14 @@ Trampoline 在英语里是“蹦床”的意思，非常形象的勾勒出这个
 // 因此设计了这个蹦床，将这个事件从SSL Acceptor弹到最终的Session Acceptor。
 
 struct SSLNextProtocolTrampoline : public Continuation {
+  // 构造函数
+  // 初始化mutex和npnParent成员，并设置回调函数为ioCompletionEvent
   explicit SSLNextProtocolTrampoline(const SSLNextProtocolAccept *npn, ProxyMutex *mutex) : Continuation(mutex), npnParent(npn)
   {
     SET_HANDLER(&SSLNextProtocolTrampoline::ioCompletionEvent);
   }
 
+  // 
   int
   ioCompletionEvent(int event, void *edata)
   {
