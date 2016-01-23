@@ -61,7 +61,8 @@ struct SSLNextProtocolTrampoline : public Continuation {
     SET_HANDLER(&SSLNextProtocolTrampoline::ioCompletionEvent);
   }
 
-  // 
+  // 这个状态机是被SSLNextProtocolAccept通过new方法创建的，然后通过“蹦床”方式弹到后面的SessionAccept中，
+  // 因此，在弹走SSLNetVC之后要通过delete方法释放对象自身。
   int
   ioCompletionEvent(int event, void *edata)
   {
@@ -69,39 +70,56 @@ struct SSLNextProtocolTrampoline : public Continuation {
     Continuation *plugin;
     SSLNetVConnection *netvc;
 
+    // 由于是对 0长度 读操作的I/O事件回调，因此 edata 指向的必然是 SSLNetVC 的read.vio成员，是一个VIO类型
     vio = static_cast<VIO *>(edata);
+    // 解析出 VIO 内包含的 SSLNetVC
     netvc = dynamic_cast<SSLNetVConnection *>(vio->vc_server);
+    // 如果不是 SSLNetVConnection 类型，那么就 assert 了
     ink_assert(netvc != NULL);
 
+    // 由于是 0长度的读操作，因此只有传入READ_COMPLETE才表示成功，而且不会出现READ_READY，因为READ_COMPLETE优先级较高
+    // 其它情况一律是错误的情况
     switch (event) {
     case VC_EVENT_EOS:
     case VC_EVENT_ERROR:
     case VC_EVENT_ACTIVE_TIMEOUT:
     case VC_EVENT_INACTIVITY_TIMEOUT:
       // Cancel the read before we have a chance to delete the continuation
+      // 遇到连接超时的时候，注销读操作，关闭SSLNetVC，回收“蹦床”自身
       netvc->do_io_read(NULL, 0, NULL);
       netvc->do_io(VIO::CLOSE);
       delete this;
       return EVENT_ERROR;
     case VC_EVENT_READ_COMPLETE:
+      // 遇到我们需要的READ_COMPLETE事件，直接跳出switch
       break;
     default:
+      // 感觉不应该有任何运行到这里的可能
+      // 是不是要弄个assert在这里？不然要内存泄漏了？
       return EVENT_ERROR;
     }
 
     // Cancel the read before we have a chance to delete the continuation
+    // 注销读操作，因为接下来要回收“蹦床”自身
     netvc->do_io_read(NULL, 0, NULL);
+    // 通过SSLNetVConnection的endpoint方法获取 npnEndpoint 成员
     plugin = netvc->endpoint();
     if (plugin) {
+      // 优先“弹到” npnEndpoint 状态机
       send_plugin_event(plugin, NET_EVENT_ACCEPT, netvc);
     } else if (npnParent->endpoint) {
+      // 如果 npnEndpoint 状态机不存在，就“弹到” npnParent->endpoint 状态机
+      // npnParent 是初始化“蹦床”时，传入的一个缺省状态机
       // Route to the default endpoint
       send_plugin_event(npnParent->endpoint, NET_EVENT_ACCEPT, netvc);
     } else {
+      // 如果都不存在，就直接关闭 SSLNetVC
       // No handler, what should we do? Best to just kill the VC while we can.
       netvc->do_io(VIO::CLOSE);
     }
 
+    // 上面从 NET_EVENT_ACCEPT 事件处理函数返回后，SSLNetVC 的 Read VIO 和/或 Write VIO 会被重新设置，并与上层状态机关联。
+    // 因此可以安全的删除“蹦床”自身，并返回
     delete this;
     return EVENT_CONT;
   }
@@ -109,15 +127,21 @@ struct SSLNextProtocolTrampoline : public Continuation {
   const SSLNextProtocolAccept *npnParent;
 };
 
+// 用来回调状态机的方法
+// plugin 是即将回调的状态机
+// event 是回调的事件
+// edata 是NetVC
 static void
 send_plugin_event(Continuation *plugin, int event, void *edata)
 {
   if (plugin->mutex) {
+    // 有mutex，则上锁后回调
     EThread *thread(this_ethread());
     MUTEX_TAKE_LOCK(plugin->mutex, thread);
     plugin->handleEvent(event, edata);
     MUTEX_UNTAKE_LOCK(plugin->mutex, thread);
   } else {
+    // 没有mutex，直接回调
     plugin->handleEvent(event, edata);
   }
 }
