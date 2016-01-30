@@ -110,7 +110,8 @@ struct SSLNextProtocolTrampoline : public Continuation {
     } else if (npnParent->endpoint) {
       // 如果 npnEndpoint 状态机不存在，就“弹到” npnParent->endpoint 状态机
       // npnParent 是初始化“蹦床”时，传入的 SSLNextProtocolAccept 实例。
-      // npnParent->endpoint 对于 SSLNextProtocolAccept 来说，在 [HttpProxyServerMain.cc](http://github.com/apache/trafficserver/tree/master/proxy/http/HttpProxyServerMain.cc) 中被指向了  ProtocolProbeSessionAccept 对象。
+      // npnParent->endpoint 对于 SSLNextProtocolAccept 来说，
+      //     在 HttpProxyServerMain.cc 中被指向了  ProtocolProbeSessionAccept 对象。
       // Route to the default endpoint
       send_plugin_event(npnParent->endpoint, NET_EVENT_ACCEPT, netvc);
     } else {
