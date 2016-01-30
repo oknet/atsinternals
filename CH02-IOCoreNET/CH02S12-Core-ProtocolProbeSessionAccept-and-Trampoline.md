@@ -216,7 +216,7 @@ struct ProtocolProbeTrampoline : public Continuation, public ProtocolProbeSessio
 
     // Directly invoke the session acceptor, letting it take ownership of the input buffer.
     // 直接回调选中协议的状态机的accept方法
-    //     上层协议的accept方法会设置Read VIO／Write VIO等，来接管后续的IO操作
+    //     上层协议的accept方法会设置Read VIO / Write VIO等，来接管后续的IO操作
     //     设置完成后就会迅速返回
     probeParent->endpoint[key]->accept(netvc, this->iobuf, reader);
     // 释放状态机自身
@@ -224,9 +224,12 @@ struct ProtocolProbeTrampoline : public Continuation, public ProtocolProbeSessio
     return EVENT_CONT;
 
   done:
-    // 异常处理
-    // 对于 SSLVC 传入的 iobuf 是由 SSLVC 提供的，不能释放掉
-    // 其它情况的 iobuf 需要释放掉，因为该 iobuf 用于 probe 操作临时存放接收到的第一不分数据
+    // 异常处理（由于SSLVC也会在客户端不支持NPN/ALPN时使用此状态机判定应用层的协议类型，因此要对SSLVC做判断和处理）
+    // 如果：
+    //     传入的 iobuf 是由 SSLVC 提供的，但不是 SSLVC 内部的 iobuf
+    //  或
+    //     netvc不是一个SSLVC
+    // iobuf 需要释放掉，因为该 iobuf 用于 probe 操作临时存放接收到的第一部分数据
     SSLNetVConnection *ssl_vc = dynamic_cast<SSLNetVConnection *>(netvc);
     if (!ssl_vc || (this->iobuf != ssl_vc->get_ssl_iobuf())) {
       free_MIOBuffer(this->iobuf);
@@ -238,6 +241,7 @@ struct ProtocolProbeTrampoline : public Continuation, public ProtocolProbeSessio
   }
 
   MIOBuffer *iobuf;
+  // probeParent 指向创建此“蹦床”实例的 ProtocolProbeSessionAccept 状态机
   const ProtocolProbeSessionAccept *probeParent;
 };
 ```
