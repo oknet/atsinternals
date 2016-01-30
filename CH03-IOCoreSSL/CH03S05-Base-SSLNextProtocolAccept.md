@@ -108,6 +108,8 @@ SSLNextProtocolAccept::mainEvent(int event, void *edata)
     // 将当前 支持的协议与上层状态机（protoset）注册到SSLVC
     netvc->registerNextProtocolSet(&this->protoset);
     // 为当前的SSLVC设置“蹦床”，准备跳转到匹配的上层状态机
+    // 这里设置一个 Read VIO，读取 0字节 长度，this->buffer 是在构造函数中创建的
+    // 最后的参数0，对VIO::READ没用。
     netvc->do_io(VIO::READ, new SSLNextProtocolTrampoline(this, netvc->mutex), 0, this->buffer, 0);
     // 设置 sessionAcceptPtr ，但是好像没有用到。
     netvc->set_session_accept_pointer(this);
