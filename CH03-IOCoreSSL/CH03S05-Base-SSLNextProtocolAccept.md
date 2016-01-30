@@ -126,6 +126,19 @@ SSLNextProtocolAccept::mainEvent(int event, void *edata)
 }
 ```
 
+## SSL会话创建流程
+
+由于 SSL 位于OSI第六层的表示层，在完成加解密动作后要与OSI第七层的应用层对接，因此 ATS 设计了一个“蹦床”的结构来实现从 SSL 到 HTTP，SPDY，HTTP2的跳转过程，因此ATS的实现方式如下：
+
+  - 首先，创建 ProtocolProbeSessionAccept 对象，用于支持 80 端口 HTTP，SPDY，HTTP2 的“蹦床”结构
+    - 但是这个方式是需要读取第一个部分的明文（未加密）数据来判断请求的
+    - 有可能判断的不正确
+  - 然后，创建 SSLNextProtocolAccept，用于支持 443 端口 SSL 协议加密的 HTTP，SPDY，HTTP2 的“蹦床”结构
+    - 使用 NPN / ALPN 的方式注册 http，spdy，http/2 三种协议和对应的状态机
+    - 同时把 ProtocolProbeSessionAccept 状态机传入
+    - 这样不支持 NPN / ALPN 协议的客户端就可以用原始的方式判断出应用层的协议类型
+
+
 ## 参考资料
 
 - [P_SSLNextProtocolSet.h](https://github.com/apache/trafficserver/tree/master/iocore/net/P_SSLNextProtocolSet.h)
