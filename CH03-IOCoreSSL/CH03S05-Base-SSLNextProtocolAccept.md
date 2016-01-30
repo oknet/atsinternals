@@ -47,8 +47,11 @@ private:
   SSLNextProtocolAccept &operator=(const SSLNextProtocolAccept &); // disabled
 
   MIOBuffer *buffer; // XXX do we really need this?
+  // endpoint 指向 NPN / ALPN 无法匹配时，缺省的处理机制。
+  // 对于 SSLNextProtocolAccept 来说，在创建时由调用者传入，通过构造函数设置，
+  //     在 HttpProxyServerMain.cc 中创建 SSLNextProtocolAccept 时传入的是 ProtocolProbeSessionAccept 对象。
   Continuation *endpoint;
-  // 存储了当前注册的所有协议和上层状态机的对应关系
+  // 存储了适用于 NPN / ALPN 协议的，当前注册的所有协议和上层状态机的对应关系
   SSLNextProtocolSet protoset;
   // tr-pass 标志
   bool transparent_passthrough;
