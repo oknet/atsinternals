@@ -188,7 +188,9 @@ SSLNextProtocolAccept::buffer
   - 而且所有的 SSLNextProtocolTrampoline 都共用同一个 buffer
     - netvc->do_io(VIO::READ, new SSLNextProtocolTrampoline(this, netvc->mutex), 0, this->buffer, 0);
     - 事实上在每一个 sslvc 里的 iobuf 代替了 buffer
-  
+
+最后，对于 SSLNextProtocolTrampoline 状态机的回调，总是异步的。
+
 ## 参考资料
 
 - [P_SSLNextProtocolSet.h](https://github.com/apache/trafficserver/tree/master/iocore/net/P_SSLNextProtocolSet.h)
