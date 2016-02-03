@@ -14,7 +14,9 @@ SSLNextProtocolAccept 是读取 NPN / ALPN 协议中传递的类型，然后通�
 class SSLNextProtocolAccept : public SessionAccept
 {
 public:
-  // 构造函数：初始化mutex为NULL，创建buffer，用传入的状态机初始化endpoint，用传入的transparent_passthrough初始化成员
+  // 构造函数：
+  //     初始化mutex为NULL，使用 new_empty_MIOBuffer() 创建 buffer，
+  //     用传入的状态机初始化endpoint，用传入的transparent_passthrough初始化成员
   // 设置回调函数为 mainEvent
   SSLNextProtocolAccept(Continuation *, bool);
   // 析构函数：用来释放成员 buffer
@@ -139,9 +141,42 @@ SSLNextProtocolAccept::mainEvent(int event, void *edata)
     - 这样不支持 NPN / ALPN 协议的客户端就可以用原始的方式判断出应用层的协议类型
 
 
+## 关于 new_empty_MIOBuffer 方法
+
+```
+TS_INLINE MIOBuffer *
+new_empty_MIOBuffer_internal(
+  int64_t size_index)
+{
+  MIOBuffer *b = THREAD_ALLOC(ioAllocator, this_thread());
+  b->size_index = size_index;
+  return b;
+}
+```
+
+对照 new_MIOBuffer 方法
+
+```
+TS_INLINE MIOBuffer *
+new_MIOBuffer_internal(
+  int64_t size_index)
+{
+  MIOBuffer *b = THREAD_ALLOC(ioAllocator, this_thread());
+  b->alloc(size_index);
+  return b;
+}
+```
+
+可以看到差别就是是否执行了 alloc 的内部方法
+
+  - alloc 方法是按照 size_index 的要求为 MIOBuffer 分配内存（IOBufferBlock 和 IOBufferData）
+  - 如果不调用 alloc 方法，只是设置了 size_index 的值，则表示在第一次向 MIOBuffer 写入数据的时候，在进行内存的分配。
+
+因此，new_empty_MIOBuffer 就是只创建一个 MIOBuffer 的结构，但是不关联 IOBufferBlock 和 IOBufferData。
+
 ## 参考资料
 
 - [P_SSLNextProtocolSet.h](https://github.com/apache/trafficserver/tree/master/iocore/net/P_SSLNextProtocolSet.h)
 - [P_SSLNextProtocolAccept.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_SSLNextProtocolAccept.h)
 - [SSLNextProtocolAccept.cc](http://github.com/apache/trafficserver/tree/master/iocore/net/SSLNextProtocolAccept.cc)
-
+- [P_IOBuffer.h](https://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_IOBuffer.h)
