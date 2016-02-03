@@ -133,8 +133,9 @@ ProtocolProbeSessionAccept::mainEvent(int event, void *data)
     } else {
       // 如果缓冲区内已经有可以读取的数据，那就可以根据这些数据来判断是什么协议的类型了
       Debug("http", "probe already has data, call ioComplete directly..");
+      // 取消读操作
       vio = netvc->do_io_read(NULL, 0, NULL);
-      // 因此通过do_io_read清除读操作状态机（通常为SSL层），再同步回调蹦床来完成判断
+      // 同步回调蹦床来完成判断
       probe->ioCompletionEvent(VC_EVENT_READ_COMPLETE, (void *)vio);
       // 在同步回调之后，蹦床就已经delete了自己，因此之后不可以通过probe再引用蹦床的任何成员
     }
@@ -307,4 +308,73 @@ proto_is_http2(IOBufferReader *reader)
   return memcmp(HTTP2_CONNECTION_PREFACE, buf, nbytes) == 0;
 }
 ```
+
+## Free Mutex
+
+ProtocolProbeSessionAccept 状态机的mutex在构造函数中设置为NULL，表示该状态机被回调时不需要加锁，可以被并发调用
+
+  - 从NetAccept回调一个状态机的时候，通过下面的方式回调 ProtocolProbeSessionAccept::mainEvent
+    - action_.continuation->handleEvent(NET_EVENT_ACCEPT, vc);
+  - 由于 ProtocolProbeSessionAccept 的mutex为NULL，因此可以被并发调用
+
+在 ProtocolProbeSessionAccept::mainEvent 中
+
+  - 为每一个新的 netvc 创建了 ProtocolProbeTrampoline 状态机，共享 netvc 的 mutex
+    - ProtocolProbeTrampoline *probe = new ProtocolProbeTrampoline(this, netvc->mutex, buf, reader);
+  - 如果 iobuf 内没有数据，则设置 Read VIO，等待对 ProtocolProbeTrampoline 的回调
+  - 如果 iobuf 内有数据，则取消 Read VIO，同步回调 ProtocolProbeTrampoline
+    - probe->ioCompletionEvent(VC_EVENT_READ_COMPLETE, (void *)vio);
+
+创建 ProtocolProbeTrampoline 状态机后，由构造函数完成初始化：
+
+  - 对于非SSLVC：需要通过 new_MIOBuffer 为 iobuf 分配内存
+  - 对于SSLVC：iobuf 则指向 SSLVC 的 iobuf
+  - reader 则与 iobuf 对应
+  - 设置 probeParent 指向 ProtocolProbeSessionAccept，以便获取 ProtocolProbeSessionAccept::endpoint 来完成跳转
+  - 设置回调函数为：ioCompletionEvent
+
+回调函数 ProtocolProbeTrampoline::ioCompletionEvent 接受两种事件类型：
+
+  - VC_EVENT_READ_READY
+  - VC_EVENT_READ_COMPLETE
+
+然后根据读取到的信息判断应用层的协议是 SPDY 还是 HTTP2，如果都不是则按照 HTTP 协议来处理。
+
+根据协议的类型，通过下面的方法回调上层状态机的 SessionAccept 的 accept 方法
+
+  - probeParent->endpoint[key]->accept(netvc, this->iobuf, reader);
+
+上层状态机的 accept 方法用来：
+
+  - 接管 netvc，
+  - 重新设置 Read/Write VIO，
+  - 接管 iobuf 指向的 MIOBuffer，因此在返回后不需要在 ProtocolProbeTrampoline 释放
+  - 因此在调用后快速返回。
+
+此时 ProtocolProbeTrampoline 完成了从 NetAccept 到上层状态机的 SessionAccept 的跳转，释放自身：
+
+  - delete this;
+  - return EVENT_CONT;
+
+如果 ProtocolProbeTrampoline 没有成功将 netvc 弹到上层协议的 SessionAccept 状态机，就需要考虑是否释放 iobuf
+
+  - 考虑到 iobuf 在 sslvc 时直接指向 sslvc 的 iobuf，因此在释放前要做一个判断
+
+```
+  SSLNetVConnection *ssl_vc = dynamic_cast<SSLNetVConnection *>(netvc);
+  if (!ssl_vc || (this->iobuf != ssl_vc->get_ssl_iobuf())) {
+    free_MIOBuffer(this->iobuf);
+  }
+```
+
+需要注意的是：
+
+  - ProtocolProbeSessionAccept 是：
+    - 每个 TCP Port 创建一个
+    - 没有 Mutex 保护
+  - ProtocolProbeTrampoline 是：
+    - 每个 NetVC 会创建一个
+    - 生命周期非常的短，在跳转到上层协议的 SessionAccept 状态机之后，就会被回收
+    - 共享 NetVC 的 Mutex
+
 
