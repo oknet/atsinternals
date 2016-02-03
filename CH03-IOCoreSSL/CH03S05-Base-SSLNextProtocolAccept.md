@@ -130,7 +130,7 @@ SSLNextProtocolAccept::mainEvent(int event, void *edata)
 
 ## SSL会话创建流程
 
-由于 SSL 位于OSI第六层的表示层，在完成加解密动作后要与OSI第七层的应用层对接，因此 ATS 设计了一个“蹦床”的结构来实现从 SSL 到 HTTP，SPDY，HTTP2的跳转过程，因此ATS的实现方式如下：
+由于 SSL 位于OSI第六层的表示层，在完成加解密动作后要与OSI第七层的应用层对接，因此 ATS 设计了一个“蹦床”的结构来实现从 SSL 到 SPDY，HTTP2，HTTP的跳转过程，因此ATS的实现方式如下：
 
   - 首先，创建 ProtocolProbeSessionAccept 对象，用于支持 80 端口 HTTP，SPDY，HTTP2 的“蹦床”结构
     - 但是这个方式是需要读取第一个部分的明文（未加密）数据来判断请求的
@@ -139,7 +139,6 @@ SSLNextProtocolAccept::mainEvent(int event, void *edata)
     - 使用 NPN / ALPN 的方式注册 http，spdy，http/2 三种协议和对应的状态机
     - 同时把 ProtocolProbeSessionAccept 状态机传入
     - 这样不支持 NPN / ALPN 协议的客户端就可以用原始的方式判断出应用层的协议类型
-
 
 ## 关于 new_empty_MIOBuffer 方法
 
@@ -174,6 +173,22 @@ new_MIOBuffer_internal(
 
 因此，new_empty_MIOBuffer 就是只创建一个 MIOBuffer 的结构，但是不关联 IOBufferBlock 和 IOBufferData。
 
+## Free Mutex
+
+与 ProtocolProbeSessionAccept 状态机一样，SSLNextProtocolAccept 在构造函数中设置为NULL，表示该状态机被回调时不需要加锁，可以被并发调用。
+
+虽然定义了 SSLNextProtocolAccept 的析构函数，但是由于 SSLNextProtocolAccept 并不会被释放，因此，析构函数不会在系统运行时被调用。
+
+SSLNextProtocolAccept::buffer
+
+  - 在调用 do_io 设置 Read VIO 的时候，需要传入一个 MIOBuffer
+  - 但是 SSLNextProtocolAccept 只是在 SSL握手 之前的一个状态机，因此这个MIOBuffer并没有用处
+  - 只是为了在调用 do_io 的时候可以传入一个符合要求的参数
+  - 所以这里的 buffer 在构造函数中使用了 new_empty_MIOBuffer 来完成初始化
+  - 而且所有的 SSLNextProtocolTrampoline 都共用同一个 buffer
+    - netvc->do_io(VIO::READ, new SSLNextProtocolTrampoline(this, netvc->mutex), 0, this->buffer, 0);
+    - 事实上在每一个 sslvc 里的 iobuf 代替了 buffer
+  
 ## 参考资料
 
 - [P_SSLNextProtocolSet.h](https://github.com/apache/trafficserver/tree/master/iocore/net/P_SSLNextProtocolSet.h)
