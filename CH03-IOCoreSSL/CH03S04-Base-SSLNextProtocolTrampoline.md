@@ -127,12 +127,15 @@ struct SSLNextProtocolTrampoline : public Continuation {
     plugin = netvc->endpoint();
     if (plugin) {
       // 优先“弹到” npnEndpoint 状态机
+      // plugin 是根据 NPN/ALPN 协议确定的状态机，如果为 NULL，则说明：
+      //     客户端不支持 NPN/ALPN 协议，或者该协议没有注册到协商过程中
       send_plugin_event(plugin, NET_EVENT_ACCEPT, netvc);
     } else if (npnParent->endpoint) {
       // 如果 npnEndpoint 状态机不存在，就“弹到” npnParent->endpoint 状态机
       // npnParent 是初始化“蹦床”时，传入的 SSLNextProtocolAccept 实例。
       // npnParent->endpoint 对于 SSLNextProtocolAccept 来说，
-      //     在 HttpProxyServerMain.cc 中被指向了  ProtocolProbeSessionAccept 对象。
+      //     在 HttpProxyServerMain.cc 中被指向了 ProtocolProbeSessionAccept 对象。
+      //     在 ProtocolProbeSessionAccept 中将根据读取到的应用层的数据来确认协议类型。
       // Route to the default endpoint
       send_plugin_event(npnParent->endpoint, NET_EVENT_ACCEPT, netvc);
     } else {
