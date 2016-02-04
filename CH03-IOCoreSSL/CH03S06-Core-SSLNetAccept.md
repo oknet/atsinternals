@@ -3,12 +3,13 @@
 SSLNetAccept继承自NetAccept，它对NetAccept的部分方法进行了重载，实现了SSLNetAccept的功能。
 
 前面讲到NetVC的创建有两种方式：
+
   - 一种通过NetAccept
   - 一种通过connectUp
 
 因此对于每一种NetVC及其继承子类，都有对应的NetAccept和connectUp的实现。
 
-而SSLNetAccept则用于创建SSLNetVConnection。
+而SSLNetAccept则是对应NetAccept，用于创建SSLNetVConnection
 
 下面的讲解将着重介绍被重载的方法，因此请对照NetAccept的章节一起理解SSLNetAccept的实现
 
@@ -34,6 +35,18 @@ typedef int (SSLNetAccept::*SSLNetAcceptHandler)(int, void *);
 ```
 
 ## 方法
+
+### SSLNetAccept::getNetProcessor()
+
+此方法用于返回NetProcessor的全局类型实例。
+
+```
+NetProcessor *
+SSLNetAccept::getNetProcessor() const
+{
+  return &sslNetProcessor;
+}
+```
 
 ### SSLNetAccept::getEtype()
 
@@ -61,23 +74,13 @@ SSLNetAccept::getEtype() const
 }
 ```
 
-### SSLNetAccept::getNetProcessor()
-
-此方法用于返回NetProcessor的全局类型实例。
-
-```
-NetProcessor *
-SSLNetAccept::getNetProcessor() const
-{
-  return &sslNetProcessor;
-}
-```
-
 ### SSLNetAccept::init_accept_per_thread(bool isTransparent)
 
 为 ET_SSL 线程组创建并初始化SSLNetAccept状态机。
 
 前面讲过 NetAccept 有两种运行模式，独立线程模式和状态机模式，这个就是采用状态机模式，要在线程组中创建对应的状态机。
+
+period 是负数，因此会进入隐性队列（负队列）。
 
 ```
 void
