@@ -1,6 +1,37 @@
 # 核心组件 SSLNetVConnection
 
-SSLNetVConnection 继承自 UnixNetVConnection，对部分方法进行了重载：
+SSLNetVConnection 继承自 UnixNetVConnection，在其基础上构建了对SSL会话的支持。
+
+与介绍UnixNetVConnection时一样，也来一个IOCoreSSL子系统的对比，与EventSystem是一样的，也有Thread，Processor和Event，只是名字不一样了：
+
+|  EventSystem   |         IOCoreNet         |         IOCoreSSL         |
+|:--------------:|:-------------------------:|:-------------------------:|
+|      Event     |     UnixNetVConnection    |     SSLNetVConnection     |
+|     EThread    | NetHandler，InactivityCop | NetHandler, InactivityCop |
+| EventProcessor |        NetProcessor       |      sslNetProcessor      |
+
+- 像 Event和UnixNetVConnection 一样，SSLNetVConnection 也提供了面向上层状态机的方法
+  - do_io_* 系列
+  - (set|cancel)_*_timeout 系列
+  - (add|remove)_*_queue 系列
+  - 还有一部分面向上层状态机的方法在sslNetProcessor中定义
+- SSLNetVConnection 也提供了面向底层状态机的方法
+  - 通常由NetHandler来调用
+  - 可以把这些方法视作NetHandler状态机的专用回调函数
+  - 我个人觉得，应该把所有跟socket打交道的函数都放在NetHandler里面
+- SSLNetVConnection 也是状态机
+  - 因此它也有自己的handler（回调函数）
+    - SSLNetAccept调用acceptEvent
+    - InactivityCop调用mainEvent
+    - 构造函数会初始化为startEvent，用于调用connectUp()，这是面向sslNetProcessor的
+  - 大致有以下三条调用路径：
+    - EThread  －－－  SSLNetAccept  －－－ SSLNetVConnection
+    - EThread  －－－  NetHandler  －－－  SSLNetVConnection
+    - EThread  －－－  InactivityCop  －－－  SSLNetVConnection
+
+由于它既是Event，又是SM，还比UnixNetVConnection增加了SSL的处理，所以从形态上来看，SSLNetVConnection 要比 Event和UnixNetVConnection 复杂的多。
+
+SSLNetVConnection 对 UnixNetVConnection 的部分方法进行了重载：
 
   - net_read_io
   - load_buffer_and_write
@@ -36,36 +67,6 @@ SSLNetVConnection 继承自 UnixNetVConnection，对部分方法进行了重载�
   - get_ssl_reader
   - isEosRcvd
 
-在UnixNetVConnection的基础上构建了对SSL会话的支持。
-
-与介绍UnixNetVConnection时一样，也来一个IOCoreSSL子系统的对比，与EventSystem是一样的，也有Thread，Processor和Event，只是名字不一样了：
-
-|  EventSystem   |         IOCoreNet         |         IOCoreSSL         |
-|:--------------:|:-------------------------:|:-------------------------:|
-|      Event     |     UnixNetVConnection    |     SSLNetVConnection     |
-|     EThread    | NetHandler，InactivityCop | NetHandler, InactivityCop |
-| EventProcessor |        NetProcessor       |      sslNetProcessor      |
-
-- 像 Event和UnixNetVConnection 一样，SSLNetVConnection 也提供了面向上层状态机的方法
-  - do_io_* 系列
-  - (set|cancel)_*_timeout 系列
-  - (add|remove)_*_queue 系列
-  - 还有一部分面向上层状态机的方法在sslNetProcessor中定义
-- SSLNetVConnection 也提供了面向底层状态机的方法
-  - 通常由NetHandler来调用
-  - 可以把这些方法视作NetHandler状态机的专用回调函数
-  - 我个人觉得，应该把所有跟socket打交道的函数都放在NetHandler里面
-- SSLNetVConnection 也是状态机
-  - 因此它也有自己的handler（回调函数）
-    - SSLNetAccept调用acceptEvent
-    - InactivityCop调用mainEvent
-    - 构造函数会初始化为startEvent，用于调用connectUp()，这是面向sslNetProcessor的
-  - 大致有以下三条调用路径：
-    - EThread  －－－  SSLNetAccept  －－－ SSLNetVConnection
-    - EThread  －－－  NetHandler  －－－  SSLNetVConnection
-    - EThread  －－－  InactivityCop  －－－  SSLNetVConnection
-
-由于它既是Event，又是SM，还比UnixNetVConnection增加了SSL的处理，所以从形态上来看，SSLNetVConnection 要比 Event和UnixNetVConnection 复杂的多。
 
 ## 定义
 
