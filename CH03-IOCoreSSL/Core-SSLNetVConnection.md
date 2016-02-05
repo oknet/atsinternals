@@ -429,11 +429,107 @@ typedef int (SSLNetVConnection::*SSLNetVConnHandler)(int, void *);
 extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
 ```
 
+## SSL/TLS 实现简介
+
+理论上来说，SSL/TLS 是构建在 TCP 协议之上，因此也可以使用类似 HttpSM 的设计方式，实现 SSL/TLS 的握手和数据加解密的过程。
+
+但是这样的实现，就导致了从 IOCoreNet 到 HttpSM 是一层关系，而从 IOCoreNet 到 SSL/TLS 再到 HttpSM，从而实现 https 的时候，是两层关系。
+
+这样在实现 HttpSM 的时候，就要考虑前面还有一个同层次的上层状态机，而不能直接操作 VIO。
+
+事实上在 IOCoreNet 到 SSL/TLS 再到 HttpSM 的实现方式中，SSL/TLS 更像是一个 TransformVC，在后面我们介绍 TransformVC 时，就会了解到，让 HttpSM 同时兼容 NetVC 和 TransformVC 是很困难的。
+
+因此，在 ATS 对 SSL/TLS 的实现里，选择了把 SSL/TLS 作为 IOCore 的一部分，而不是把 SSL/TLS 放到上层状态机里。
+
+这样的好处，可以让 HttpSM 在处理 HTTPS 协议时使用 SSLNetVConnection，与处理 HTTP 协议时使用 UnixNetVConnection 是完全一样的。
+
+于是 SSLNetVConnection 就诞生了，但是 SSL/TLS 的处理实际上是一个子状态，在 UnixNetVConnection 上扩展了一堆的方法来实现这个子状态。
+
+由于是子状态，就要有一个切入点，这个切入点，就在：
+
+  - net_read_io
+  - load_buffer_and_write
+
+如果还记得 NetHandler::mainNetEvent 部分是如何调用上面的两个方法的吗？
+
+```
+  // UnixNetVConnection *
+  while ((vc = read_ready_list.dequeue())) {
+    if (vc->closed)
+      close_UnixNetVConnection(vc, trigger_event->ethread);
+    else if (vc->read.enabled && vc->read.triggered)
+      vc->net_read_io(this, trigger_event->ethread);
+    else if (!vc->read.enabled) {
+      read_ready_list.remove(vc);
+    }
+  }
+  while ((vc = write_ready_list.dequeue())) {
+    if (vc->closed)
+      close_UnixNetVConnection(vc, trigger_event->ethread);
+    else if (vc->write.enabled && vc->write.triggered)
+      write_to_net(this, vc, trigger_event->ethread);
+    else if (!vc->write.enabled) {
+      write_ready_list.remove(vc);
+    }
+  }
+```
+
+以下是 UnixNetVConnection的读写过程：
+
+  - 在读取 socket fd 到 MIOBuffer 的时候，调用的：
+    - vc->net_read_io(this, trigger_event->ethread);
+    - 这是一个 netvc 的成员方法
+    - 事实上是直接调用了 read_from_net(nh, this, lthread);
+    - 这不是一个 netvc 的成员方法
+    - 在 read_from_net 中调用了 read/readv 方法实现了读取操作
+  - 但是在将 MIOBuffer 写入 socket fd 的时候，调用的：
+    - write_to_net(this, vc, trigger_event->ethread);
+    - 这不是一个 netvc 的成员方法
+    - 事实上是直接调用了 write_to_net_io(nh, vc, thread);
+    - 在 write_to_net_io 中调用了vc->load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
+    - 这是一个 netvc 的成员方法
+    - 在 vc->load_buffer_and_write 中调用了 write/writev 方法实现了读取操作
+
+那么 SSLNetVConnection 的读写过程呢：
+
+  - 在读取 socket fd 到 MIOBuffer 的时候，调用的：
+    - vc->net_read_io(this, trigger_event->ethread);
+      - 这是一个 netvc 的成员方法，但是被重载了
+    - 在 net_read_io 中调用了 ssl_read_from_net(this, lthread, r);
+      - 这不是一个 netvc 的成员方法
+    - 在 ssl_read_from_net 中调用了 SSLReadBuffer 方法
+    - 在 SSLReadBuffer 中调用了 OpenSSL API 的 SSL_read(ssl, buf, (int)nbytes); 实现了读取并解密的操作
+  - 但是在将 MIOBuffer 写入 socket fd 的时候，调用的：
+    - write_to_net(this, vc, trigger_event->ethread);
+      - 这不是一个 netvc 的成员方法
+      - 事实上是直接调用了 write_to_net_io(nh, vc, thread);
+    - 在 write_to_net_io 中调用了vc->load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
+      - 这是一个 netvc 的成员方法，但是被重载了
+    - 在 vc->load_buffer_and_write 中调用了 SSLWriteBuffer 方法
+    - 在 SSLWriteBuffer 中调用了 OpenSSL API 的 SSL_write(ssl, buf, (int)nbytes); 实现了发送并加密的操作
+
+我们看到整个读取过程，基本都被 SSLNetVConnection 重载过了，发送过程则只有后半部分被重载。
+
+而 SSL/TLS 的握手过程则在 net_read_io 和 write_to_net_io 中进行了处理：
+
+  - write_to_net_io 虽然没有被重载，但是在 UnixNetVConnection 中已经做了一个判断
+  - 由于 SSL/TLS 的发起方，不一定必须是 客户端，所以，要在读写两个方向上都要进行握手的判断和处理
+
+由于 SSL/TLS 的握手过程和数据传输过程是完全不同的，所以：
+
+  - 握手过程实际上需要一个状态机来处理
+  - 数据传输过程/加解密过程，则是通过类似 TransformVC 的方式来完成
+  - 为了集成上述两种实现，SSL/TLS 设计的真的非常复杂？巧妙？混乱？
+  - 反正就是各种难懂、别扭就对了，看不懂就多看两遍，仔细推敲吧
+
+## 方法
+
+
 
 ## 参考资料
 
 - [P_SSLNetVConnection.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_SSLNetVConnection.h)
 - [SSLNetVConnection.cc](http://github.com/apache/trafficserver/tree/master/iocore/net/SSLNetVConnection.cc)
-
+- [SSLUtils.cc](http://github.com/apache/trafficserver/tree/master/iocore/net/SSLUtils.cc)
 
   
