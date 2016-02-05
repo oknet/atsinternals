@@ -524,7 +524,300 @@ extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
 
 ## 方法
 
+### net_read_io
 
+```
+// changed by YTS Team, yamsat
+void
+SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
+{
+  int ret;
+  int64_t r = 0;
+  int64_t bytes = 0;
+  NetState *s = &this->read;
+
+  // 如果是 blind tunnel，那么就使用 UnixNetVConnection::net_read_io 替代
+  // 相当于保持一致，不进行 SSL 处理，只做TCP Proxy转发
+  if (HttpProxyPort::TRANSPORT_BLIND_TUNNEL == this->attributes) {
+    this->super::net_read_io(nh, lthread);
+    return;
+  }
+
+  // 尝试获取对此VC的VIO的Mutex锁
+  MUTEX_TRY_LOCK_FOR(lock, s->vio.mutex, lthread, s->vio._cont);
+  if (!lock.is_locked()) {
+    // 如果没有拿到锁，就重新调度，等下一次再读取
+    // read_reschedule 会把此vc放回到read_ready_link的队列尾部
+    // 由于NetHandler的处理方式，必然会在本次EventSystem回调NetHandler中完成所有的读操作
+    //     不会延迟到下一次EventSystem对NetHandler的回调
+    readReschedule(nh);
+    return;
+  }
+  // Got closed by the HttpSessionManager thread during a migration
+  // The closed flag should be stable once we get the s->vio.mutex in that case
+  // (the global session pool mutex).
+  // 拿到锁之后，首先判断该vc是否被异步关闭了，因为 HttpSessionManager 会管理一个全局的session池。
+  if (this->closed) {
+    // 这里为何不直接调用 close_UnixNetVConnection() ?
+    // 通过调用 UnixNetVConnection::net_read_io 来间接调用 close_UnixNetVConnection() 关闭 sslvc
+    this->super::net_read_io(nh, lthread);
+    return;
+  }
+  // If the key renegotiation failed it's over, just signal the error and finish.
+  // 出现这个状态是在配置里，禁止了 SSL Renegotiation，但是客户端又发起了 SSL Renegotiation 请求
+  if (sslClientRenegotiationAbort == true) {
+    // 此时直接报错，然后关闭 sslvc
+    this->read.triggered = 0;
+    readSignalError(nh, (int)r);
+    Debug("ssl", "[SSLNetVConnection::net_read_io] client renegotiation setting read signal error");
+    return;
+  }
+
+  // If it is not enabled, lower its priority.  This allows
+  // a fast connection to speed match a slower connection by
+  // shifting down in priority even if it could read.
+  // 再判断，该vc的读操作是否被异步禁止了
+  if (!s->enabled || s->vio.op != VIO::READ) {
+    read_disable(nh, this);
+    return;
+  }
+  
+  // 下面才开始进入读操作前的准备工作
+  // 获取缓冲区，准备写入数据
+  MIOBufferAccessor &buf = s->vio.buffer;
+  // 在VIO中定义了总共需要读取的数据的总长度，还有已经完成的数据读取长度
+  // ntodo 是剩余的，还需要读取的数据长度
+  int64_t ntodo = s->vio.ntodo();
+  ink_assert(buf.writer());
+
+  // Continue on if we are still in the handshake
+  // 前面讲过，SSL/TLS 握手过程是一个子状态机，就嵌入到了 net_read_io 和 write_to_net_io 里面
+  if (!getSSLHandShakeComplete()) {
+    int err;
+
+    if (getSSLClientConnection()) {
+      ret = sslStartHandShake(SSL_EVENT_CLIENT, err);
+    } else {
+      ret = sslStartHandShake(SSL_EVENT_SERVER, err);
+    }
+    // If we have flipped to blind tunnel, don't read ahead
+    if (this->handShakeReader && this->attributes != HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
+      // Check and consume data that has been read
+      if (BIO_eof(SSL_get_rbio(this->ssl))) {
+        this->handShakeReader->consume(this->handShakeBioStored);
+        this->handShakeBioStored = 0;
+      }
+    } else if (this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
+      // Now in blind tunnel. Set things up to read what is in the buffer
+      // Must send the READ_COMPLETE here before considering
+      // forwarding on the handshake buffer, so the
+      // SSLNextProtocolTrampoline has a chance to do its
+      // thing before forwarding the buffers.
+      this->readSignalDone(VC_EVENT_READ_COMPLETE, nh);
+
+      // If the handshake isn't set yet, this means the tunnel
+      // decision was make in the SNI callback.  We must move
+      // the client hello message back into the standard read.vio
+      // so it will get forwarded onto the origin server
+      if (!this->getSSLHandShakeComplete()) {
+        this->sslHandShakeComplete = 1;
+
+        // Copy over all data already read in during the SSL_accept
+        // (the client hello message)
+        NetState *s = &this->read;
+        MIOBufferAccessor &buf = s->vio.buffer;
+        int64_t r = buf.writer()->write(this->handShakeHolder);
+        s->vio.nbytes += r;
+        s->vio.ndone += r;
+
+        // Clean up the handshake buffers
+        this->free_handshake_buffers();
+
+        if (r > 0) {
+          // Kick things again, so the data that was copied into the
+          // vio.read buffer gets processed
+          this->readSignalDone(VC_EVENT_READ_COMPLETE, nh);
+        }
+      }
+      return;
+    }
+    if (ret == EVENT_ERROR) {
+      this->read.triggered = 0;
+      readSignalError(nh, err);
+    } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
+      if (SSLConfigParams::ssl_handshake_timeout_in > 0) {
+        double handshake_time = ((double)(Thread::get_hrtime() - sslHandshakeBeginTime) / 1000000000);
+        Debug("ssl", "ssl handshake for vc %p, took %.3f seconds, configured handshake_timer: %d", this, handshake_time,
+              SSLConfigParams::ssl_handshake_timeout_in);
+        if (handshake_time > SSLConfigParams::ssl_handshake_timeout_in) {
+          Debug("ssl", "ssl handshake for vc %p, expired, release the connection", this);
+          read.triggered = 0;
+          nh->read_ready_list.remove(this);
+          readSignalError(nh, VC_EVENT_EOS);
+          return;
+        }
+      }
+      read.triggered = 0;
+      nh->read_ready_list.remove(this);
+      readReschedule(nh);
+    } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
+      write.triggered = 0;
+      nh->write_ready_list.remove(this);
+      writeReschedule(nh);
+    } else if (ret == EVENT_DONE) {
+      // If this was driven by a zero length read, signal complete when
+      // the handshake is complete. Otherwise set up for continuing read
+      // operations.
+      if (ntodo <= 0) {
+        if (!getSSLClientConnection()) {
+          // we will not see another ET epoll event if the first byte is already
+          // in the ssl buffers, so, SSL_read if there's anything already..
+          Debug("ssl", "ssl handshake completed on vc %p, check to see if first byte, is already in the ssl buffers", this);
+          this->iobuf = new_MIOBuffer(BUFFER_SIZE_INDEX_4K);
+          if (this->iobuf) {
+            this->reader = this->iobuf->alloc_reader();
+            s->vio.buffer.writer_for(this->iobuf);
+            ret = ssl_read_from_net(this, lthread, r);
+            if (ret == SSL_READ_EOS) {
+              this->eosRcvd = true;
+            }
+#if DEBUG
+            int pending = SSL_pending(this->ssl);
+            if (r > 0 || pending > 0) {
+              Debug("ssl", "ssl read right after handshake, read %" PRId64 ", pending %d bytes, for vc %p", r, pending, this);
+            }
+#endif
+          } else {
+            Error("failed to allocate MIOBuffer after handshake, vc %p", this);
+          }
+          read.triggered = 0;
+          read_disable(nh, this);
+        }
+        readSignalDone(VC_EVENT_READ_COMPLETE, nh);
+      } else {
+        read.triggered = 1;
+        if (read.enabled)
+          nh->read_ready_list.in_or_enqueue(this);
+      }
+    } else if (ret == SSL_WAIT_FOR_HOOK) {
+      // avoid readReschedule - done when the plugin calls us back to reenable
+    } else {
+      readReschedule(nh);
+    }
+    return;
+  }
+
+  // If there is nothing to do or no space available, disable connection
+  if (ntodo <= 0 || !buf.writer()->write_avail()) {
+    read_disable(nh, this);
+    return;
+  }
+
+  // At this point we are at the post-handshake SSL processing
+  // If the read BIO is not already a socket, consider changing it
+  if (this->handShakeReader) {
+    // Check out if there is anything left in the current bio
+    if (!BIO_eof(SSL_get_rbio(this->ssl))) {
+      // Still data remaining in the current BIO block
+    } else {
+      // Consume what SSL has read so far.
+      this->handShakeReader->consume(this->handShakeBioStored);
+
+      // If we are empty now, switch over
+      if (this->handShakeReader->read_avail() <= 0) {
+        // Switch the read bio over to a socket bio
+        SSL_set_rfd(this->ssl, this->get_socket());
+        this->free_handshake_buffers();
+      } else {
+        // Setup the next iobuffer block to drain
+        char *start = this->handShakeReader->start();
+        char *end = this->handShakeReader->end();
+        this->handShakeBioStored = end - start;
+
+        // Sets up the buffer as a read only bio target
+        // Must be reset on each read
+        BIO *rbio = BIO_new_mem_buf(start, this->handShakeBioStored);
+        BIO_set_mem_eof_return(rbio, -1);
+        SSL_set_rbio(this->ssl, rbio);
+      }
+    }
+  }
+  // Otherwise, we already replaced the buffer bio with a socket bio
+
+  // not sure if this do-while loop is really needed here, please replace
+  // this comment if you know
+  do {
+    ret = ssl_read_from_net(this, lthread, r);
+    if (ret == SSL_READ_READY || ret == SSL_READ_ERROR_NONE) {
+      bytes += r;
+    }
+    ink_assert(bytes >= 0);
+  } while ((ret == SSL_READ_READY && bytes == 0) || ret == SSL_READ_ERROR_NONE);
+
+  if (bytes > 0) {
+    if (ret == SSL_READ_WOULD_BLOCK || ret == SSL_READ_READY) {
+      if (readSignalAndUpdate(VC_EVENT_READ_READY) != EVENT_CONT) {
+        Debug("ssl", "ssl_read_from_net, readSignal != EVENT_CONT");
+        return;
+      }
+    }
+  }
+
+  switch (ret) {
+  case SSL_READ_ERROR_NONE:
+  case SSL_READ_READY:
+    readReschedule(nh);
+    return;
+    break;
+  case SSL_WRITE_WOULD_BLOCK:
+  case SSL_READ_WOULD_BLOCK:
+    if (lock.get_mutex() != s->vio.mutex.m_ptr) {
+      Debug("ssl", "ssl_read_from_net, mutex switched");
+      if (ret == SSL_READ_WOULD_BLOCK)
+        readReschedule(nh);
+      else
+        writeReschedule(nh);
+      return;
+    }
+    // reset the trigger and remove from the ready queue
+    // we will need to be retriggered to read from this socket again
+    read.triggered = 0;
+    nh->read_ready_list.remove(this);
+    Debug("ssl", "read_from_net, read finished - would block");
+#ifdef TS_USE_PORT
+    if (ret == SSL_READ_WOULD_BLOCK)
+      readReschedule(nh);
+    else
+      writeReschedule(nh);
+#endif
+    break;
+
+  case SSL_READ_EOS:
+    // close the connection if we have SSL_READ_EOS, this is the return value from ssl_read_from_net() if we get an
+    // SSL_ERROR_ZERO_RETURN from SSL_get_error()
+    // SSL_ERROR_ZERO_RETURN means that the origin server closed the SSL connection
+    eosRcvd = true;
+    read.triggered = 0;
+    readSignalDone(VC_EVENT_EOS, nh);
+
+    if (bytes > 0) {
+      Debug("ssl", "read_from_net, read finished - EOS");
+    } else {
+      Debug("ssl", "read_from_net, read finished - 0 useful bytes read, bytes used by SSL layer");
+    }
+    break;
+  case SSL_READ_COMPLETE:
+    readSignalDone(VC_EVENT_READ_COMPLETE, nh);
+    Debug("ssl", "read_from_net, read finished - signal done");
+    break;
+  case SSL_READ_ERROR:
+    this->read.triggered = 0;
+    readSignalError(nh, (int)r);
+    Debug("ssl", "read_from_net, read finished - read error");
+    break;
+  }
+}
+```
 
 ## 参考资料
 
