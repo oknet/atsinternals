@@ -592,27 +592,44 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
 
   // Continue on if we are still in the handshake
   // 前面讲过，SSL/TLS 握手过程是一个子状态机，就嵌入到了 net_read_io 和 write_to_net_io 里面
+  // getSSLHandShakeComplete() 返回的是成员 sslHandShakeComplete，表示是否完成了SSL握手过程
   if (!getSSLHandShakeComplete()) {
+    // 如果没有完成SSL握手过程，那么就进入SSL握手处理过程
     int err;
 
+    // getSSLClientConnection() 返回的是成员 sslClientConnection，表示这是否是一个由ATS发起的SSL连接
+    // 如果由ATS发起，那么ATS就是SSL Client，否则ATS就是SSL Server
+    // 调用 sslStartHandShake 来进行握手，传递握手方式，指明这是ATS作为 Client 还是 Server 的握手过程
     if (getSSLClientConnection()) {
+      // ATS 作为 SSL Client
       ret = sslStartHandShake(SSL_EVENT_CLIENT, err);
     } else {
+      // ATS 作为 SSL Server
+      // 会设置 this->attributes 的属性，例如 Blind Tunnel
       ret = sslStartHandShake(SSL_EVENT_SERVER, err);
     }
     // If we have flipped to blind tunnel, don't read ahead
+    // 下面的部分主要是判断对Blind Tunnel的处理
     if (this->handShakeReader && this->attributes != HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
+      // 如果不是Blind Tunnel，而且 MIOBuffer *handShakeBuffer 关联的 IOBufferReader *handShakeReader 不为空
+      //     就需要对 handShakeBuffer 中的数据进行处理
       // Check and consume data that has been read
       if (BIO_eof(SSL_get_rbio(this->ssl))) {
         this->handShakeReader->consume(this->handShakeBioStored);
         this->handShakeBioStored = 0;
       }
     } else if (this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL) {
+      // 如果是Blind Tunnel，那就需要透传数据，不按照SSL连接来处理
+      //     dest_ip=1.2.3.4 action=tunnel ssl_cert_name=servercert.pem ssl_key_name=privkey.pem
       // Now in blind tunnel. Set things up to read what is in the buffer
       // Must send the READ_COMPLETE here before considering
       // forwarding on the handshake buffer, so the
       // SSLNextProtocolTrampoline has a chance to do its
       // thing before forwarding the buffers.
+      // 此时SSLVC关联的状态机还是 SSLNextProtocolTrampoline，
+      //     因此下面这个READ_COMPLETE是传递给 SSLNextProtocolTrampoline::ioCompletionEvent
+      //     通过蹦床重新为 SSLVC 设置状态机，然后 SSLNextProtocolTrampoline 被 delete
+      //     对于Blind Tunnel，状态机是HttpSM
       this->readSignalDone(VC_EVENT_READ_COMPLETE, nh);
 
       // If the handshake isn't set yet, this means the tunnel
@@ -620,10 +637,12 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
       // the client hello message back into the standard read.vio
       // so it will get forwarded onto the origin server
       if (!this->getSSLHandShakeComplete()) {
+        // 如果没有完成SSL握手，就强制设置为已经完成
         this->sslHandShakeComplete = 1;
 
         // Copy over all data already read in during the SSL_accept
         // (the client hello message)
+        // 然后把接收到客户端发送的原始的SSL数据（Raw Data）复制到 SSLVC 的 Read VIO 中
         NetState *s = &this->read;
         MIOBufferAccessor &buf = s->vio.buffer;
         int64_t r = buf.writer()->write(this->handShakeHolder);
@@ -631,25 +650,37 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
         s->vio.ndone += r;
 
         // Clean up the handshake buffers
+        // 然后释放掉 SSL 的 MIOBuffer *handShakeBuffer 以及关联的 handShakeReader 和 handShakeHolder
         this->free_handshake_buffers();
 
+        // 如果 handShakeBuffer 中是有数据的，那么上面就执行了数据的复制，Read VIO 中就有了新数据
+        //     此时就要向上层状态机发送一个 READ_COMPLETE 的事件。
         if (r > 0) {
           // Kick things again, so the data that was copied into the
           // vio.read buffer gets processed
           this->readSignalDone(VC_EVENT_READ_COMPLETE, nh);
         }
       }
+      // 由于是 Blind Tunnel，在设置SSL握手状态为完成后，直接就返回
+      //     后面就转为Tunnel的处理，纯TCP的转发
       return;
     }
+    
+    // 根据 sslStartHandShake() 的返回值进行相应的处理
+    // 需要考虑 ATS 作为 Server 或者 Client 的两种情况
     if (ret == EVENT_ERROR) {
+      // 错误处理，直接关闭VC，回调蹦床 ioCompletionEvent
       this->read.triggered = 0;
       readSignalError(nh, err);
     } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
+      // 为了完成握手过程，需要读取更多数据
       if (SSLConfigParams::ssl_handshake_timeout_in > 0) {
+        // 如果设置了 SSL 握手超时时间
         double handshake_time = ((double)(Thread::get_hrtime() - sslHandshakeBeginTime) / 1000000000);
         Debug("ssl", "ssl handshake for vc %p, took %.3f seconds, configured handshake_timer: %d", this, handshake_time,
               SSLConfigParams::ssl_handshake_timeout_in);
         if (handshake_time > SSLConfigParams::ssl_handshake_timeout_in) {
+          // 发现超时，同样进行错误处理，然后关闭连接，但是固定传递 EOS 的状态
           Debug("ssl", "ssl handshake for vc %p, expired, release the connection", this);
           read.triggered = 0;
           nh->read_ready_list.remove(this);
@@ -657,17 +688,24 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
           return;
         }
       }
+      // 从 NetHandler 的队列里清除 SSLVC，等下一次有数据时再继续处理
+      // 注意跟 disable 的区别，disable 会同时从 epoll 里删除 vc 对应的 socket fd
+      // 而这里只是在本次 NetHandler 的处理循环中跳过此 SSLVC，等下一次 epoll_wait 再次触发
       read.triggered = 0;
       nh->read_ready_list.remove(this);
       readReschedule(nh);
     } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
+      // 为了完成握手过程，需要发送更多数据
+      // 通常是当前缓冲区满了，因此等待下一次缓冲区可写时再继续发送
       write.triggered = 0;
       nh->write_ready_list.remove(this);
       writeReschedule(nh);
     } else if (ret == EVENT_DONE) {
+      // 出现此情况的时候，要进行深入的判断
       // If this was driven by a zero length read, signal complete when
       // the handshake is complete. Otherwise set up for continuing read
       // operations.
+      // ntodo 表示剩余需要读取的字节数
       if (ntodo <= 0) {
         if (!getSSLClientConnection()) {
           // we will not see another ET epoll event if the first byte is already
@@ -706,6 +744,7 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
     }
     return;
   }
+  // 如果SSL握手已经完成
 
   // If there is nothing to do or no space available, disable connection
   if (ntodo <= 0 || !buf.writer()->write_avail()) {
