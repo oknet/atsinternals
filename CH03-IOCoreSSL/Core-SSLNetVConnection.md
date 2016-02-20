@@ -726,6 +726,8 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
             // 创建 iobuf 成功，分配reader
             this->reader = this->iobuf->alloc_reader();
             // 设置 Read VIO 内的 buffer 为 iobuf
+            // 这里的iobuf在之前指向：SSLNextProtocolAccept::buffer（为了实现设置 0 长度读取操作）
+            //     SSLNextProtocolAccept::buffer 是不可以写数据的，因此这里要切换成新分配的 MIOBuffer
             s->vio.buffer.writer_for(this->iobuf);
             // 进行数据读取操作
             ret = ssl_read_from_net(this, lthread, r);
