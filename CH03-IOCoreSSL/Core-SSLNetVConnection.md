@@ -669,7 +669,8 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
     // 根据 sslStartHandShake() 的返回值进行相应的处理
     // 需要考虑 ATS 作为 Server 或者 Client 的两种情况
     if (ret == EVENT_ERROR) {
-      // 错误处理，直接关闭VC，回调蹦床 ioCompletionEvent
+      // 错误处理，直接关闭VC，回调蹦床 ioCompletionEvent 传递 VC_EVENT_ERROR 事件类型，lerror = err;
+      // err 的值在 sslStartHandShake 中设置，通常为 syscall 或者 openssl 库的错误代码。
       this->read.triggered = 0;
       readSignalError(nh, err);
     } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
@@ -697,25 +698,38 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
     } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
       // 为了完成握手过程，需要发送更多数据
       // 通常是当前缓冲区满了，因此等待下一次缓冲区可写时再继续发送
+      // 同样要注意跟 disable 的区别
       write.triggered = 0;
       nh->write_ready_list.remove(this);
       writeReschedule(nh);
-    } else if (ret == EVENT_DONE) {
-      // 出现此情况的时候，要进行深入的判断
+    } else if (ret == EVENT_DONE) { // 出现此情况的时候，要进行深入的判断
       // If this was driven by a zero length read, signal complete when
       // the handshake is complete. Otherwise set up for continuing read
       // operations.
-      // ntodo 表示剩余需要读取的字节数
+      // 原文注释翻译：如果这是由 0 长度读操作驱动的一次调用，
+      //     EVENT_DONE 表示完成了握手过程，需要向蹦床 ioCompletionEvent 传递 READ_COMPLETE 事件。
+      //     否则，需要继续读取数据，那么 EVENT_DONE 则只是表示没有错误。
+      
+      // ntodo 表示剩余需要读取的字节数，这里我觉得应该用 nbytes 来判断是否是 0 长度的读操作 ？？？ TS-4216
       if (ntodo <= 0) {
+        // 进入 0 长度读操作驱动的调用处理过程
         if (!getSSLClientConnection()) {
+          // 当此 SSLVC 对于 ATS 是 SSL Server 端时
+          // 由于在 accept 上设置了 TCP_DEFER_ACCEPT 属性，因此对于一个新 Accept 的连接，需要判断是否有新数据。
           // we will not see another ET epoll event if the first byte is already
           // in the ssl buffers, so, SSL_read if there's anything already..
+          // 因此要直接做一次读取操作，来试试看是否有新数据
           Debug("ssl", "ssl handshake completed on vc %p, check to see if first byte, is already in the ssl buffers", this);
+          // 创建 iobuf 用于接收数据
           this->iobuf = new_MIOBuffer(BUFFER_SIZE_INDEX_4K);
           if (this->iobuf) {
+            // 创建 iobuf 成功，分配reader
             this->reader = this->iobuf->alloc_reader();
+            // 设置 Read VIO 内的 buffer 为 iobuf
             s->vio.buffer.writer_for(this->iobuf);
+            // 进行数据读取操作
             ret = ssl_read_from_net(this, lthread, r);
+            // 读操作可能会遇到 SSL EOS 的情况，需要做一个判断，例如握手的加密算法不支撑，协商失败等。
             if (ret == SSL_READ_EOS) {
               this->eosRcvd = true;
             }
@@ -728,23 +742,36 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
           } else {
             Error("failed to allocate MIOBuffer after handshake, vc %p", this);
           }
+          // 这里虽然做了 disable，但是后面回调蹦床的时候，会再次重新设置 VIO
           read.triggered = 0;
           read_disable(nh, this);
         }
+        // 回调蹦床 ioCompletionEvent 传递 READ_COMPLETE 事件，表示完成了握手过程
+        // 会重新设置 VIO
         readSignalDone(VC_EVENT_READ_COMPLETE, nh);
       } else {
+        // 这不是一次 0 长度读操作驱动的调用，需要继续读取数据，在 NetHandler 中激活该 NetVC
         read.triggered = 1;
         if (read.enabled)
           nh->read_ready_list.in_or_enqueue(this);
       }
     } else if (ret == SSL_WAIT_FOR_HOOK) {
       // avoid readReschedule - done when the plugin calls us back to reenable
+      // 当 plugin 回调 reenable 的时候，避免调用readReschedule
+      // 在后面讲解 SSL Hook 的时候，再详细分析这块。
     } else {
+      // 其它情况，调用readReschedule
+      // 底层调用 read_reschedule(nh, vc); 实现
+      //     当 read.triggered == 1 && read.enabled == 1 的时候
+      //     调用 nh->read_ready_list.in_or_enqueue(vc);
       readReschedule(nh);
     }
+    // 在SSL握手处理过程中，直接返回 NetHandler
     return;
   }
   // 如果SSL握手已经完成
+  // 下面的部分就与 UnixNetVConnection::net_read_io 差不多了
+  //     只不过这个是调用 ssl_read_from_net 代替 read
 
   // If there is nothing to do or no space available, disable connection
   if (ntodo <= 0 || !buf.writer()->write_avail()) {
