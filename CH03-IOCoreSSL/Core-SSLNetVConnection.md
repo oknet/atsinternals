@@ -726,10 +726,13 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
             // 创建 iobuf 成功，分配reader
             this->reader = this->iobuf->alloc_reader();
             // 设置 Read VIO 内的 buffer 为 iobuf
+            // 使用writer_for的方法设置之后，再向vio.buffer写入数据时，实际是写入了 this->iobuf 内。
+            //     同时，vio.buffer 是不可读的，如果想要读取 this->iobuf 内的数据，需要通过 this->reader 完成。
             // 这里的iobuf在之前指向：SSLNextProtocolAccept::buffer（为了实现设置 0 长度读取操作）
             //     SSLNextProtocolAccept::buffer 是不可以写数据的，因此这里要切换成新分配的 MIOBuffer
             s->vio.buffer.writer_for(this->iobuf);
-            // 进行数据读取操作
+            // 进行数据读取操作（因为有 TCP_DEFER_ACCEPT）：
+            //     从 SSLVC 的 socket 上读取数据，然后通过 vio.buffer 将数据写入 this->iobuf
             ret = ssl_read_from_net(this, lthread, r);
             // 读操作可能会遇到 SSL EOS 的情况，需要做一个判断，例如握手的加密算法不支撑，协商失败等。
             if (ret == SSL_READ_EOS) {
@@ -744,12 +747,12 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
           } else {
             Error("failed to allocate MIOBuffer after handshake, vc %p", this);
           }
-          // 这里虽然做了 disable，但是后面回调蹦床的时候，会再次重新设置 VIO
+          // 这里虽然做了 disable，但是下面紧跟着回调蹦床的时候，会再次重新设置 VIO
           read.triggered = 0;
           read_disable(nh, this);
         }
         // 回调蹦床 ioCompletionEvent 传递 READ_COMPLETE 事件，表示完成了握手过程
-        // 会重新设置 VIO
+        // 此时会由蹦床回调上层状态机，上层状态机会重新设置 VIO，激活此 SSLVC
         readSignalDone(VC_EVENT_READ_COMPLETE, nh);
       } else {
         // 这不是一次 0 长度读操作驱动的调用，需要继续读取数据，在 NetHandler 中激活该 NetVC
