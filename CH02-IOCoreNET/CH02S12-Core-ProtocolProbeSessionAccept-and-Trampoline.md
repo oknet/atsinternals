@@ -309,7 +309,7 @@ proto_is_http2(IOBufferReader *reader)
 }
 ```
 
-## Free Mutex
+## 无锁设计 / Mutex Free
 
 ProtocolProbeSessionAccept 状态机的mutex在构造函数中设置为NULL，表示该状态机被回调时不需要加锁，可以被并发调用
 
@@ -367,7 +367,7 @@ ProtocolProbeSessionAccept 状态机的mutex在构造函数中设置为NULL，�
   }
 ```
 
-需要注意的是：
+总结：
 
   - ProtocolProbeSessionAccept 是：
     - 每个 TCP Port 创建一个
