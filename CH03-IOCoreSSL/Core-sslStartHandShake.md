@@ -132,7 +132,19 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
 
 ### sslServerHandShakeEvent 分析
 
+sslServerHandShakeEvent 主要实现了：
 
+  - 在调用 SSL_accept 完成握手过程之前，触发 PreAcceptHook，
+  - 处理在 PreAcceptHook 中停留的状态，
+  - 在完成 PreAcceptHook 之后，再通过 SSL_accept 完成握手过程
+
+在调用 SSL_accept 完成握手过程时：
+
+  - 会触发 SNI Callback 或者 CERT Callback，
+  - 处理在 SNI/CERT Hook 中停留的状态，
+  - 在完成 SNI/CERT Hook 之后，再通过 SSL_accept 完成握手过程
+
+上面两处 Hook 的停留状态，都需要在 Hook 中调用 reenable 来触发对 sslServerHandShakeEvent 的再次调用，才能继续。
 
 ```
 int
@@ -168,6 +180,8 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
         sslPreAcceptHookState = SSL_HOOKS_DONE;
       } else {
         // SSL_HOOKS_ACTIVE 状态表示，正在执行对 Hook 函数／插件 的回调操作
+        // 在 Hook 函数／插件 的回调操作中，通过调用 reenable 重新设置 sslPreAcceptHookState 状态，
+        //     对于非 SSL_HOOKS_DONE 状态的情况，统一改为 SSL_HOOKS_INVOKE 状态
         sslPreAcceptHookState = SSL_HOOKS_ACTIVE;
         // 回调 Hook 函数／插件
         // 默认 SSLNetVC 的 mutex 已经被上锁，wrap 尝试对 Hook 函数／插件 的 mutex 上锁，成功则执行同步回调，
@@ -178,10 +192,12 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
         //     上锁失败则重新调度 ContWrapper 再次执行。
         ContWrapper::wrap(mutex, curHook->m_cont, TS_EVENT_VCONN_PRE_ACCEPT, this);
     
-        // 对于同步调用，返回 SSL_WAIT_FOR_HOOK 会不会有问题？？？
+        // 返回SSL_WAIT_FOR_HOOK，就是表示只有reenable才能继续后面的流程
         return SSL_WAIT_FOR_HOOK;
       }
     } else { // waiting for hook to complete
+      // 不是 SSL_HOOKS_INVOKE 状态，例如，可能是 SSL_HOOKS_ACTIVE 状态，
+      // 那么就继续 SSL_WAIT_FOR_HOOK
              /* A note on waiting for the hook. I believe that because this logic
                 cannot proceed as long as a hook is outstanding, the underlying VC
                 can't go stale. If that can happen for some reason, we'll need to be
@@ -196,27 +212,42 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
   // Again no data has been exchanged, so we can go directly
   // without data replay.
   // Note we can't arrive here if a hook is active.
+  // 在 PreAcceptHook 内可以对SSLVC的属性进行设置，让SSLVC变成Blind Tunnel
+  //     在 Hook 内调用 TSVConnTunnel 来设置 SSLVC 成为 Blind Tunnel
+  // 此处就是对这个设置进行的响应
   if (TS_SSL_HOOK_OP_TUNNEL == hookOpRequested) {
+    // 设置属性为 Blind Tunnel
     this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+    // 释放成员 ssl
     SSL_free(this->ssl);
     this->ssl = NULL;
     // Don't mark the handshake as complete yet,
     // Will be checking for that flag not being set after
     // we get out of this callback, and then will shuffle
     // over the buffered handshake packets to the O.S.
+    // 上面的注释暂时没看懂，不明白为何这里不能直接设置为握手已经完成的状态？？
     return EVENT_DONE;
   } else if (TS_SSL_HOOK_OP_TERMINATE == hookOpRequested) {
+    // 如果需要在 PreAcceptHook 内终止此 SSLVC，可以设置为 TS_SSL_HOOK_OP_TERMINATE
+    // 直接设置为握手完成的状态 －－－－> 这样就能终止此 SSLVC 吗？？
     sslHandShakeComplete = 1;
     return EVENT_DONE;
   }
+  // 到这里，所有跟 PreAcceptHook 相关的部分都已经完成了
 
   int retval = 1; // Initialze with a non-error value
 
   // All the pre-accept hooks have completed, proceed with the actual accept.
+  // 检查一下 ssl 的读通道 rbio，是不是空了
   if (BIO_eof(SSL_get_rbio(this->ssl))) { // No more data in the buffer
+    // 没有数据了，就要通过 read_raw_data 读取数据
+    //     只有上一个 rbio 被完全消费了，才可以通过 read_raw_data 设置一个新的，
+    //     因为 read_raw_data 是会替换掉原来设置的 bio。
+    // 这样 SSL_accept 就可以处理这些SSL握手数据了
     // Read from socket to fill in the BIO buffer with the
     // raw handshake data before calling the ssl accept calls.
     retval = this->read_raw_data();
+    // 返回 0 表示 EOF
     if (retval == 0) {
       // EOF, go away, we stopped in the handshake
       SSLDebugVC(this, "SSL handshake error: EOF");
@@ -224,26 +255,40 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     }
   }
 
+  // 调用 SSLAccept 消费 rbio 内的数据
+  // SSLAccept 是对 OpenSSL API SSL_accept 的封装
   ssl_error_t ssl_error = SSLAccept(ssl);
   bool trace = getSSLTrace();
   Debug("ssl", "trace=%s", trace ? "TRUE" : "FALSE");
 
+  // SSL_ERROR_NONE 表示没有错误
   if (ssl_error != SSL_ERROR_NONE) {
+    // SSLAccept 调用出错了
+    // 这里保存 errno 有用吗？？？
     err = errno;
     SSLDebugVC(this, "SSL handshake error: %s (%d), errno=%d", SSLErrorName(ssl_error), ssl_error, err);
 
     // start a blind tunnel if tr-pass is set and data does not look like ClientHello
+    // 如果 SSLAccept 出错了，那么就看看是否设置了 tr-pass 标志
     char *buf = handShakeBuffer->buf();
+    // 如果设置了 tr-pass 标志，而且接收到的数据也不像是 SSL 握手请求
     if (getTransparentPassThrough() && buf && *buf != SSL_OP_HANDSHAKE) {
       SSLDebugVC(this, "Data does not look like SSL handshake, starting blind tunnel");
+      // 设置 Blind Tunnel 属性
       this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+      // 强制设置为未完成握手的情况，应该跟上面的 if (TS_SSL_HOOK_OP_TUNNEL == hookOpRequested) 处理是一样的
       sslHandShakeComplete = 0;
+      // 返回调用者，按照Blind Tunnel来进行处理
       return EVENT_CONT;
     }
   }
 
+  // 根据 SSLAccept 的返回值进行错误处理
+  //     参考：https://www.openssl.org/docs/manmaster/ssl/SSL_get_error.html
   switch (ssl_error) {
   case SSL_ERROR_NONE:
+    // 没有出错的情况
+    // 输出握手成功的debug信息
     if (is_debug_tag_set("ssl")) {
       X509 *cert = SSL_get_peer_certificate(ssl);
 
@@ -255,11 +300,13 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
       }
     }
 
+    // 设置握手完成
     sslHandShakeComplete = true;
 
     TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL server handshake completed successfully");
     // do we want to include cert info in trace?
 
+    // 记录握手过程使用的时间
     if (sslHandshakeBeginTime) {
       const ink_hrtime ssl_handshake_time = Thread::get_hrtime() - sslHandshakeBeginTime;
       Debug("ssl", "ssl handshake time:%" PRId64, ssl_handshake_time);
@@ -276,24 +323,30 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 // is preferred since it is the server's preference.  The server
 // preference would not be meaningful if we let the client
 // preference have priority.
-
+      // 使用 ALPN 协商模式，获得支持的 proto 字符串
 #if TS_USE_TLS_ALPN
       SSL_get0_alpn_selected(ssl, &proto, &len);
 #endif /* TS_USE_TLS_ALPN */
 
+      // 在ALPN失败或不存在时，
+      // 使用 NPN 协商模式，获得支持的 proto 字符串
 #if TS_USE_TLS_NPN
       if (len == 0) {
         SSL_get0_next_proto_negotiated(ssl, &proto, &len);
       }
 #endif /* TS_USE_TLS_NPN */
 
+      // len 为支持的协议类型的描述串长度
       if (len) {
+        // len 大于 0 表示协商成功了
         // If there's no NPN set, we should not have done this negotiation.
         ink_assert(this->npnSet != NULL);
 
+        // 根据 npnSet 来找到能处理此协议的状态机，保存到 npnEndpoint
         this->npnEndpoint = this->npnSet->findEndpoint(proto, len);
         this->npnSet = NULL;
 
+        // 如果 npnEndpoint 为空，则表示此协议没有对应的状态机可以处理
         if (this->npnEndpoint == NULL) {
           Error("failed to find registered SSL endpoint for '%.*s'", (int)len, (const char *)proto);
           return EVENT_ERROR;
@@ -306,9 +359,9 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
         TraceIn(trace, get_remote_addr(), get_remote_port(), "client did not select a next protocol");
       }
     }
-
+    // 返回调用者
     return EVENT_DONE;
-
+    
   case SSL_ERROR_WANT_CONNECT:
     TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL server handshake ERROR_WANT_CONNECT");
     return SSL_HANDSHAKE_WANT_CONNECT;
@@ -337,6 +390,8 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL server handshake ERROR_WANT_X509_LOOKUP");
     return EVENT_CONT;
   case SSL_ERROR_WANT_SNI_RESOLVE:
+    // SSL_ERROR_WANT_SNI_RESOLVE 的出现表示 SSL 握手过程在 SNI Callback 中挂起了，
+    //     需要再次调用 SSL_accept 才能完成握手过程。
     TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL server handshake ERROR_WANT_SNI_RESOLVE");
 #elif SSL_ERROR_WANT_X509_LOOKUP
   case SSL_ERROR_WANT_X509_LOOKUP:
@@ -344,10 +399,12 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 #endif
 #if defined(SSL_ERROR_WANT_SNI_RESOLVE) || defined(SSL_ERROR_WANT_X509_LOOKUP)
     if (this->attributes == HttpProxyPort::TRANSPORT_BLIND_TUNNEL || TS_SSL_HOOK_OP_TUNNEL == hookOpRequested) {
+      // 如果在 Hook 里面设置为 Blind Tunnel 了，就需要做一个处理
       this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
       sslHandShakeComplete = 0;
       return EVENT_CONT;
     } else {
+      // 如果没有设置为 Blind Tunnel，那么就是停在 Hook 函数／插件里面了，因此需要等待
       //  Stopping for some other reason, perhaps loading certificate
       return SSL_WAIT_FOR_HOOK;
     }
@@ -357,6 +414,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL server handshake ERROR_WANT_ACCEPT");
     return EVENT_CONT;
 
+  // 下面这些都是SSL异常的错误处理
   case SSL_ERROR_SSL: {
     SSL_CLR_ERR_INCR_DYN_STAT(this, ssl_error_ssl, "SSLNetVConnection::sslServerHandShakeEvent, SSL_ERROR_SSL errno=%d", errno);
     char buf[512];
