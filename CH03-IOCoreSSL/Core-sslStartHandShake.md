@@ -16,25 +16,38 @@
   - 当 ATS 接受一个Client发起的SSL连接时，ATS作为SSL Server，因此调用 sslServerHandShakeEvent 完成握手
   - 当 ATS 主动向OServer发起SSL连接时，ATS作为SSL Client，因此调用 sslClientHandShakeEvent 完成握手
 
-## 定义
+## 方法
+
+### sslStartHandShake 分析
+
+sslStartHandShake 用来初始化 SSLNetVC 的成员 ```SSL *ssl;```，在SSL握手中，作为 SSL Client 和/或 SSL Server 需要使用不同的方式来初始化该成员。如果初始化失败，则直接报错返回。
+
+在完成 ssl 初始化之后，再根据 event 的值调用 sslServerHandShakeEvent 或 sslClientHandShakeEvent 完成后续握手工作。
 
 ```
 int
 SSLNetVConnection::sslStartHandShake(int event, int &err)
 {
+  // 用于记录 SSL 握手开始的时间，可用来判断握手过程是否超时
   if (sslHandshakeBeginTime == 0) {
     sslHandshakeBeginTime = Thread::get_hrtime();
     // net_activity will not be triggered until after the handshake
     set_inactivity_timeout(HRTIME_SECONDS(SSLConfigParams::ssl_handshake_timeout_in));
   }
+  
+  // 根据 event 来判断握手类型
   switch (event) {
   case SSL_EVENT_SERVER:
-    if (this->ssl == NULL) {
+    // ATS 作为 SSL Server
+    if (this->ssl == NULL) {  // 成员 ssl 用来保存 SSL Session 信息，由 OpenSSL 创建
+      // 读取 ssl_multicert.config 配置文件
       SSLCertificateConfig::scoped_config lookup;
       IpEndpoint ip;
       int namelen = sizeof(ip);
       safe_getsockname(this->get_socket(), &ip.sa, &namelen);
+      // 根据 ssl_multicert.config 配置文件的信息查找是否与当前的ip存在匹配关系
       SSLCertContext *cc = lookup->find(ip);
+      // 输出Debug信息
       if (is_debug_tag_set("ssl")) {
         IpEndpoint src, dst;
         ip_port_text_buffer ipb1, ipb2;
@@ -50,20 +63,32 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
       // Escape if this is marked to be a tunnel.
       // No data has been read at this point, so we can go
       // directly into blind tunnel mode
+      // 如果在 ssl_multicert.config 配置文件中定义了与此IP相关的规则，而且action＝tunnel
       if (cc && SSLCertContext::OPT_TUNNEL == cc->opt && this->is_transparent) {
+        // 设置为 Blind Tunnel
         this->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+        // 强制握手过程为完成
         sslHandShakeComplete = 1;
+        // 释放 ssl 成员
         SSL_free(this->ssl);
         this->ssl = NULL;
+        // 返回调用者
+        // 此时这个SSLVC就变成了一个TCP Blind Tunnel，ATS只是在TCP层双向转发数据
         return EVENT_DONE;
       }
 
-
+      // 如果没有设置为 Blind Tunnel：
       // Attach the default SSL_CTX to this SSL session. The default context is never going to be able
       // to negotiate a SSL session, but it's enough to trampoline us into the SNI callback where we
       // can select the right server certificate.
+      // 使用缺省 context 初始化 ssl 成员
+      // 这里 lookup 在 find() 方法中设置了证书
+      // defaultContext() 的设置是不允许进行SSL会话的协商的 －－ 这句不太理解什么意思？？？
       this->ssl = make_ssl_connection(lookup->defaultContext(), this);
 #if !(TS_USE_TLS_SNI)
+      // 初始化用于调试的 SSLTrace
+      // 在 openssl 1.0.2d 之后，支持 TLS SNI
+      // 但是在这个版本之前，就需要通过其它方法来trace一个SSL会话
       // set SSL trace
       if (SSLConfigParams::ssl_wire_trace_enabled) {
         bool trace = computeSSLTrace();
@@ -72,51 +97,88 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
       }
 #endif
     }
-
+    // 如果创建 ssl 成员失败，报错并返回错误
     if (this->ssl == NULL) {
       SSLErrorVC(this, "failed to create SSL server session");
       return EVENT_ERROR;
     }
 
+    // 最后调用 sslServerHandShakeEvent 进行握手
     return sslServerHandShakeEvent(err);
 
   case SSL_EVENT_CLIENT:
+    // 如果成员 ssl 未创建
     if (this->ssl == NULL) {
+      // 使用 client_ctx 初始化并创建成员 ssl
       this->ssl = make_ssl_connection(ssl_NetProcessor.client_ctx, this);
     }
 
+    // 如果创建 ssl 成员失败，报错并返回错误
     if (this->ssl == NULL) {
       SSLErrorVC(this, "failed to create SSL client session");
       return EVENT_ERROR;
     }
-
+    
+    // 最后调用 sslClientHandShakeEvent 进行握手
     return sslClientHandShakeEvent(err);
 
   default:
+    // 其它情况，异常错误／调用
     ink_assert(0);
     return EVENT_ERROR;
   }
 }
+```
 
+### sslServerHandShakeEvent 分析
+
+
+
+```
 int
 SSLNetVConnection::sslServerHandShakeEvent(int &err)
 {
+  // sslPreAcceptHookState 用来支持 PreAcceptHook 的实现
+  // 这里首先判断是否已经完成了 PreAcceptHook 阶段
   if (SSL_HOOKS_DONE != sslPreAcceptHookState) {
     // Get the first hook if we haven't started invoking yet.
+    // PreAcceptHook 对于每一个 SSLNetVC 只会触发一次，
+    //     在回调Hook函数／插件时，还没有向上层状态机传递NET_EVENT_ACCEPT事件
     if (SSL_HOOKS_INIT == sslPreAcceptHookState) {
+      // SSL_HOOKS_INIT 状态表示 PreAcceptHook 未被触发
+      // 获取 Hook 函数／插件，然后设置状态为 “发起”
       curHook = ssl_hooks->get(TS_VCONN_PRE_ACCEPT_INTERNAL_HOOK);
       sslPreAcceptHookState = SSL_HOOKS_INVOKE;
     } else if (SSL_HOOKS_INVOKE == sslPreAcceptHookState) {
+      // SSL_HOOKS_INVOKE 状态表示 PreAcceptHook 在发起中
+      // 由于 Hook 函数／插件，可能不只有一个，
+      //     因此在完成了第一个函数／插件的调用，还未开始调用第二个时，就可能是这个状态
+      //     另外，Hook 函数／插件由于某些原因需要延迟 PreAccept 过程，也可能会停留在这个状态
       // if the state is anything else, we haven't finished
       // the previous hook yet.
+      // 获取下一个 Hook 函数／插件
       curHook = curHook->next();
     }
     if (SSL_HOOKS_INVOKE == sslPreAcceptHookState) {
+      // 如果在发起中的状态
       if (0 == curHook) { // no hooks left, we're done
+        // 下一个 Hook 函数／插件 指向 NULL （0），表示没有啦
+        // 那么所有的 Hook 函数／插件 都执行完成了，PreAcceptHook 就全部执行完成
+        //     设置为 SSL_HOOKS_DONE 表示已经完成了 PreAcceptHook 阶段
         sslPreAcceptHookState = SSL_HOOKS_DONE;
       } else {
+        // SSL_HOOKS_ACTIVE 状态表示，正在执行对 Hook 函数／插件 的回调操作
         sslPreAcceptHookState = SSL_HOOKS_ACTIVE;
+        // 回调 Hook 函数／插件
+        // 默认 SSLNetVC 的 mutex 已经被上锁，wrap 尝试对 Hook 函数／插件 的 mutex 上锁，成功则执行同步回调，
+        // 失败则创建 ContWrapper 通过 EventSystem 进行异步回调，ContWrapper 的 mutex 共享 SSLNetVC 的 mutex
+        //     因此在 EventSystem 回调时会首先锁住 SSLNetVC 的 mutex，
+        //     然后在 ContWrapper 的回调函数 event_handler 中再次尝试对 Hook 函数／插件 的 mutex 上锁，
+        //     上锁成功则同步回调 Hook 函数／插件，然后释放 ContWrapper，
+        //     上锁失败则重新调度 ContWrapper 再次执行。
         ContWrapper::wrap(mutex, curHook->m_cont, TS_EVENT_VCONN_PRE_ACCEPT, this);
+    
+        // 对于同步调用，返回 SSL_WAIT_FOR_HOOK 会不会有问题？？？
         return SSL_WAIT_FOR_HOOK;
       }
     } else { // waiting for hook to complete
@@ -316,8 +378,11 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     return EVENT_ERROR;
   }
 }
+```
 
+### sslClientHandShakeEvent 分析
 
+```
 int
 SSLNetVConnection::sslClientHandShakeEvent(int &err)
 {
