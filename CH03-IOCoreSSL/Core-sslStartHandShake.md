@@ -563,4 +563,9 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
 
 ## 参考
 
-[OpenSSL::SSL_get_error](https://www.openssl.org/docs/manmaster/ssl/SSL_get_error.html)
+  - [OpenSSL::SSL_accept](https://www.openssl.org/docs/manmaster/ssl/SSL_accept.html)
+  - [OpenSSL::SSL_get_rbio](https://www.openssl.org/docs/manmaster/ssl/SSL_get_rbio.html)
+  - [OpenSSL::SSL_set_bio](https://www.openssl.org/docs/manmaster/ssl/SSL_set_bio.html)
+  - [OpenSSL::SSL_connect](https://www.openssl.org/docs/manmaster/ssl/SSL_connect.html)
+  - [OpenSSL::SSL_get_error](https://www.openssl.org/docs/manmaster/ssl/SSL_get_error.html)
+  - [OpenSSL::SSL_CTX_set_verify](https://www.openssl.org/docs/manmaster/ssl/SSL_CTX_set_verify.html)
