@@ -440,11 +440,16 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 
 ### sslClientHandShakeEvent 分析
 
+sslClientHandShakeEvent 主要实现了：
+
+  - ATS 作为 SSL Client 向 OServer 发起一个 SSL Handshake 的功能
+  
 ```
 int
 SSLNetVConnection::sslClientHandShakeEvent(int &err)
 {
 #if TS_USE_TLS_SNI
+  // 对 SNI 功能的支持
   if (options.sni_servername) {
     if (SSL_set_tlsext_host_name(ssl, options.sni_servername)) {
       Debug("ssl", "using SNI name '%s' for client handshake", options.sni_servername.get());
@@ -453,21 +458,31 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
       SSL_INCREMENT_DYN_STAT(ssl_sni_name_set_failure);
     }
   }
-
 #endif
 
+  // 在 SSLInitClientContext 方法中，初始化了 ssl_client_data_index，
+  //     用来在 SSL 会话描述符中申请一个内存块，此index表示内存块的编号，
+  //     对于可以通过此index值来存／取该内存块的数据，
+  //     在 SSL 会话描述符中有多个这样的内存块，可以存储应用层的数据
+  // 在 ATS 中，利用这个特性，把 SSLVC 的实例内存地址（this）存储到了 SSL 会话描述符中
   SSL_set_ex_data(ssl, get_ssl_client_data_index(), this);
+  // 向 OServer 发起 SSL Handshake，SSLConnect 是对 SSL_connect 的封装
   ssl_error_t ssl_error = SSLConnect(ssl);
+  // SSL 跟踪调试状态
   bool trace = getSSLTrace();
   Debug("ssl", "trace=%s", trace ? "TRUE" : "FALSE");
 
+  // 根据 SSLConnect 的返回值 ssl_error 进行错误处理
   switch (ssl_error) {
+  // SSL_ERROR_NONE 表示没有错误
   case SSL_ERROR_NONE:
+    // 输出调试信息
     if (is_debug_tag_set("ssl")) {
       X509 *cert = SSL_get_peer_certificate(ssl);
 
       Debug("ssl", "SSL client handshake completed successfully");
       // if the handshake is complete and write is enabled reschedule the write
+      // 为何在开启了调试信息时要做 writeReschedule ？？？
       if (closed == 0 && write.enabled)
         writeReschedule(nh);
       if (cert) {
@@ -481,9 +496,11 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
     TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake completed successfully");
     // do we want to include cert info in trace?
 
+    // 设置握手完成
     sslHandShakeComplete = true;
     return EVENT_DONE;
 
+  // 下面是其它错误情况的处理
   case SSL_ERROR_WANT_WRITE:
     Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_WANT_WRITE");
     SSL_INCREMENT_DYN_STAT(ssl_error_want_write);
@@ -524,7 +541,6 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
     return EVENT_ERROR;
     break;
 
-
   case SSL_ERROR_SSL:
   default: {
     err = errno;
@@ -538,10 +554,13 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
     TraceIn(trace, get_remote_addr(), get_remote_port(),
             "SSL client handshake ERROR_SSL: sslErr=%d, ERR_get_error=%ld (%s) errno=%d", ssl_error, e, buf, errno);
     return EVENT_ERROR;
-  } break;
+    }
+    break;
   }
   return EVENT_CONT;
 }
 ```
 
 ## 参考
+
+[OpenSSL::SSL_get_error](https://www.openssl.org/docs/manmaster/ssl/SSL_get_error.html)
