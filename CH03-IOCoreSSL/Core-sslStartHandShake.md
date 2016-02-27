@@ -561,6 +561,265 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
 }
 ```
 
+## SNI/CERT Hook 的实现
+
+在上面的 sslServerHandShakeEvent 分析中，并未看到 SNI/CERT Hook 的实现部分，只看到了 PreAccept Hook 的实现，那么 SNI/CERT Hook 是如何实现的呢？
+
+由于在 OpenSSL 1.0.2d 之后提供了 Certificate Callback，但是之前的版本是 SNI Callback，有一定区别，因此在ATS中通过宏定义来实现了对两个不同版本的 OpenSSL 库的兼容。
+
+但是更早期的版本里，好像连 SNI Callback 也没有实现，在 configure 的时候，会检测 ```SSL_CTX_set_tlsext_servername_callback``` 是否可用：
+
+  - 可用，那么定义 TS_USE_TLS_SNI 为 true (1)
+  - 不可用，就定义 TS_USE_TLS_SNI 为 false (0)
+
+在 Client 连接到 ATS 的 SSL Server 进行握手时，SSL Server 需要下发一个证书给 Client，因此 ATS 规定需要在 ssl_multicert.config 中配置一个规则，指明使用的证书：
+
+  - 必须设置 ssl_cert_name=<file.pem>
+    - 当 Client 访问的时候，就会将这个证书提供给客户端
+    - 在加载证书的时候，会根据其内签发的域名来匹配SNI
+  - 其它选项都可以可选的，不是必须配置的
+  - 如果设置 dest_ip=*
+    - 那么对应的证书则作为缺省证书使用，
+    - 当SNI内包含的域名，无法在所有的证书中找到时，则使用这个缺省证书。
+  - 当没有设置 dest_ip=* 的缺省证书时，
+    - 在 SSLParseCertificateConfiguration 方法加载完配置后，会创建一个 dest_ip=* 的记录，但是该记录没有证书。
+    - 那么在找不到证书时，握手就无法建立。
+
+SSLParseCertificateConfiguration 方法负责：
+
+  - 解析 ssl_multicert.config 配置文件
+  - 调用 ssl_store_ssl_context 方法来加载证书
+  - 全部处理完成后，会检查是否已经设置了缺省证书
+  - 如果没有设置，则调用 ssl_store_ssl_context 方法添加一个 空（NULL）证书，作为缺省证书
+
+ssl_store_ssl_context 方法负责
+
+  - 向 SSLCertLookup 类型的容器添加域名和证书
+  - 如果添加的证书是一个缺省证书，则会：
+    - 将此证书设置为 SSLCertLookup 类型容器内的缺省证书
+    - 同时调用 ssl_set_handshake_callbacks 方法，设置 SNI/CERT Hook 到 SSL 会话上
+
+ssl_set_handshake_callbacks 方法通过宏定义来判定使用哪个 OpenSSL 的API方法来设置 Hook 函数。
+
+```
+source: SSLUtils.cc
+static void
+ssl_set_handshake_callbacks(SSL_CTX *ctx)
+{
+#if TS_USE_TLS_SNI
+// Make sure the callbacks are set
+#if TS_USE_CERT_CB
+  SSL_CTX_set_cert_cb(ctx, ssl_cert_callback, NULL);
+#else
+  SSL_CTX_set_tlsext_servername_callback(ctx, ssl_servername_callback);
+#endif
+#endif
+}
+```
+
+下面分别是 ctx, ssl_cert_callback 和 ssl_servername_callback 两个回调函数，set_context_cert 方法是公共部分。
+
+```
+source: SSLUtils.cc
+#if TS_USE_TLS_SNI
+int
+set_context_cert(SSL *ssl)
+{
+  SSL_CTX *ctx = NULL;
+  SSLCertContext *cc = NULL;
+  SSLCertificateConfig::scoped_config lookup;
+  const char *servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+  SSLNetVConnection *netvc = (SSLNetVConnection *)SSL_get_app_data(ssl);
+  bool found = true;
+  int retval = 1;
+
+  Debug("ssl", "set_context_cert ssl=%p server=%s handshake_complete=%d", ssl, servername, netvc->getSSLHandShakeComplete());
+  // set SSL trace (we do this a little later in the USE_TLS_SNI case so we can get the servername
+  if (SSLConfigParams::ssl_wire_trace_enabled) {
+    bool trace = netvc->computeSSLTrace();
+    Debug("ssl", "sslnetvc. setting trace to=%s", trace ? "true" : "false");
+    netvc->setSSLTrace(trace);
+  }
+
+  // catch the client renegotiation early on
+  if (SSLConfigParams::ssl_allow_client_renegotiation == false && netvc->getSSLHandShakeComplete()) {
+    Debug("ssl", "set_context_cert trying to renegotiate from the client");
+    retval = 0; // Error
+    goto done;
+  }
+
+  // The incoming SSL_CTX is either the one mapped from the inbound IP address or the default one. If we
+  // don't find a name-based match at this point, we *do not* want to mess with the context because we've
+  // already made a best effort to find the best match.
+  if (likely(servername)) {
+    cc = lookup->find((char *)servername);
+    if (cc && cc->ctx)
+      ctx = cc->ctx;
+    if (cc && SSLCertContext::OPT_TUNNEL == cc->opt && netvc->get_is_transparent()) {
+      netvc->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
+      netvc->setSSLHandShakeComplete(true);
+      retval = -1;
+      goto done;
+    }
+  }
+
+  // If there's no match on the server name, try to match on the peer address.
+  if (ctx == NULL) {
+    IpEndpoint ip;
+    int namelen = sizeof(ip);
+
+    safe_getsockname(netvc->get_socket(), &ip.sa, &namelen);
+    cc = lookup->find(ip);
+    if (cc && cc->ctx)
+      ctx = cc->ctx;
+  }
+
+  if (ctx != NULL) {
+    SSL_set_SSL_CTX(ssl, ctx);
+#if HAVE_OPENSSL_SESSION_TICKETS
+    // Reset the ticket callback if needed
+    SSL_CTX_set_tlsext_ticket_key_cb(ctx, ssl_callback_session_ticket);
+#endif
+  } else {
+    found = false;
+  }
+
+  ctx = SSL_get_SSL_CTX(ssl);
+  Debug("ssl", "ssl_cert_callback %s SSL context %p for requested name '%s'", found ? "found" : "using", ctx, servername);
+
+  if (ctx == NULL) {
+    retval = 0;
+    goto done;
+  }
+done:
+  return retval;
+}
+
+// Use the certificate callback for openssl 1.0.2 and greater
+// otherwise use the SNI callback
+#if TS_USE_CERT_CB
+/**
+ * Called before either the server or the client certificate is used
+ * Return 1 on success, 0 on error, or -1 to pause
+ */
+static int
+ssl_cert_callback(SSL *ssl, void * /*arg*/)
+{
+  SSLNetVConnection *netvc = (SSLNetVConnection *)SSL_get_app_data(ssl);
+  bool reenabled;
+  int retval = 1;
+
+  // Do the common certificate lookup only once.  If we pause
+  // and restart processing, do not execute the common logic again
+  if (!netvc->calledHooks(TS_SSL_CERT_HOOK)) {
+    retval = set_context_cert(ssl);
+    if (retval != 1) {
+      return retval;
+    }
+  }
+
+  // Call the plugin cert code
+  reenabled = netvc->callHooks(TS_SSL_CERT_HOOK);
+  // If it did not re-enable, return the code to
+  // stop the accept processing
+  if (!reenabled) {
+    retval = -1; // Pause
+  }
+
+  // Return 1 for success, 0 for error, or -1 to pause
+  return retval;
+}
+#else
+static int
+ssl_servername_callback(SSL *ssl, int * /* ad */, void * /*arg*/)
+{
+  SSLNetVConnection *netvc = (SSLNetVConnection *)SSL_get_app_data(ssl);
+  bool reenabled;
+  int retval = 1;
+
+  // Do the common certificate lookup only once.  If we pause
+  // and restart processing, do not execute the common logic again
+  if (!netvc->calledHooks(TS_SSL_CERT_HOOK)) {
+    retval = set_context_cert(ssl);
+    if (retval != 1) {
+      goto done;
+    }
+  }
+
+  // Call the plugin SNI code
+  reenabled = netvc->callHooks(TS_SSL_SNI_HOOK);
+  // If it did not re-enable, return the code to
+  // stop the accept processing
+  if (!reenabled) {
+    retval = -1;
+  }
+
+done:
+  // Map 1 to SSL_TLSEXT_ERR_OK
+  // Map 0 to SSL_TLSEXT_ERR_ALERT_FATAL
+  // Map -1 to SSL_TLSEXT_ERR_READ_AGAIN, if present
+  switch (retval) {
+  case 1:
+    retval = SSL_TLSEXT_ERR_OK;
+    break;
+  case -1:
+#ifdef SSL_TLSEXT_ERR_READ_AGAIN
+    retval = SSL_TLSEXT_ERR_READ_AGAIN;
+#else
+    Error("Cannot pause SNI processsing with this version of openssl");
+    retval = SSL_TLSEXT_ERR_ALERT_FATAL;
+#endif
+    break;
+  case 0:
+  default:
+    retval = SSL_TLSEXT_ERR_ALERT_FATAL;
+    break;
+  }
+  return retval;
+}
+#endif
+#endif /* TS_USE_TLS_SNI */
+```
+
+```
+bool
+SSLNetVConnection::callHooks(TSHttpHookID eventId)
+{
+  // Only dealing with the SNI/CERT hook so far.
+  // TS_SSL_SNI_HOOK and TS_SSL_CERT_HOOK are the same value
+  ink_assert(eventId == TS_SSL_CERT_HOOK);
+
+  // First time through, set the type of the hook that is currently
+  // being invoked
+  if (this->sslHandshakeHookState == HANDSHAKE_HOOKS_PRE) {
+    this->sslHandshakeHookState = HANDSHAKE_HOOKS_CERT;
+  }
+
+  if (this->sslHandshakeHookState == HANDSHAKE_HOOKS_CERT && eventId == TS_SSL_CERT_HOOK) {
+    if (curHook != NULL) {
+      curHook = curHook->next();
+    } else {
+      curHook = ssl_hooks->get(TS_SSL_CERT_INTERNAL_HOOK);
+    }
+  } else {
+    // Not in the right state, or no plugins registered for this hook
+    // reenable and continue
+    return true;
+  }
+
+  bool reenabled = true;
+  SSLHandshakeHookState holdState = this->sslHandshakeHookState;
+  if (curHook != NULL) {
+    // Otherwise, we have plugin hooks to run
+    this->sslHandshakeHookState = HANDSHAKE_HOOKS_INVOKE;
+    curHook->invoke(eventId, this);
+    reenabled = (this->sslHandshakeHookState != HANDSHAKE_HOOKS_INVOKE);
+  }
+  this->sslHandshakeHookState = holdState;
+  return reenabled;
+}
+```
+
 ## 参考
 
   - [OpenSSL::SSL_accept](https://www.openssl.org/docs/manmaster/ssl/SSL_accept.html)
@@ -569,3 +828,4 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
   - [OpenSSL::SSL_connect](https://www.openssl.org/docs/manmaster/ssl/SSL_connect.html)
   - [OpenSSL::SSL_get_error](https://www.openssl.org/docs/manmaster/ssl/SSL_get_error.html)
   - [OpenSSL::SSL_CTX_set_verify](https://www.openssl.org/docs/manmaster/ssl/SSL_CTX_set_verify.html)
+  - [SSLUtils.cc](https://github.com/apache/trafficserver/blob/master/iocore/net/SSLUtils.cc)
