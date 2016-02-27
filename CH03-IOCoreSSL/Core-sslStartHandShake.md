@@ -617,7 +617,9 @@ ssl_set_handshake_callbacks(SSL_CTX *ctx)
 }
 ```
 
-下面分别是 ctx, ssl_cert_callback 和 ssl_servername_callback 两个回调函数，set_context_cert 方法是公共部分。
+下面分别是 ssl_cert_callback 和 ssl_servername_callback 两个回调函数，set_context_cert 方法是公共部分。
+
+set_context_cert 方法用来把
 
 ```
 source: SSLUtils.cc
