@@ -115,7 +115,8 @@ ProtocolProbeSessionAccept::mainEvent(int event, void *data)
     MIOBuffer *buf = NULL;
     IOBufferReader *reader = NULL;
     if (ssl_vc) {
-      // 如果是SSLVC，就设置iobuf和reader
+      // 如果是SSLVC，就从SSLVC获取iobuf和reader
+      // 在SSLVC的iobuf里存储了握手完成后读取到的第一部分数据的解密后的内容
       buf = ssl_vc->get_ssl_iobuf();
       reader = ssl_vc->get_ssl_reader();
     }
@@ -174,7 +175,10 @@ struct ProtocolProbeTrampoline : public Continuation, public ProtocolProbeSessio
                                    IOBufferReader *reader)
     : Continuation(mutex), probeParent(probe)
   {
-    // 继承或者创建独立的iobuf，用于读取第一个来自客户端的请求数据，这样可以判断客户端采用什么样的协议
+    // 如果SSLVC的客户端不支持NPN/ALPN协议，那么就会通过此处来判断具体的协议类型
+    // 对于 sslvc，传递进来的 buffer和reader 都来自 sslvc 的成员，则继承 buffer和reader
+    // 对于 netvc，传递进来的 buffer和reader 都是 NULL，则创建独立的 buffer和reader
+    // buffer和reader 用于读取第一个来自客户端的请求数据，这样可以判断客户端采用什么样的协议
     this->iobuf = buffer ? buffer : new_MIOBuffer(buffer_size_index);
     this->reader = reader ? reader : iobuf->alloc_reader(); // reader must be allocated only on a new MIOBuffer.
     // 设置回调函数为 ioCompletionEvent
@@ -309,7 +313,7 @@ proto_is_http2(IOBufferReader *reader)
 }
 ```
 
-## Free Mutex
+## 无锁设计 / Mutex Free
 
 ProtocolProbeSessionAccept 状态机的mutex在构造函数中设置为NULL，表示该状态机被回调时不需要加锁，可以被并发调用
 
@@ -367,7 +371,7 @@ ProtocolProbeSessionAccept 状态机的mutex在构造函数中设置为NULL，�
   }
 ```
 
-需要注意的是：
+总结：
 
   - ProtocolProbeSessionAccept 是：
     - 每个 TCP Port 创建一个
