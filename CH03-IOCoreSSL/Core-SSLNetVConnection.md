@@ -1,4 +1,4 @@
-# 核心组件 SSLNetVConnection
+# 核心组件：SSLNetVConnection
 
 SSLNetVConnection 继承自 UnixNetVConnection，在其基础上构建了对SSL会话的支持。
 
