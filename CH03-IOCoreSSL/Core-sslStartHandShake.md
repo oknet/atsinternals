@@ -81,14 +81,13 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
       // Attach the default SSL_CTX to this SSL session. The default context is never going to be able
       // to negotiate a SSL session, but it's enough to trampoline us into the SNI callback where we
       // can select the right server certificate.
-      // 使用缺省 context 初始化 ssl 成员
-      // 这里 lookup 在 find() 方法中设置了证书
-      // defaultContext() 的设置是不允许进行SSL会话的协商的 －－ 这句不太理解什么意思？？？
+      // 使用缺省 context 初始化 ssl 成员。
+      // defaultContext() 的设置是不允许进行SSL会话的协商的， －－ 这句不太理解什么意思？？？
+      // 但是可以触发 SNI Callback，这样就可以选择一个正确的 Server 端的证书。
       this->ssl = make_ssl_connection(lookup->defaultContext(), this);
 #if !(TS_USE_TLS_SNI)
-      // 初始化用于调试的 SSLTrace
-      // 在 openssl 1.0.2d 之后，支持 TLS SNI
-      // 但是在这个版本之前，就需要通过其它方法来trace一个SSL会话
+      // 如果当前 OpenSSL 的版本连基本的 TLS SNI Callback 都不支持的话，
+      // 就需要在这里初始化用于调试的 SSLTrace 状态
       // set SSL trace
       if (SSLConfigParams::ssl_wire_trace_enabled) {
         bool trace = computeSSLTrace();
@@ -132,9 +131,9 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
 
 ### sslServerHandShakeEvent 分析
 
-sslServerHandShakeEvent 主要实现了：
+sslServerHandShakeEvent 主要实现了对 SSL_accept 方法的封装：
 
-  - 在调用 SSL_accept 完成握手过程之前，触发 PreAcceptHook，
+  - 在调用 SSL_accept 之前，触发 PreAcceptHook，
   - 处理在 PreAcceptHook 中停留的状态，
   - 在完成 PreAcceptHook 之后，再通过 SSL_accept 完成握手过程
 
@@ -142,9 +141,11 @@ sslServerHandShakeEvent 主要实现了：
 
   - 会触发 SNI Callback 或者 CERT Callback，
   - 处理在 SNI/CERT Hook 中停留的状态，
-  - 在完成 SNI/CERT Hook 之后，再通过 SSL_accept 完成握手过程
+  - 在完成 SNI/CERT Hook 之后，再继续调用 SSL_accept 完成握手过程
 
 上面两处 Hook 的停留状态，都需要在 Hook 中调用 reenable 来触发对 sslServerHandShakeEvent 的再次调用，才能继续。
+
+需要注意的是，NetHandler在 读事件 和 写事件 时，都会回调 sslServerHandShakeEvent，因此在阅读代码时要同时考虑 读 和 写 两种情况的回调。
 
 ```
 int
