@@ -586,6 +586,23 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
     - 在 SSLParseCertificateConfiguration 方法加载完配置后，会创建一个 dest_ip=* 的记录，但是该记录没有证书。
     - 那么在找不到证书时，握手就无法建立。
 
+对 ssl_multicert.config 的加载和解析过程：
+
+  - SSLNetProcessor::start(int number_of_ssl_threads, size_t stacksize)
+    - SSLConfig::startup()
+      - 加载 SSL配置到 ConfigProcessor
+      - SSLConfig::reconfigure()
+      - SSLConfigParams *params = new SSLConfigParams;
+      - params->initialize();  // 这一行负责加载records.config中与SSL相关的配置
+      - 保存 params 到 ConfigProcessor
+    - SSLCertificateConfig::startup()
+      - 加载 ssl_multicert.config 里定义的证书信息到 ConfigProcessor
+      - SSLCertificateConfig::reconfigure()
+        - 声明 SSLConfig::scoped_config params;  // 构造函数从 ConfigProcessor 加载相关配置完成初始化
+        - 声明 SSLCertLookup *lookup = new SSLCertLookup();
+        - 调用 SSLParseCertificateConfiguration(params, lookup)
+        - 保存 lookup 到 ConfigProcessor
+
 SSLParseCertificateConfiguration 方法负责：
 
   - 解析 ssl_multicert.config 配置文件
@@ -600,7 +617,43 @@ ssl_store_ssl_context 方法负责
     - 将此证书设置为 SSLCertLookup 类型容器内的缺省证书
     - 同时调用 ssl_set_handshake_callbacks 方法，设置 SNI/CERT Hook 到 SSL 会话上
 
+注意，scoped_config 的定义有两处：
+
+  - SSLConfig::scoped_config
+    - 构造函数从 ConfigProcessor 获取 SSLConfigParams 类型的结构数据，完成初始化
+  - SSLCertificateConfig::scoped_config
+    - 构造函数从 ConfigProcessor 获取 SSLCertLookup 类型的结构数据，完成初始化
+
+```
+source: P_SSLConfig.h
+struct SSLConfig {
+  static void startup();
+  static void reconfigure();
+  static SSLConfigParams *acquire();
+  static void release(SSLConfigParams *params);
+
+  typedef ConfigProcessor::scoped_config<SSLConfig, SSLConfigParams> scoped_config;
+
+private:
+  static int configid;
+};
+
+struct SSLCertificateConfig {
+  static bool startup();
+  static bool reconfigure();
+  static SSLCertLookup *acquire();
+  static void release(SSLCertLookup *params);
+
+  typedef ConfigProcessor::scoped_config<SSLCertificateConfig, SSLCertLookup> scoped_config;
+
+private:
+  static int configid;
+};
+```
+
 ssl_set_handshake_callbacks 方法通过宏定义来判定使用哪个 OpenSSL 的API方法来设置 Hook 函数。
+
+需要注意的是，如果 TS_USE_TLS_SNI 为 0 的话，那么 ssl_set_handshake_callbacks 就是一个空函数。
 
 ```
 source: SSLUtils.cc
@@ -620,7 +673,16 @@ ssl_set_handshake_callbacks(SSL_CTX *ctx)
 
 下面分别是 ssl_cert_callback 和 ssl_servername_callback 两个回调函数，set_context_cert 方法是公共部分。
 
-set_context_cert 方法用来把
+同样，如果 TS_USE_TLS_SNI 为 0 的话，这三个方法就不会被定义出来：
+
+  - ssl_cert_callback
+    - 当 OpenSSL 版本大于等于 1.0.2d 的时候，采用Cert Callback
+  - ssl_servername_callback
+    - 否则，采用 SNI Callback
+  - set_context_cert
+    - 由上面两个方法调用，用来设置默认的SSL证书信息
+    - 首先根据 Server Name 在 SSLCertLookup 中查找，
+    - 如果找不到，再根据 IP 查找。
 
 ```
 source: SSLUtils.cc
