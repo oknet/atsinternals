@@ -1042,11 +1042,13 @@ verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
 
   SSLDebug("Entered verify cb");
   // 获取证书链中存在错误的位置
-  //     如果是 0 表示最末端的证书出现错误，表示前面的父级证书都没有错误
+  //     如果是 0 表示最末端的证书
+  //     如果是 1，2，... 表示签发此证书的父证书有错误
   depth = X509_STORE_CTX_get_error_depth(ctx);
   // 获取当前证书
   cert = X509_STORE_CTX_get_current_cert(ctx);
   // 获取错误信息
+  //     如果 err ＝ X509_V_OK ，此时 depth ＝ 0 表示最末端的证书验证通过
   err = X509_STORE_CTX_get_error(ctx);
 
   // 输入的参数 preverify_ok 如果为 0 表示证书链的验证已经失败了，
@@ -1058,7 +1060,7 @@ verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
   }
   if (depth != 0) {
     // Not server cert....
-    // 当父级证书出现错误的时候，我们不进行处理
+    // 如果出现这种情况说明：虽然没有出现证书验证错误，但是不存在末端证书
     return preverify_ok;
   }
   /*
