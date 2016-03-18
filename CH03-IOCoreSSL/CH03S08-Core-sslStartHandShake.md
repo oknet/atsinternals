@@ -209,6 +209,23 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     }
   }
 
+  ////////////
+  //
+  //  这里存在一个 SSL 的 bug：https://issues.apache.org/jira/browse/TS-4075，但是 Patch 还未经官方确认
+  //  情况是这样的：
+  //      如果在 SNI/CERT Hook 函数回调中，当前 SSLVC 的 SSL_accept 过程被挂起，
+  //          sslHandshakeHookState == HANDSHAKE_HOOKS_CERT 的状态
+  //      此时如果客户端关闭了 Socket 连接，那么 epoll_wait 就会发现 socket fd 可读
+  //          然后 NetHandler 调用了 net_read_io, 然后发现 SSL 握手未完成，
+  //          然后 net_read_io 调用了 ret = sslStartHandShake(SSL_EVENT_SERVER, err); 
+  //          然后 sslStartHandShake 调用了 sslServerHandShakeEvent ，就是当前函数
+  //          然后在调用 SSLAccept 之前，填充 BIO 缓冲区时，调用 read_raw_data 发现读到了 0 字节
+  //          这表示连接中断，返回了 EVENT_ERROR 给 net_read_io
+  //      net_read_io 发现遇到了 EVENT_ERROR，就把 SSLVC 給关闭了。
+  //      但是，此时 Plugin 还在处理中，等 Plugin 需要针对此 SSLVC 做动作时，就导致 ATS 崩溃了。
+  //
+  ////////////
+
   // If a blind tunnel was requested in the pre-accept calls, convert.
   // Again no data has been exchanged, so we can go directly
   // without data replay.
