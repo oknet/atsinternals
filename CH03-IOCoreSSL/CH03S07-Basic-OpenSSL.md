@@ -159,6 +159,14 @@ make_ssl_connection(SSL_CTX *ctx, SSLNetVConnection *netvc)
 
     // 保存当前的 netvc 的地址到 SSL 会话里
     //     相当于是 SSL 会话指回到 netvc 的反向指针
+    // SSL_set_app_data 是一个宏，相当于 SSL_set_ex_data(ssl, 0 /* ssl_client_data_index */, netvc);
+    // ssl_client_data_index 为 SSL_get_ex_new_index() 的返回值，
+    // 而 SSL_get_ex_new_index() 被 SSLInitClientContext() 调用，
+    // 而 SSLInitClientContext() 被 SSLNetProcessor::start() 调用，
+    // 而 SSL_get_ex_new_index() 只被调用了一次，因此 ssl_client_data_index 为 0
+    // 所以这里对于 ATS与OS之间的SSL连接 和 Client与ATS之间的SSL连接 ，可以使用：
+    //      SSL_set_app_data(ssl, netvc) 或 SSL_set_ex_data(ssl, ssl_client_data_index, netvc) 来设置netvc与SSL会话的关联
+    //      SSL_get_app_data(ssl) 或 SSL_get_ex_data(ssl, ssl_client_data_index) 来获取netvc与SSL会话的关联
     SSL_set_app_data(ssl, netvc);
   }
 
@@ -166,6 +174,8 @@ make_ssl_connection(SSL_CTX *ctx, SSLNetVConnection *netvc)
   return ssl;
 }
 ```
+
+感觉这里应该用 ssl_netvc_data_index 来代替 ssl_client_data_index 的命名，毕竟在 server 和 client 都使用了。
 
 # 参考资料
 
