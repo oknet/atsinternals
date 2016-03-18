@@ -225,6 +225,11 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
   //      但是，此时 Plugin 还在处理中，等 Plugin 需要针对此 SSLVC 做动作时，就导致 ATS 崩溃了。
   //
   ////////////
+  //
+  //  修复方案是当发现处于 sslHandshakeHookState == HANDSHAKE_HOOKS_CERT 状态时，返回 SSL_WAIT_FOR_HOOK，
+  //  这样就可以推迟 SSLVC 的关闭，这样等 Plugin 需要针对此 SSLVC 做动作时，就不会出现找不到 SSLVC 的情况。
+  //
+  ////////////
 
   // If a blind tunnel was requested in the pre-accept calls, convert.
   // Again no data has been exchanged, so we can go directly
