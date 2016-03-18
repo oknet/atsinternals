@@ -671,18 +671,26 @@ ssl_set_handshake_callbacks(SSL_CTX *ctx)
 }
 ```
 
-下面分别是 ssl_cert_callback 和 ssl_servername_callback 两个回调函数，set_context_cert 方法是公共部分。
-
-同样，如果 TS_USE_TLS_SNI 为 0 的话，这三个方法就不会被定义出来：
+下面分别是 ssl_cert_callback 和 ssl_servername_callback 两个回调函数：
 
   - ssl_cert_callback
     - 当 OpenSSL 版本大于等于 1.0.2d 的时候，采用Cert Callback
   - ssl_servername_callback
     - 否则，采用 SNI Callback
+  - 这两个回调函数都需要确保必须调用，且只调用一次 set_context_cert 方法
+    - 因为 set_context_cert 方法用来设置缺省的证书还有通信加密算法
+    - 而且由于 SNI/CERT Hook 功能的存在，这两个回调函数，可能会被多次回调
+  - 然后再回调 SNI/CERT Hook
+
+而 set_context_cert 方法是两个回调函数的公共部分：
+
   - set_context_cert
     - 由上面两个方法调用，用来设置默认的SSL证书信息
     - 首先根据 Server Name 在 SSLCertLookup 中查找，
     - 如果找不到，再根据 IP 查找。
+
+同样，如果 TS_USE_TLS_SNI 为 0 的话，上面这三个方法就不会被定义出来。
+
 
 ```
 source: SSLUtils.cc
@@ -693,13 +701,16 @@ set_context_cert(SSL *ssl)
   SSL_CTX *ctx = NULL;
   SSLCertContext *cc = NULL;
   SSLCertificateConfig::scoped_config lookup;
+  // 获取 SNI
   const char *servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
   SSLNetVConnection *netvc = (SSLNetVConnection *)SSL_get_app_data(ssl);
   bool found = true;
+  // 返回值默认为 1 表示成功
   int retval = 1;
 
   Debug("ssl", "set_context_cert ssl=%p server=%s handshake_complete=%d", ssl, servername, netvc->getSSLHandShakeComplete());
   // set SSL trace (we do this a little later in the USE_TLS_SNI case so we can get the servername
+  // 设置 SSL Trace
   if (SSLConfigParams::ssl_wire_trace_enabled) {
     bool trace = netvc->computeSSLTrace();
     Debug("ssl", "sslnetvc. setting trace to=%s", trace ? "true" : "false");
@@ -707,6 +718,14 @@ set_context_cert(SSL *ssl)
   }
 
   // catch the client renegotiation early on
+  // 处理 CVE-2011-1473 客户端发起的 SSL 重协商漏洞
+  //     该问题是由于SSL协议的客观因素引起的。
+  //     因为服务器在进行密钥的计算时，其消耗的计算资源是客户端的数十倍
+  //     所以如果可以允许客户端主动发起Renegotiation，那么将可以造成DoS攻击。
+  // 参考：
+  //     TS-1467: Disable client initiated renegotiation (SSL) DDoS by default
+  //     Github: https://github.com/apache/trafficserver/commit/d43b5d685e55795a755413b92d3a8827b86c4a03
+  // 该问题的修补不只有这一处，因此需要整体参考github上的补丁
   if (SSLConfigParams::ssl_allow_client_renegotiation == false && netvc->getSSLHandShakeComplete()) {
     Debug("ssl", "set_context_cert trying to renegotiate from the client");
     retval = 0; // Error
@@ -716,19 +735,23 @@ set_context_cert(SSL *ssl)
   // The incoming SSL_CTX is either the one mapped from the inbound IP address or the default one. If we
   // don't find a name-based match at this point, we *do not* want to mess with the context because we've
   // already made a best effort to find the best match.
+  // 查找与该 SNI 匹配的 SSL_CTX 设置
   if (likely(servername)) {
     cc = lookup->find((char *)servername);
     if (cc && cc->ctx)
       ctx = cc->ctx;
+    // 开启了Tunnel功能，那么就直接透传
     if (cc && SSLCertContext::OPT_TUNNEL == cc->opt && netvc->get_is_transparent()) {
       netvc->attributes = HttpProxyPort::TRANSPORT_BLIND_TUNNEL;
       netvc->setSSLHandShakeComplete(true);
+      // 返回 -1 表示挂起 SSL 握手过程
       retval = -1;
       goto done;
     }
   }
 
   // If there's no match on the server name, try to match on the peer address.
+  // 当通过 SNI 无法找到匹配的 SSL_CTX 时，使用 IP 再次查找
   if (ctx == NULL) {
     IpEndpoint ip;
     int namelen = sizeof(ip);
@@ -737,12 +760,16 @@ set_context_cert(SSL *ssl)
     cc = lookup->find(ip);
     if (cc && cc->ctx)
       ctx = cc->ctx;
+    // 此处没有对 Tunnel 进行判断，因为这里是到了 SNI/CERT Callback，
+    // 而根据 IP 进行判断是否要做 Tunnel 没必要在这么靠后的位置。
   }
 
+  // 如果匹配成功，就要把 SSL_CTX 设置到当前的 SSL 会话上
   if (ctx != NULL) {
     SSL_set_SSL_CTX(ssl, ctx);
 #if HAVE_OPENSSL_SESSION_TICKETS
     // Reset the ticket callback if needed
+    // 如果支持 Session Ticket，还要设置 Session Ticket Callback
     SSL_CTX_set_tlsext_ticket_key_cb(ctx, ssl_callback_session_ticket);
 #endif
   } else {
@@ -752,7 +779,9 @@ set_context_cert(SSL *ssl)
   ctx = SSL_get_SSL_CTX(ssl);
   Debug("ssl", "ssl_cert_callback %s SSL context %p for requested name '%s'", found ? "found" : "using", ctx, servername);
 
+  // 如果当前的 SSL 会话没有 SSL_CTX，那么就要返回错误
   if (ctx == NULL) {
+    // 返回值为 0 表示错误
     retval = 0;
     goto done;
   }
@@ -776,6 +805,7 @@ ssl_cert_callback(SSL *ssl, void * /*arg*/)
 
   // Do the common certificate lookup only once.  If we pause
   // and restart processing, do not execute the common logic again
+  // 确保必须执行，而且只执行一次 set_context_cert 方法
   if (!netvc->calledHooks(TS_SSL_CERT_HOOK)) {
     retval = set_context_cert(ssl);
     if (retval != 1) {
@@ -784,9 +814,11 @@ ssl_cert_callback(SSL *ssl, void * /*arg*/)
   }
 
   // Call the plugin cert code
+  // 回调 SNI/CERT Hook
   reenabled = netvc->callHooks(TS_SSL_CERT_HOOK);
   // If it did not re-enable, return the code to
   // stop the accept processing
+  // 根据返回值来确认是否要挂起握手过程
   if (!reenabled) {
     retval = -1; // Pause
   }
@@ -804,6 +836,7 @@ ssl_servername_callback(SSL *ssl, int * /* ad */, void * /*arg*/)
 
   // Do the common certificate lookup only once.  If we pause
   // and restart processing, do not execute the common logic again
+  // 确保必须执行，而且只执行一次 set_context_cert 方法
   if (!netvc->calledHooks(TS_SSL_CERT_HOOK)) {
     retval = set_context_cert(ssl);
     if (retval != 1) {
@@ -812,9 +845,11 @@ ssl_servername_callback(SSL *ssl, int * /* ad */, void * /*arg*/)
   }
 
   // Call the plugin SNI code
+  // 回调 SNI/CERT Hook
   reenabled = netvc->callHooks(TS_SSL_SNI_HOOK);
   // If it did not re-enable, return the code to
   // stop the accept processing
+  // 根据返回值来确认是否要挂起握手过程
   if (!reenabled) {
     retval = -1;
   }
@@ -823,6 +858,8 @@ done:
   // Map 1 to SSL_TLSEXT_ERR_OK
   // Map 0 to SSL_TLSEXT_ERR_ALERT_FATAL
   // Map -1 to SSL_TLSEXT_ERR_READ_AGAIN, if present
+  // 由于早期版本的 OpenSSL API 的返回值是一组宏定义
+  // 因此下面的代码做一下简单的翻译工作
   switch (retval) {
   case 1:
     retval = SSL_TLSEXT_ERR_OK;
@@ -846,6 +883,19 @@ done:
 #endif /* TS_USE_TLS_SNI */
 ```
 
+## SNI/CERT Hook 的回调
+
+在 SSLVC 中，PRE ACCEPT Hook 与 SNI/CERT Hook 的回调处理都是特殊的方式。
+
+在 sslServerHandShakeEvent 中已经介绍了 PRE ACCEPT Hook 的回调，下面是对 SNI/CERT Hook 的回调进行分析。
+
+抵达 callHooks 方法的调用栈如下：
+
+  - SSLAccept()
+    - SSL_accept()
+      - ssl_servername_callback() / ssl_cert_callback()
+        - callHooks()
+
 ```
 bool
 SSLNetVConnection::callHooks(TSHttpHookID eventId)
@@ -856,32 +906,79 @@ SSLNetVConnection::callHooks(TSHttpHookID eventId)
 
   // First time through, set the type of the hook that is currently
   // being invoked
+  // 将 SNI/CERT Hook 的状态由“初始状态”修改“中间状态”
   if (this->sslHandshakeHookState == HANDSHAKE_HOOKS_PRE) {
     this->sslHandshakeHookState = HANDSHAKE_HOOKS_CERT;
   }
 
+  // 只有“中间状态”时才设置 Hook 函数
+  // 如果有多个 Plugin 都 Hook 在 SNI/CERT 处理上时，
+  //     Hook 函数就是一个链表，需要一个一个的按照顺序回调
   if (this->sslHandshakeHookState == HANDSHAKE_HOOKS_CERT && eventId == TS_SSL_CERT_HOOK) {
     if (curHook != NULL) {
+      // 如果之前已经设置过，那么就取下一个 Hook 函数
       curHook = curHook->next();
     } else {
+      // 如果之前没有设置过，那么就获取第一个 Hook 函数
       curHook = ssl_hooks->get(TS_SSL_CERT_INTERNAL_HOOK);
     }
   } else {
     // Not in the right state, or no plugins registered for this hook
     // reenable and continue
+    // 状态不正确，或者没有plugin注册这个 Hook 点
     return true;
   }
 
+  // 如果 curHook 不为空，则发起对 Hook 函数的调用
   bool reenabled = true;
   SSLHandshakeHookState holdState = this->sslHandshakeHookState;
   if (curHook != NULL) {
     // Otherwise, we have plugin hooks to run
     this->sslHandshakeHookState = HANDSHAKE_HOOKS_INVOKE;
+    // TS_SSL_CERT_HOOK 是最奇葩的 Hook 了，它没有自己的 TS_EVENT_xxxx_HOOK 值
     curHook->invoke(eventId, this);
+    // 如果在 Hook 函数中调用了 TSVConnReenable(ssl_vc)，那么就会间接调用了 ssl_vc->reenable(ssl_vc->nh)
+    // 在 reenbale 中如果判断所有的 Hook 函数都执行完了，那么就会设置为 HANDSHAKE_HOOKS_DONE 的状态
+    // 只有此时 reenabled 才会为 true
     reenabled = (this->sslHandshakeHookState != HANDSHAKE_HOOKS_INVOKE);
   }
   this->sslHandshakeHookState = holdState;
+  // 如果 reenabled 为 true 表示不需要挂起 SSL_accept 过程
+  // 否则就会在 SSL_accept 过程中挂起，直到 SSL_accept 被再次调用，然后回调本函数
+  // 本函数返回 true 才会让 SSL_accept 过程完成。
   return reenabled;
+}
+```
+
+需要注意 SSLNetVConnection::reenable() 方法是多态的，下面这个才是 TSAPI TSVConnReenable(ssl_vc) 调用的那个：
+
+```
+void
+SSLNetVConnection::reenable(NetHandler *nh)
+{
+  if (this->sslPreAcceptHookState != SSL_HOOKS_DONE) {
+    this->sslPreAcceptHookState = SSL_HOOKS_INVOKE;
+    this->readReschedule(nh);
+  } else {
+    // Reenabling from the handshake callback
+    //
+    // Originally, we would wait for the callback to go again to execute additinonal
+    // hooks, but since the callbacks are associated with the context and the context
+    // can be replaced by the plugin, it didn't seem reasonable to assume that the
+    // callback would be executed again.  So we walk through the rest of the hooks
+    // here in the reenable.
+    if (curHook != NULL) {
+      curHook = curHook->next();
+      if (curHook != NULL) {
+        // Invoke the hook
+        curHook->invoke(TS_SSL_CERT_HOOK, this);
+      }
+    }
+    if (curHook == NULL) {
+      this->sslHandshakeHookState = HANDSHAKE_HOOKS_DONE;
+      this->readReschedule(nh);
+    }
+  }
 }
 ```
 
