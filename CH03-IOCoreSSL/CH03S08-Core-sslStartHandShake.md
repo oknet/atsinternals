@@ -129,6 +129,8 @@ SSLNetVConnection::sslStartHandShake(int event, int &err)
 }
 ```
 
+## ATS作为SSL Server时的握手过程
+
 ### sslServerHandShakeEvent 分析
 
 sslServerHandShakeEvent 主要实现了对 SSL_accept 方法的封装：
@@ -461,130 +463,7 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
 }
 ```
 
-### sslClientHandShakeEvent 分析
-
-sslClientHandShakeEvent 主要实现了：
-
-  - ATS 作为 SSL Client 向 OServer 发起一个 SSL Handshake 的功能
-  
-```
-int
-SSLNetVConnection::sslClientHandShakeEvent(int &err)
-{
-#if TS_USE_TLS_SNI
-  // 对 SNI 功能的支持
-  if (options.sni_servername) {
-    if (SSL_set_tlsext_host_name(ssl, options.sni_servername)) {
-      Debug("ssl", "using SNI name '%s' for client handshake", options.sni_servername.get());
-    } else {
-      Debug("ssl.error", "failed to set SNI name '%s' for client handshake", options.sni_servername.get());
-      SSL_INCREMENT_DYN_STAT(ssl_sni_name_set_failure);
-    }
-  }
-#endif
-
-  // 在 SSLInitClientContext 方法中，初始化了 ssl_client_data_index，
-  //     用来在 SSL 会话描述符中申请一个内存块，此index表示内存块的编号，
-  //     对于可以通过此index值来存／取该内存块的数据，
-  //     在 SSL 会话描述符中有多个这样的内存块，可以存储应用层的数据
-  // 在 ATS 中，利用这个特性，把 SSLVC 的实例内存地址（this）存储到了 SSL 会话描述符中
-  SSL_set_ex_data(ssl, get_ssl_client_data_index(), this);
-  // 向 OServer 发起 SSL Handshake，SSLConnect 是对 SSL_connect 的封装
-  ssl_error_t ssl_error = SSLConnect(ssl);
-  // SSL 跟踪调试状态
-  bool trace = getSSLTrace();
-  Debug("ssl", "trace=%s", trace ? "TRUE" : "FALSE");
-
-  // 根据 SSLConnect 的返回值 ssl_error 进行错误处理
-  switch (ssl_error) {
-  // SSL_ERROR_NONE 表示没有错误
-  case SSL_ERROR_NONE:
-    // 输出调试信息
-    if (is_debug_tag_set("ssl")) {
-      X509 *cert = SSL_get_peer_certificate(ssl);
-
-      Debug("ssl", "SSL client handshake completed successfully");
-      // if the handshake is complete and write is enabled reschedule the write
-      // 为何在开启了调试信息时要做 writeReschedule ？？？
-      if (closed == 0 && write.enabled)
-        writeReschedule(nh);
-      if (cert) {
-        debug_certificate_name("server certificate subject CN is", X509_get_subject_name(cert));
-        debug_certificate_name("server certificate issuer CN is", X509_get_issuer_name(cert));
-        X509_free(cert);
-      }
-    }
-    SSL_INCREMENT_DYN_STAT(ssl_total_success_handshake_count_out_stat);
-
-    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake completed successfully");
-    // do we want to include cert info in trace?
-
-    // 设置握手完成
-    sslHandShakeComplete = true;
-    return EVENT_DONE;
-
-  // 下面是其它错误情况的处理
-  case SSL_ERROR_WANT_WRITE:
-    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_WANT_WRITE");
-    SSL_INCREMENT_DYN_STAT(ssl_error_want_write);
-    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_WRITE");
-    return SSL_HANDSHAKE_WANT_WRITE;
-
-  case SSL_ERROR_WANT_READ:
-    SSL_INCREMENT_DYN_STAT(ssl_error_want_read);
-    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_WANT_READ");
-    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_READ");
-    return SSL_HANDSHAKE_WANT_READ;
-
-  case SSL_ERROR_WANT_X509_LOOKUP:
-    SSL_INCREMENT_DYN_STAT(ssl_error_want_x509_lookup);
-    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_WANT_X509_LOOKUP");
-    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_X509_LOOKUP");
-    break;
-
-  case SSL_ERROR_WANT_ACCEPT:
-    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_ACCEPT");
-    return SSL_HANDSHAKE_WANT_ACCEPT;
-
-  case SSL_ERROR_WANT_CONNECT:
-    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_CONNECT");
-    break;
-
-  case SSL_ERROR_ZERO_RETURN:
-    SSL_INCREMENT_DYN_STAT(ssl_error_zero_return);
-    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, EOS");
-    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake EOS");
-    return EVENT_ERROR;
-
-  case SSL_ERROR_SYSCALL:
-    err = errno;
-    SSL_INCREMENT_DYN_STAT(ssl_error_syscall);
-    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, syscall");
-    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake Syscall Error: %s", strerror(errno));
-    return EVENT_ERROR;
-    break;
-
-  case SSL_ERROR_SSL:
-  default: {
-    err = errno;
-    // FIXME -- This triggers a retry on cases of cert validation errors....
-    Debug("ssl", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_SSL");
-    SSL_CLR_ERR_INCR_DYN_STAT(this, ssl_error_ssl, "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_SSL errno=%d", errno);
-    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_SSL");
-    char buf[512];
-    unsigned long e = ERR_peek_last_error();
-    ERR_error_string_n(e, buf, sizeof(buf));
-    TraceIn(trace, get_remote_addr(), get_remote_port(),
-            "SSL client handshake ERROR_SSL: sslErr=%d, ERR_get_error=%ld (%s) errno=%d", ssl_error, e, buf, errno);
-    return EVENT_ERROR;
-    }
-    break;
-  }
-  return EVENT_CONT;
-}
-```
-
-## SNI/CERT Hook 的实现
+### SNI/CERT Hook 的实现
 
 在上面的 sslServerHandShakeEvent 分析中，并未看到 SNI/CERT Hook 的实现部分，只看到了 PreAccept Hook 的实现，那么 SNI/CERT Hook 是如何实现的呢？
 
@@ -905,7 +784,7 @@ done:
 #endif /* TS_USE_TLS_SNI */
 ```
 
-## SNI/CERT Hook 的回调
+### SNI/CERT Hook 的回调
 
 在 SSLVC 中，PRE ACCEPT Hook 与 SNI/CERT Hook 的回调处理都是特殊的方式。
 
@@ -1004,7 +883,230 @@ SSLNetVConnection::reenable(NetHandler *nh)
 }
 ```
 
-## 参考
+## ATS作为SSL Client时的握手过程
+
+首先简单说一下 SSLInitClientContext() , 在该方法中：
+
+  - 设置了 SSL 协议的版本
+    - SSL_CTX_set_options(client_ctx, params->ssl_client_ctx_protocols)
+  - 设置了加密算法
+    - SSL_CTX_set_cipher_list(client_ctx, params->client_cipherSuite)
+  - 设置了 verify_callback 函数
+    - SSL_CTX_set_verify(client_ctx, SSL_VERIFY_PEER, verify_callback)
+    - 在需要对 OServer 的证书进行验证时，通过这个 verify_callback 进行验证
+    - SSL_CTX_set_verify_depth(client_ctx, params->client_verify_depth)
+    - 证书链存在时，还可以指定验证的深度
+  - 如果设置了向OServer提供客户端证书的功能
+    - SSL_CTX_use_certificate_chain_file(client_ctx, params->clientCertPath)
+    - SSL_CTX_use_PrivateKey_file(client_ctx, clientKeyPtr, SSL_FILETYPE_PEM)
+    - SSL_CTX_check_private_key(client_ctx)
+    - 加载客户端证书，加载客户端私钥，验证客户端证书和私钥的匹配性
+  - 初始化了 ssl_client_data_index
+    - 用来在 SSL 会话描述符中申请一个内存块，此index表示内存块的编号
+    - 对于可以通过此index值来存／取该内存块的数据
+    - 在 SSL 会话描述符中有多个这样的内存块，可以存储应用层的数据
+    - 参考：https://www.mail-archive.com/openssl-users@openssl.org/msg52326.html
+
+SSLInitClientContext() 被 SSLNetProcessor::start() 调用，因此在 ET_SSL 启动之前就完成了初始化设置。
+
+### sslClientHandShakeEvent 分析
+
+sslClientHandShakeEvent 主要实现了：
+
+  - ATS 作为 SSL Client 向 OServer 发起一个 SSL Handshake 的功能
+  
+```
+int
+SSLNetVConnection::sslClientHandShakeEvent(int &err)
+{
+#if TS_USE_TLS_SNI
+  // 对 SNI 功能的支持
+  if (options.sni_servername) {
+    if (SSL_set_tlsext_host_name(ssl, options.sni_servername)) {
+      Debug("ssl", "using SNI name '%s' for client handshake", options.sni_servername.get());
+    } else {
+      Debug("ssl.error", "failed to set SNI name '%s' for client handshake", options.sni_servername.get());
+      SSL_INCREMENT_DYN_STAT(ssl_sni_name_set_failure);
+    }
+  }
+#endif
+
+  // 在 ATS 中，利用 ex_data 这个功能，把 SSLVC 的实例内存地址（this）存储到了 SSL 会话描述符中
+  SSL_set_ex_data(ssl, get_ssl_client_data_index(), this);
+  // 向 OServer 发起 SSL Handshake，SSLConnect 是对 SSL_connect 的封装
+  ssl_error_t ssl_error = SSLConnect(ssl);
+  // SSL 跟踪调试状态
+  bool trace = getSSLTrace();
+  Debug("ssl", "trace=%s", trace ? "TRUE" : "FALSE");
+
+  // 根据 SSLConnect 的返回值 ssl_error 进行错误处理
+  switch (ssl_error) {
+  // SSL_ERROR_NONE 表示没有错误
+  case SSL_ERROR_NONE:
+    // 输出调试信息
+    if (is_debug_tag_set("ssl")) {
+      X509 *cert = SSL_get_peer_certificate(ssl);
+
+      Debug("ssl", "SSL client handshake completed successfully");
+      // if the handshake is complete and write is enabled reschedule the write
+      // 为何在开启了调试信息时要做 writeReschedule ？？？
+      if (closed == 0 && write.enabled)
+        writeReschedule(nh);
+      if (cert) {
+        debug_certificate_name("server certificate subject CN is", X509_get_subject_name(cert));
+        debug_certificate_name("server certificate issuer CN is", X509_get_issuer_name(cert));
+        X509_free(cert);
+      }
+    }
+    SSL_INCREMENT_DYN_STAT(ssl_total_success_handshake_count_out_stat);
+
+    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake completed successfully");
+    // do we want to include cert info in trace?
+
+    // 设置握手完成
+    sslHandShakeComplete = true;
+    return EVENT_DONE;
+
+  // 下面是其它错误情况的处理
+  case SSL_ERROR_WANT_WRITE:
+    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_WANT_WRITE");
+    SSL_INCREMENT_DYN_STAT(ssl_error_want_write);
+    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_WRITE");
+    return SSL_HANDSHAKE_WANT_WRITE;
+
+  case SSL_ERROR_WANT_READ:
+    SSL_INCREMENT_DYN_STAT(ssl_error_want_read);
+    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_WANT_READ");
+    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_READ");
+    return SSL_HANDSHAKE_WANT_READ;
+
+  case SSL_ERROR_WANT_X509_LOOKUP:
+    SSL_INCREMENT_DYN_STAT(ssl_error_want_x509_lookup);
+    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_WANT_X509_LOOKUP");
+    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_X509_LOOKUP");
+    break;
+
+  case SSL_ERROR_WANT_ACCEPT:
+    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_ACCEPT");
+    return SSL_HANDSHAKE_WANT_ACCEPT;
+
+  case SSL_ERROR_WANT_CONNECT:
+    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake ERROR_WANT_CONNECT");
+    break;
+
+  case SSL_ERROR_ZERO_RETURN:
+    SSL_INCREMENT_DYN_STAT(ssl_error_zero_return);
+    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, EOS");
+    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake EOS");
+    return EVENT_ERROR;
+
+  case SSL_ERROR_SYSCALL:
+    err = errno;
+    SSL_INCREMENT_DYN_STAT(ssl_error_syscall);
+    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, syscall");
+    TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL client handshake Syscall Error: %s", strerror(errno));
+    return EVENT_ERROR;
+    break;
+
+  case SSL_ERROR_SSL:
+  default: {
+    err = errno;
+    // FIXME -- This triggers a retry on cases of cert validation errors....
+    Debug("ssl", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_SSL");
+    SSL_CLR_ERR_INCR_DYN_STAT(this, ssl_error_ssl, "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_SSL errno=%d", errno);
+    Debug("ssl.error", "SSLNetVConnection::sslClientHandShakeEvent, SSL_ERROR_SSL");
+    char buf[512];
+    unsigned long e = ERR_peek_last_error();
+    ERR_error_string_n(e, buf, sizeof(buf));
+    TraceIn(trace, get_remote_addr(), get_remote_port(),
+            "SSL client handshake ERROR_SSL: sslErr=%d, ERR_get_error=%ld (%s) errno=%d", ssl_error, e, buf, errno);
+    return EVENT_ERROR;
+    }
+    break;
+  }
+  return EVENT_CONT;
+}
+```
+
+### OServer 证书的验证过程
+
+```
+source: SSLClientUtils.cc
+int
+verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+  X509 *cert;
+  int depth;
+  int err;
+  SSL *ssl;
+
+  SSLDebug("Entered verify cb");
+  // 获取证书链中存在错误的位置
+  //     如果是 0 表示最末端的证书出现错误，表示前面的父级证书都没有错误
+  depth = X509_STORE_CTX_get_error_depth(ctx);
+  // 获取当前证书
+  cert = X509_STORE_CTX_get_current_cert(ctx);
+  // 获取错误信息
+  err = X509_STORE_CTX_get_error(ctx);
+
+  // 输入的参数 preverify_ok 如果为 0 表示证书链的验证已经失败了，
+  // 因此就没必要进行 SNI 或 IP 的验证了
+  if (!preverify_ok) {
+    // Don't bother to check the hostname if we failed openssl's verification
+    SSLDebug("verify error:num=%d:%s:depth=%d", err, X509_verify_cert_error_string(err), depth);
+    return preverify_ok;
+  }
+  if (depth != 0) {
+    // Not server cert....
+    // 当父级证书出现错误的时候，我们不进行处理
+    return preverify_ok;
+  }
+  /*
+   * Retrieve the pointer to the SSL of the connection currently treated
+   * and the application specific data stored into the SSL object.
+   */
+  // 从 SSL_CTX 对象里获取 SSL 对象
+  ssl = static_cast<SSL *>(X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx()));
+  // 再从 SSL 对象里获取 SSLVC 对象
+  SSLNetVConnection *netvc = static_cast<SSLNetVConnection *>(SSL_get_ex_data(ssl, ssl_client_data_index));
+  // 只对 SSLNetVConnection 进行证书验证
+  if (netvc != NULL) {
+    // Match SNI if present
+    // 如果向 OServer 发起请求时，填写了 SNI，那么就需要验证 SNI 与 证书的匹配关系
+    if (netvc->options.sni_servername) {
+      char *matched_name = NULL;
+      // 函数 validate_hostname() 在 lib/ts/X509HostnameValidator.cc 中定义
+      if (validate_hostname(cert, reinterpret_cast<unsigned char *>(netvc->options.sni_servername.get()), false, &matched_name)) {
+        SSLDebug("Hostname %s verified OK, matched %s", netvc->options.sni_servername.get(), matched_name);
+        ats_free(matched_name);
+        // 验证通过返回
+        return preverify_ok;
+      }
+      SSLDebug("Hostname verification failed for (%s)", netvc->options.sni_servername.get());
+    }
+    // Otherwise match by IP
+    // 没有填写 SNI，那么就验证 IP 与证书的匹配关系
+    else {
+      char buff[INET6_ADDRSTRLEN];
+      // 把 IP 转换为字符串
+      ats_ip_ntop(netvc->server_addr, buff, INET6_ADDRSTRLEN);
+      if (validate_hostname(cert, reinterpret_cast<unsigned char *>(buff), true, NULL)) {
+        SSLDebug("IP %s verified OK", buff);
+        // 验证通过返回
+        return preverify_ok;
+      }
+      SSLDebug("IP verification failed for (%s)", buff);
+    }
+    // SNI 和 IP 的验证都没有成功，返回 0 表示验证失败
+    return 0;
+  }
+  
+  // 如果不是 SSLVC，直接返回验证成功
+  return preverify_ok;
+}
+```
+
+# 参考
 
   - [OpenSSL::SSL_accept](https://www.openssl.org/docs/manmaster/ssl/SSL_accept.html)
   - [OpenSSL::SSL_get_rbio](https://www.openssl.org/docs/manmaster/ssl/SSL_get_rbio.html)
@@ -1013,3 +1115,4 @@ SSLNetVConnection::reenable(NetHandler *nh)
   - [OpenSSL::SSL_get_error](https://www.openssl.org/docs/manmaster/ssl/SSL_get_error.html)
   - [OpenSSL::SSL_CTX_set_verify](https://www.openssl.org/docs/manmaster/ssl/SSL_CTX_set_verify.html)
   - [SSLUtils.cc](https://github.com/apache/trafficserver/blob/master/iocore/net/SSLUtils.cc)
+  - [SSLClientUtils.cc](https://github.com/apache/trafficserver/blob/master/iocore/net/SSLClientUtils.cc)
