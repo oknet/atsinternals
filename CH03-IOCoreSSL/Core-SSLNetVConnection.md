@@ -447,10 +447,11 @@ extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
 
 由于是子状态，就要有一个切入点，这个切入点，就在：
 
-  - net_read_io
-  - load_buffer_and_write
+  - vc->net_read_io
+  - write_to_net(vc), write_to_net_io(vc)
+    - vc->load_buffer_and_write
 
-如果还记得 NetHandler::mainNetEvent 部分是如何调用上面的两个方法的吗？
+还记得 NetHandler::mainNetEvent 部分是如何调用上面的两个方法的吗？
 
 ```
   // UnixNetVConnection *
@@ -494,8 +495,8 @@ extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
 
   - 在读取 socket fd 到 MIOBuffer 的时候，调用的：
     - vc->net_read_io(this, trigger_event->ethread);
-      - 这是一个 netvc 的成员方法，但是被重载了
-    - 在 net_read_io 中调用了 ssl_read_from_net(this, lthread, r);
+      - 这是一个 netvc 的成员方法，但是在sslvc中被重载了
+    - 在 sslvc->net_read_io 中调用了 ssl_read_from_net(this, lthread, r);
       - 这不是一个 netvc 的成员方法
     - 在 ssl_read_from_net 中调用了 SSLReadBuffer 方法
     - 在 SSLReadBuffer 中调用了 OpenSSL API 的 SSL_read(ssl, buf, (int)nbytes); 实现了读取并解密的操作
@@ -508,12 +509,15 @@ extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
     - 在 vc->load_buffer_and_write 中调用了 SSLWriteBuffer 方法
     - 在 SSLWriteBuffer 中调用了 OpenSSL API 的 SSL_write(ssl, buf, (int)nbytes); 实现了发送并加密的操作
 
-我们看到整个读取过程，基本都被 SSLNetVConnection 重载过了，发送过程则只有后半部分被重载。
+我们看到：
+
+  - 数据读取过程，基本都被 SSLNetVConnection 重载过了
+  - 而数据发送过程则只有后半部分被重载
 
 而 SSL/TLS 的握手过程则在 net_read_io 和 write_to_net_io 中进行了处理：
 
-  - write_to_net_io 虽然没有被重载，但是在 UnixNetVConnection 中已经做了一个判断
-  - 由于 SSL/TLS 的发起方，不一定必须是 客户端，所以，要在读写两个方向上都要进行握手的判断和处理
+  - write_to_net_io 不是 netvc 的成员函数，无法被 sslvc 重载，但是在编写时已经对 SSLVC 做了一个判断
+  - 当 OpenSSL 遇到 WANT_WRITE 等错误状态时，就需要等待 socket fd 可写
 
 由于 SSL/TLS 的握手过程和数据传输过程是完全不同的，所以：
 
