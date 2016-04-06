@@ -443,9 +443,9 @@ extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
 
 这样的好处，可以让 HttpSM 在处理 HTTPS 协议时使用 SSLNetVConnection，与处理 HTTP 协议时使用 UnixNetVConnection 是完全一样的。
 
-于是 SSLNetVConnection 就诞生了，但是 SSL/TLS 的处理实际上是一个子状态，在 UnixNetVConnection 上扩展了一堆的方法来实现这个子状态。
+于是 SSLNetVConnection 就诞生了，但是 SSL/TLS 的处理实际上是一个子状态机，它有两个状态：握手状态和数据通信状态。在 UnixNetVConnection 上重载、扩展了一堆的方法来实现这个子状态机。
 
-由于是子状态，就要有一个切入点，这个切入点，就在：
+由于是子状态机，就要有一个切入点，这个切入点，就在：
 
   - vc->net_read_io
   - write_to_net(vc), write_to_net_io(vc)
@@ -500,13 +500,13 @@ extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
       - 这不是一个 netvc 的成员方法
     - 在 ssl_read_from_net 中调用了 SSLReadBuffer 方法
     - 在 SSLReadBuffer 中调用了 OpenSSL API 的 SSL_read(ssl, buf, (int)nbytes); 实现了读取并解密的操作
-  - 但是在将 MIOBuffer 写入 socket fd 的时候，调用的：
+  - 在将 MIOBuffer 写入 socket fd 的时候，调用的：
     - write_to_net(this, vc, trigger_event->ethread);
       - 这不是一个 netvc 的成员方法
       - 事实上是直接调用了 write_to_net_io(nh, vc, thread);
     - 在 write_to_net_io 中调用了vc->load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
-      - 这是一个 netvc 的成员方法，但是被重载了
-    - 在 vc->load_buffer_and_write 中调用了 SSLWriteBuffer 方法
+      - 这是一个 netvc 的成员方法，但是在sslvc中被重载了
+    - 在 sslvc->load_buffer_and_write 中调用了 SSLWriteBuffer 方法
     - 在 SSLWriteBuffer 中调用了 OpenSSL API 的 SSL_write(ssl, buf, (int)nbytes); 实现了发送并加密的操作
 
 我们看到：
