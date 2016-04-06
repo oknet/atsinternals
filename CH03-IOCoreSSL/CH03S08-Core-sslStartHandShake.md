@@ -1030,6 +1030,21 @@ SSLNetVConnection::sslClientHandShakeEvent(int &err)
 
 ### OServer 证书的验证过程
 
+如果在ATS的records.config中开启了OServer证书链验证：
+
+```
+CONFIG proxy.config.ssl.client.verify.server INT 1
+```
+
+那么，ATS在拿到OServer的证书后，会对证书链进行验证，证书链的验证结果保存到 preverify_ok 中：
+
+  - 0 表示证书链存在问题
+  - 1 表示证书链验证通过
+
+如果没有开启OServer证书链验证，那么 preverify_ok 被设置为 1。
+
+然后回调 verify_callback() 进行域名匹配验证。
+
 ```
 source: SSLClientUtils.cc
 int
