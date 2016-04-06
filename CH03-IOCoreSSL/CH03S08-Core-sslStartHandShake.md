@@ -250,7 +250,11 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
     // Will be checking for that flag not being set after
     // we get out of this callback, and then will shuffle
     // over the buffered handshake packets to the O.S.
-    // 上面的注释暂时没看懂，不明白为何这里不能直接设置为握手已经完成的状态？？
+    // 如果这里只考虑PRE ACCEPT Hook的情况，是可以直接设置为“握手完成”状态的
+    // 但是这里还需要考虑在SNI/CERT Hook时，也有可能会将VC设置为Blind Tunnel。
+    //     因为触发SNI/CERT Hook的时候，handshakeBuffer里面已经有数据了，
+    //     需要回到net_read_io()中进行处理，所以这里不能设置为“握手完成”状态的
+    //     否则就无法回到net_read_io()中的“握手过程”进行后续处理。
     return EVENT_DONE;
   } else if (TS_SSL_HOOK_OP_TERMINATE == hookOpRequested) {
     // 如果需要在 PreAcceptHook 内终止此 SSLVC，可以设置为 TS_SSL_HOOK_OP_TERMINATE
