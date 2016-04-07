@@ -1045,8 +1045,6 @@ CONFIG proxy.config.ssl.client.verify.server INT 1
   - 0 表示证书链存在问题
   - 1 表示证书链验证通过
 
-如果没有开启OServer证书链验证，那么 preverify_ok 被设置为 1。
-
 然后回调 verify_callback() 进行域名匹配验证。
 
 ```
