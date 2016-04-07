@@ -961,7 +961,7 @@ ssl_read_from_net 的调用者需要对上面的返回值进行处理：
 
 在整个SSL的实现里，还使用了下面这些映射：
 
-|           SSL_read           |        ssl_read_from_net        |
+|       SSL_accept/connect     |  sslServer/ClientHandShakeEvent |
 |:----------------------------:|:-------------------------------:|
 |  SSL_ERROR_WANT_READ         |  SSL_HANDSHAKE_WANT_READ(6)     |
 |  SSL_ERROR_WANT_WRITE        |  SSL_HANDSHAKE_WANT_WRITE(7)    |
