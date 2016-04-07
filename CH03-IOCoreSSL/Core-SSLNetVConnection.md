@@ -528,7 +528,11 @@ extern ClassAllocator<SSLNetVConnection> sslNetVCAllocator;
 
 ## 方法
 
-### net_read_io
+### net_read_io(NetHandler *nh, EThread *lthread)
+
+net_read_io() 是 SSLNetVConnection 的成员方法，包含了 SSL握手 和 SSL传输 两个功能的代码。
+
+在 UnixNetVConnection 中，net_read_io 则直接调用了独立函数 read_from_net(nh, this, lthread) 。
 
 ```
 // changed by YTS Team, yamsat
@@ -783,6 +787,7 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
   //     只不过这个是调用 ssl_read_from_net 代替 read
 
   // If there is nothing to do or no space available, disable connection
+  // 如果VIO被关闭或者Read VIO的MIOBuffer被写满了，就禁止读
   if (ntodo <= 0 || !buf.writer()->write_avail()) {
     read_disable(nh, this);
     return;
@@ -790,20 +795,33 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
 
   // At this point we are at the post-handshake SSL processing
   // If the read BIO is not already a socket, consider changing it
+  // 握手完成后：
+  //     需要把Read BIO从内存块类型切换为Socket类型
   if (this->handShakeReader) {
     // Check out if there is anything left in the current bio
+    // 查看内存块类型的Read BIO内是否还有数据
     if (!BIO_eof(SSL_get_rbio(this->ssl))) {
+      // BIO_eof() 在遇到EOF时返回 1
       // Still data remaining in the current BIO block
+      // 仍然有数据，那么 handshake buffer 应该已经跟当前 SSL会话的 Read BIO 绑定了
+      // 等后面调用 ssl_read_from_net 时，就会通过 Read BIO 来消费 handshake buffer 内的数据
     } else {
+      // Read BIO内已经被读空了，
+      // 此处把handShakeBioStored记录的上一次填充到Read BIO的字节从handShakeReader中消费掉
       // Consume what SSL has read so far.
       this->handShakeReader->consume(this->handShakeBioStored);
 
       // If we are empty now, switch over
+      // 消费完成之后，再看一下handShakeReader中是否还有数据
       if (this->handShakeReader->read_avail() <= 0) {
+        // handShakeReader中也没有数据了，那么就可以直接切换Read BIO为Socket类型
         // Switch the read bio over to a socket bio
         SSL_set_rfd(this->ssl, this->get_socket());
+        // 然后释放handShake buffers，会将 handShakeReader 设置为 NULL
         this->free_handshake_buffers();
       } else {
+        // 如果 handShakeReader 中还有可读取的数据，
+        // 那么就要利用剩余的数据，再创建一个内存块类型的 Read BIO 并且绑定到SSL会话上
         // Setup the next iobuffer block to drain
         char *start = this->handShakeReader->start();
         char *end = this->handShakeReader->end();
@@ -812,6 +830,10 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
         // Sets up the buffer as a read only bio target
         // Must be reset on each read
         BIO *rbio = BIO_new_mem_buf(start, this->handShakeBioStored);
+        // 下面这个 set_mem_eof_return 的详细解读可以参考：
+        //     https://www.openssl.org/docs/faq.html#PROG15
+        //     https://www.openssl.org/docs/manmaster/crypto/BIO_s_mem.html
+        // 其实我没弄明白......
         BIO_set_mem_eof_return(rbio, -1);
         SSL_set_rbio(this->ssl, rbio);
       }
@@ -822,6 +844,8 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
   // not sure if this do-while loop is really needed here, please replace
   // this comment if you know
   do {
+    // 调用 ssl_read_from_net 读取并解密数据，
+    // 这里读取的数据可能来自内存块BIO也可以来自Socket BIO
     ret = ssl_read_from_net(this, lthread, r);
     if (ret == SSL_READ_READY || ret == SSL_READ_ERROR_NONE) {
       bytes += r;
@@ -829,6 +853,7 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
     ink_assert(bytes >= 0);
   } while ((ret == SSL_READ_READY && bytes == 0) || ret == SSL_READ_ERROR_NONE);
 
+  // 如果读取到了数据，则回调 VC_EVENT_READ_READY 到上层状态机
   if (bytes > 0) {
     if (ret == SSL_READ_WOULD_BLOCK || ret == SSL_READ_READY) {
       if (readSignalAndUpdate(VC_EVENT_READ_READY) != EVENT_CONT) {
@@ -838,6 +863,7 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
     }
   }
 
+  // 对最后一次调用 ssl_read_from_net 的返回值进行判断
   switch (ret) {
   case SSL_READ_ERROR_NONE:
   case SSL_READ_READY:
@@ -893,6 +919,72 @@ SSLNetVConnection::net_read_io(NetHandler *nh, EThread *lthread)
   }
 }
 ```
+
+### ssl_read_from_net
+
+ssl_read_from_net 并不是 sslvc 的成员方法：
+
+  - 它是对 SSLReadBuffer 的封装，
+    - 而 SSLReadBuffer 又是对 OpenSSL API 函数 SSL_read 的封装
+
+```
+static int
+ssl_read_from_net(SSLNetVConnection *sslvc, EThread *lthread, int64_t &ret)
+```
+
+ssl_read_from_net 的返回值是直接对 SSL_read 返回值的映射：
+
+|           SSL_read           |        ssl_read_from_net        |
+|:----------------------------:|:-------------------------------:|
+|  SSL_ERROR_NONE              |  SSL_READ_ERROR_NONE(0)         |
+|  SSL_ERROR_SYSCALL           |  SSL_READ_ERROR(1)              |
+|                              |  SSL_READ_READY(2)              |
+|                              |  SSL_READ_COMPLETE(3)           |
+|  SSL_ERROR_WANT_READ         |  SSL_READ_WOULD_BLOCK(4)        |
+|  SSL_ERROR_WANT_X509_LOOKUP  |  SSL_READ_WOULD_BLOCK(4)        |
+|  SSL_ERROR_SYSCALL           |  SSL_READ_EOS(5)                |
+|  SSL_ERROR_ZERO_RETURN       |  SSL_READ_EOS(5)                |
+|  SSL_ERROR_WANT_WRITE        |  SSL_WRITE_WOULD_BLOCK(10)      |
+
+ssl_read_from_net 的调用者需要对上面的返回值进行处理：
+
+  - SSL_READ_WOULD_BLOCK 和 SSL_WRITE_WOULD_BLOCK
+    - 表示需要等待下一次 NetHandler 回调
+  - SSL_READ_ERROR_NONE 和 SSL_READ_READY
+    - 表示已经成功读取了一些数据，但是Kernel TCP/IP Buffer里还有数据，还可以继续读
+  - SSL_READ_COMPLETE
+    - 表示 VIO 设定的数据读取长度已经完成
+  - SSL_READ_EOS
+    - 表示连接中断了
+  - SSL_READ_ERROR
+    - 表示读取操作遇到了错误
+
+在整个SSL的实现里，还使用了下面这些映射：
+
+|           SSL_read           |        ssl_read_from_net        |
+|:----------------------------:|:-------------------------------:|
+|  SSL_ERROR_WANT_READ         |  SSL_HANDSHAKE_WANT_READ(6)     |
+|  SSL_ERROR_WANT_WRITE        |  SSL_HANDSHAKE_WANT_WRITE(7)    |
+|  SSL_ERROR_WANT_ACCEPT       |  SSL_HANDSHAKE_WANT_ACCEPT(8)   |
+|  SSL_ERROR_WANT_CONNECT      |  SSL_HANDSHAKE_WANT_CONNECT(9)  |
+|                              |  SSL_WAIT_FOR_HOOK(11)          |
+
+这几个值在SSL握手过程中使用，上面所有这些值都是在 SSLNetVConnection.cc 的头部定义的宏。
+
+### write_to_net_io (write_to_net)
+
+write_to_net_io 并不是 sslvc 的成员方法，SSLNetVConnection 与 UnixNetVConnection 共享此函数。
+
+在 write_to_net_io 中同时考虑了 NetVC 类型为 SSLNetVConnection 与 UnixNetVConnection 的两种情况。
+
+但是在实际发送数据时则调用了 vc->load_buffer_and_write 来完成，以实现SSL会话上的数据加密传输。
+
+
+
+### load_buffer_and_write
+
+
+
 
 ## 参考资料
 
