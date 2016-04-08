@@ -988,11 +988,255 @@ write_to_net_io 并不是 sslvc 的成员方法，SSLNetVConnection 与 UnixNetV
 
 但是在实际发送数据时则调用了 vc->load_buffer_and_write 来完成，以实现SSL会话上的数据加密传输。
 
+在 CH02-IOCoreNet 的 CH02S09-Core-UnixNetVConnection 中的 [nethandler的延伸：从miobuffer到socket](https://github.com/oknet/atsinternals/blob/master/CH02-IOCoreNET/CH02S09-Core-UnixNetVConnection.md#nethandler的延伸从miobuffer到socket) 已经对 write_to_net_io 进行了分析，但是跳过了 SSL 的部分，下面就要翻回来继续看 SSL 部分的代码。
 
+```
+void
+write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
+{
+  // ...... 略去部分代码
+  
+  // This function will always return true unless
+  // vc is an SSLNetVConnection.
+  // 如果 vc 的类型是 SSLNetVConnection，那么返回 SSL 握手是否完成的状态值，
+  // 如果 vc 的类型不是 SSLNetVConnection，那么返回值固定为 true，取反后就是 false 了。
+  // 由于我们要分析的是 SSLVC，因此这里假定 vc 的类型是 SSLNetVConnection。
+  if (!vc->getSSLHandShakeComplete()) {
+    // 没有完成 SSL 握手
+    int err, ret;
+
+    // 确认 sslvc 的方向，是作为 SSL Client，还是 SSL Server？
+    // 此处与 net_read_io 的部分一样
+    if (vc->getSSLClientConnection())
+      ret = vc->sslStartHandShake(SSL_EVENT_CLIENT, err);
+    else
+      ret = vc->sslStartHandShake(SSL_EVENT_SERVER, err);
+
+    // 根据 sslStartHandShake() 的返回值进行相应的处理
+    // 需要考虑 ATS 作为 Server 或者 Client 的两种情况
+    if (ret == EVENT_ERROR) {
+      // 遇到错误，关闭写，向上层状态机回调
+      vc->write.triggered = 0;
+      write_signal_error(nh, vc, err);
+    } else if (ret == SSL_HANDSHAKE_WANT_READ || ret == SSL_HANDSHAKE_WANT_ACCEPT) {
+      // 需要读取更多数据，但是缓冲区已经空了
+      // 因此重新调度 read 操作，等 NetHandler::mainNetEvent 的下一次回调
+      vc->read.triggered = 0;
+      nh->read_ready_list.remove(vc);
+      read_reschedule(nh, vc);
+    } else if (ret == SSL_HANDSHAKE_WANT_CONNECT || ret == SSL_HANDSHAKE_WANT_WRITE) {
+      // 需要发送更多数据，但是缓冲区已经满了
+      // 因此重新调度 write 操作，等 NetHandler::mainNetEvent 的下一次回调
+      vc->write.triggered = 0;
+      nh->write_ready_list.remove(vc);
+      write_reschedule(nh, vc);
+    } else if (ret == EVENT_DONE) {
+      // 完成了握手操作
+      // 激活 write 操作，让数据传输的部分来判断Write VIO的情况
+      // 但是需要注意，只有 triggered 和 enabled 都设置为 1 的时候，NetHandler::mainNetEvent 才会回调
+      //       enabled 表示之前曾经调用过 do_io()
+      //     triggered 表示 epoll_wait 发现此 vc 的 socket fd 上有数据活动
+      vc->write.triggered = 1;
+      if (vc->write.enabled)
+        nh->write_ready_list.in_or_enqueue(vc);
+    } else
+      // 其它返回值，例如：SSL_WAIT_FOR_HOOK，SSL_READ_WOULD_BLOCK，SSL_WRITE_WOULD_BLOCK 等
+      // 直接重新调度 write 操作，等 NetHandler::mainNetEvent 的下一次回调
+      write_reschedule(nh, vc);
+    return;
+  }
+  
+  // ...... 略去部分代码
+}
+```
 
 ### load_buffer_and_write
 
+load_buffer_and_write 的功能是将 buf 中的 towrite 字节数据通过 SSL 加密通道发送。
 
+  - total_written 用来表示成功发送的字节数
+  - wattempted 用来表示尝试发送的字节数
+  - needs 表示在返回调用者后，调用者需要再次激活 read 和/或 write
+
+返回值
+
+  - 如果 towrite 字节全部成功发送，那么返回值等于 total_written
+  - 如果 towrite 字节部分成功发送，那么：
+    - 返回值大于0，表示 buf 中可发送的数据长度可能小于 towrite 字节
+    - 返回值小于0，表示最后一次发送时返回的错误值
+
+```
+int64_t
+SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, int64_t &total_written, MIOBufferAccessor &buf,
+                                         int &needs)
+{
+  ProxyMutex *mutex = this_ethread()->mutex;
+  int64_t r = 0;
+  int64_t l = 0;
+  uint32_t dynamic_tls_record_size = 0;
+  ssl_error_t err = SSL_ERROR_NONE;
+
+  // XXX Rather than dealing with the block directly, we should use the IOBufferReader API.
+  int64_t offset = buf.reader()->start_offset;
+  IOBufferBlock *b = buf.reader()->block;
+
+  // Dynamic TLS record sizing
+  ink_hrtime now = 0;
+  if (SSLConfigParams::ssl_maxrecord == -1) {
+    now = Thread::get_hrtime_updated();
+    int msec_since_last_write = ink_hrtime_diff_msec(now, sslLastWriteTime);
+
+    if (msec_since_last_write > SSL_DEF_TLS_RECORD_MSEC_THRESHOLD) {
+      // reset sslTotalBytesSent upon inactivity for SSL_DEF_TLS_RECORD_MSEC_THRESHOLD
+      sslTotalBytesSent = 0;
+    }
+    Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite, now %" PRId64 ",lastwrite %" PRId64 " ,msec_since_last_write %d", now,
+          sslLastWriteTime, msec_since_last_write);
+  }
+
+  if (HttpProxyPort::TRANSPORT_BLIND_TUNNEL == this->attributes) {
+    return this->super::load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
+  }
+
+  bool trace = getSSLTrace();
+  Debug("ssl", "trace=%s", trace ? "TRUE" : "FALSE");
+
+  do {
+    // check if we have done this block
+    l = b->read_avail();
+    l -= offset;
+    if (l <= 0) {
+      offset = -l;
+      b = b->next;
+      continue;
+    }
+    // check if to amount to write exceeds that in this buffer
+    int64_t wavail = towrite - total_written;
+
+    if (l > wavail) {
+      l = wavail;
+    }
+
+    // TS-2365: If the SSL max record size is set and we have
+    // more data than that, break this into smaller write
+    // operations.
+    int64_t orig_l = l;
+    if (SSLConfigParams::ssl_maxrecord > 0 && l > SSLConfigParams::ssl_maxrecord) {
+      l = SSLConfigParams::ssl_maxrecord;
+    } else if (SSLConfigParams::ssl_maxrecord == -1) {
+      if (sslTotalBytesSent < SSL_DEF_TLS_RECORD_BYTE_THRESHOLD) {
+        dynamic_tls_record_size = SSL_DEF_TLS_RECORD_SIZE;
+        SSL_INCREMENT_DYN_STAT(ssl_total_dyn_def_tls_record_count);
+      } else {
+        dynamic_tls_record_size = SSL_MAX_TLS_RECORD_SIZE;
+        SSL_INCREMENT_DYN_STAT(ssl_total_dyn_max_tls_record_count);
+      }
+      if (l > dynamic_tls_record_size) {
+        l = dynamic_tls_record_size;
+      }
+    }
+
+    if (!l) {
+      break;
+    }
+
+    wattempted = l;
+    total_written += l;
+    Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite, before SSLWriteBuffer, l=%" PRId64 ", towrite=%" PRId64 ", b=%p", l,
+          towrite, b);
+    err = SSLWriteBuffer(ssl, b->start() + offset, l, r);
+
+    if (!origin_trace) {
+      TraceOut((0 < r && trace), get_remote_addr(), get_remote_port(), "WIRE TRACE\tbytes=%d\n%.*s", (int)r, (int)r,
+               b->start() + offset);
+    } else {
+      char origin_trace_ip[INET6_ADDRSTRLEN];
+      ats_ip_ntop(origin_trace_addr, origin_trace_ip, sizeof(origin_trace_ip));
+      TraceOut((0 < r && trace), get_remote_addr(), get_remote_port(), "CLIENT %s:%d\ttbytes=%d\n%.*s", origin_trace_ip,
+               origin_trace_port, (int)r, (int)r, b->start() + offset);
+    }
+
+    if (r == l) {
+      wattempted = total_written;
+    }
+    if (l == orig_l) {
+      // on to the next block
+      offset = 0;
+      b = b->next;
+    } else {
+      offset += l;
+    }
+
+    Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite,Number of bytes written=%" PRId64 " , total=%" PRId64 "", r,
+          total_written);
+    NET_INCREMENT_DYN_STAT(net_calls_to_write_stat);
+  } while (r == l && total_written < towrite && b);
+
+  if (r > 0) {
+    sslLastWriteTime = now;
+    sslTotalBytesSent += total_written;
+    if (total_written != wattempted) {
+      Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite, wrote some bytes, but not all requested.");
+      // I'm not sure how this could happen. We should have tried and hit an EAGAIN.
+      needs |= EVENTIO_WRITE;
+      return (r);
+    } else {
+      Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite, write successful.");
+      return (total_written);
+    }
+  } else {
+    switch (err) {
+    case SSL_ERROR_NONE:
+      Debug("ssl", "SSL_write-SSL_ERROR_NONE");
+      break;
+    case SSL_ERROR_WANT_READ:
+      needs |= EVENTIO_READ;
+      r = -EAGAIN;
+      SSL_INCREMENT_DYN_STAT(ssl_error_want_read);
+      Debug("ssl.error", "SSL_write-SSL_ERROR_WANT_READ");
+      break;
+    case SSL_ERROR_WANT_WRITE:
+    case SSL_ERROR_WANT_X509_LOOKUP: {
+      if (SSL_ERROR_WANT_WRITE == err) {
+        SSL_INCREMENT_DYN_STAT(ssl_error_want_write);
+      } else if (SSL_ERROR_WANT_X509_LOOKUP == err) {
+        SSL_INCREMENT_DYN_STAT(ssl_error_want_x509_lookup);
+        TraceOut(trace, get_remote_addr(), get_remote_port(), "Want X509 lookup");
+      }
+
+      needs |= EVENTIO_WRITE;
+      r = -EAGAIN;
+      Debug("ssl.error", "SSL_write-SSL_ERROR_WANT_WRITE");
+      break;
+    }
+    case SSL_ERROR_SYSCALL:
+      TraceOut(trace, get_remote_addr(), get_remote_port(), "Syscall Error: %s", strerror(errno));
+      r = -errno;
+      SSL_INCREMENT_DYN_STAT(ssl_error_syscall);
+      Debug("ssl.error", "SSL_write-SSL_ERROR_SYSCALL");
+      break;
+    // end of stream
+    case SSL_ERROR_ZERO_RETURN:
+      TraceOut(trace, get_remote_addr(), get_remote_port(), "SSL Error: zero return");
+      r = -errno;
+      SSL_INCREMENT_DYN_STAT(ssl_error_zero_return);
+      Debug("ssl.error", "SSL_write-SSL_ERROR_ZERO_RETURN");
+      break;
+    case SSL_ERROR_SSL:
+    default: {
+      char buf[512];
+      unsigned long e = ERR_peek_last_error();
+      ERR_error_string_n(e, buf, sizeof(buf));
+      TraceIn(trace, get_remote_addr(), get_remote_port(), "SSL Error: sslErr=%d, ERR_get_error=%ld (%s) errno=%d", err, e, buf,
+              errno);
+      r = -errno;
+      SSL_CLR_ERR_INCR_DYN_STAT(this, ssl_error_ssl, "SSL_write-SSL_ERROR_SSL errno=%d", errno);
+    } break;
+    }
+    return (r);
+  }
+}
+```
 
 
 ## 参考资料
