@@ -951,8 +951,8 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 // I could overwrite it for the SSL implementation
 // (SSL read does not support overlapped i/o)
 // without duplicating all the code in write_to_net.
-// 通过MIOBufferAccessor buf消费MIOBuffer内指定长度为towrite的数据，
-// 参数，调用前必须初始化为0：
+// 通过MIOBufferAccessor buf消费MIOBuffer内指定长度为towrite的数据，并发送出去
+// 以下参数，调用前必须初始化为0：
 //     wattempted 为一个地址，在返回时设置为最后一次调用write/writev时，尝试发送的数据长度
 //  total_written 为一个地址，在返回时设置为尝试发送的数据长度，调用者需要根据返回值来计算发送成功的数据长度。
 //                    r  < 0 : total_written - wattempted;
