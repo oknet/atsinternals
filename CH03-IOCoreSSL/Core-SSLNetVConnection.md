@@ -411,11 +411,20 @@ private:
     HANDSHAKE_HOOKS_DONE     ///< 表示SNI/CERT Hook执行完了
   } sslHandshakeHookState;
 
+  // npnSet 保存了所有被支持协议的 Name String 和 SessionAccept 入口
   const SSLNextProtocolSet *npnSet;
+  // 在 SSLaccept() 握手成功后，使用下面的方法进行 NPN/ALPN 协商判断：
+  //     this->npnEndpoint = this->npnSet->findEndpoint(proto, len);
+  // npnEndpoint 会被设置为协商成功的那个协议的 SessionAccept 入口
+  //     如果协商失败则被设置为 NULL
   Continuation *npnEndpoint;
   // 这个SessionAccept好像没用到？
   SessionAccept *sessionAcceptPtr;
-  // iobuf 和对应的 reader
+  // iobuf 和对应的 reader，实际上是蹦床中 iobuf 的重复，
+  // 由于抽象的不够好，导致需要在 SSLNetVConnection 中定义这个成员
+  // 而且在上层状态机，如：HttpSM，SpdySM，H2SM中都需要对NetVC进行判断，
+  //     如果是sslvc类型则需要从sslvc中获取iobuf
+  //     如果是unixnetvc类型则使用从蹦床传递进来的iobuf
   MIOBuffer *iobuf;
   IOBufferReader *reader;
   // 是否接收到了eos
