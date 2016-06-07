@@ -126,12 +126,16 @@ ProtocolProbeSessionAccept::mainEvent(int event, void *data)
     // XXX we need to apply accept inactivity timeout here ...
 
     if (!probe->reader->is_read_avail_more_than(0)) {
+      // 这里通常针对 netvc 的处理，sslvc 也有可能会运行到此处
+      //     例如 sslvc 的客户端完成握手之后，没有及时发送请求，那么sslvc的iobuf虽然被传入，但是其内是空的。
       // 如果缓冲区内没有可读取的数据，就没法判断
       Debug("http", "probe needs data, read..");
       vio = netvc->do_io_read(probe, BUFFER_SIZE_FOR_INDEX(ProtocolProbeTrampoline::buffer_size_index), probe->iobuf);
       // 因此通过do_io_read操作关联蹦床，由EventSystem回调蹦床来完成判断，reenable后交给EventSystem来处理
       vio->reenable();
     } else {
+      // 这里通常是针对 sslvc 的处理，netvc通常不会运行到这里
+      //     因为刚刚Accept就有数据可读取，那意味着buf和reader来自sslvc的iobuf
       // 如果缓冲区内已经有可以读取的数据，那就可以根据这些数据来判断是什么协议的类型了
       Debug("http", "probe already has data, call ioComplete directly..");
       // 取消读操作
