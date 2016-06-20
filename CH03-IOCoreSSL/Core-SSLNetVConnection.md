@@ -1080,6 +1080,12 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, i
   int64_t offset = buf.reader()->start_offset;
   IOBufferBlock *b = buf.reader()->block;
 
+  // 在SSL发送的时候，是把一个明文数据块加密后发出，加密之后被叫做 TLS record。
+  // 接收端必须收到一个完整的 TLS record 才能进行解密，但是受限于 TCP 连接的传输情况，
+  //   每次能够发送的 TCP 报文大小是不同的，如果 TLS record 的长度需要跨越多个 TCP 报文，
+  //   接收端就必须将多个 TCP 报文合并之后，得到一个完整的 TLS record 才可以进行解密。
+  // 在 ATS 中采用了一种动态调整明文数据块大小的方法，让加密后的 TLS record 尽可能在一个 TCP 报文中传递，
+  //   这样接收端每收到一个 TCP 报文，就可以得到一个完整的 TLS record，可以立即解密并获得明文内容。
   // Dynamic TLS record sizing
   ink_hrtime now = 0;
   if (SSLConfigParams::ssl_maxrecord == -1) {
@@ -1094,14 +1100,18 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, i
           sslLastWriteTime, msec_since_last_write);
   }
 
+  // 判断 Blind Tunnel 的情况，通过 UnixNetVConnection::load_buffer_and_write() 执行
+  //   感觉这里应该放在 Dyn TLS record sizing 之前处理会比较好啊。
   if (HttpProxyPort::TRANSPORT_BLIND_TUNNEL == this->attributes) {
     return this->super::load_buffer_and_write(towrite, wattempted, total_written, buf, needs);
   }
 
+  // 用于 SSL 跟踪调试
   bool trace = getSSLTrace();
   Debug("ssl", "trace=%s", trace ? "TRUE" : "FALSE");
 
   do {
+    // 准备用于发送的数据块，计算其长度
     // check if we have done this block
     l = b->read_avail();
     l -= offset;
@@ -1117,6 +1127,7 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, i
       l = wavail;
     }
 
+    // 仍然是为了 Dyn TLS record sizing
     // TS-2365: If the SSL max record size is set and we have
     // more data than that, break this into smaller write
     // operations.
@@ -1140,12 +1151,22 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, i
       break;
     }
 
+    // 设置 wattempted 为本次期望发送的字节数
     wattempted = l;
+    // 设置 total_writen 为本次成功发送后的总发送字节数
+    //   这个设置好奇怪？？
     total_written += l;
     Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite, before SSLWriteBuffer, l=%" PRId64 ", towrite=%" PRId64 ", b=%p", l,
           towrite, b);
+    // 调用 SSLWriteBuffer 进行数据的加密和发送
+    //   ssl 为SSL CTX描述符
+    //   b->start() + offset 为准备发送的明文数据内容的起始地址
+    //   l 为期望发送的字节数
+    //   r 为成功发送的字节数
+    //   当出现错误时，err为非0值
     err = SSLWriteBuffer(ssl, b->start() + offset, l, r);
 
+    // 根据需要显示 SSL 的调试信息
     if (!origin_trace) {
       TraceOut((0 < r && trace), get_remote_addr(), get_remote_port(), "WIRE TRACE\tbytes=%d\n%.*s", (int)r, (int)r,
                b->start() + offset);
@@ -1157,46 +1178,73 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, i
     }
 
     if (r == l) {
+      // 本次数据发送成功，设置 wattempted 为总发送字节数
       wattempted = total_written;
     }
+    
+    // 判断当前 IOBufferBlock 的发送是否受到 Dyn TLS record sizing 的影响而分片发送
     if (l == orig_l) {
+      // 没有分片，则继续发送下一个 IOBufferBlock
       // on to the next block
       offset = 0;
       b = b->next;
     } else {
+      // 出现分片，则继续发送当前 IOBufferBlock 剩余的部分
       offset += l;
     }
 
     Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite,Number of bytes written=%" PRId64 " , total=%" PRId64 "", r,
           total_written);
     NET_INCREMENT_DYN_STAT(net_calls_to_write_stat);
+    // 如果：
+    //   本轮发送成功：r == l
+    //   没有完全全部发送任务：total_written < towrite
+    //   还有承载数据的 IOBufferBlock：b
+    // 那么就继续下一个循环
   } while (r == l && total_written < towrite && b);
 
   if (r > 0) {
+    // 从 while 跳出时，没有遇到错误
     sslLastWriteTime = now;
     sslTotalBytesSent += total_written;
     if (total_written != wattempted) {
+      // 没有完成所有的数据发送，此时 b==NULL
+      // 需要回调上层状态机 WRITE_READY，重新填充数据，然后重新调度写操作，
+      // 等待下一次NetHandler回调，继续完成数据的发送。
       Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite, wrote some bytes, but not all requested.");
       // I'm not sure how this could happen. We should have tried and hit an EAGAIN.
+      // 告知调用者（write_to_net_io），需要重新调度写操作
       needs |= EVENTIO_WRITE;
+      // 返回最后一次成功发送的字节数
       return (r);
     } else {
+      // 完成了全部的数据发送，此时 total_written >= towrite
+      // !!! 这里需要注意 !!!
+      //   如果IOBufferBlock中可用于发送的数据量大于 towrite 值，会出现 total_written > towrite 的情况
+      //   这是bug？？
       Debug("ssl", "SSLNetVConnection::loadBufferAndCallWrite, write successful.");
+      // 返回实际发送成功的字节数
       return (total_written);
     }
   } else {
+    // 从 while 跳出时，遇到了错误
+    // 根据最后一次调用 SSLWriteBuffer 的返回值，判断错误类型
     switch (err) {
     case SSL_ERROR_NONE:
+      // 没有错误
       Debug("ssl", "SSL_write-SSL_ERROR_NONE");
       break;
     case SSL_ERROR_WANT_READ:
+      // 需要读取数据
       needs |= EVENTIO_READ;
       r = -EAGAIN;
       SSL_INCREMENT_DYN_STAT(ssl_error_want_read);
       Debug("ssl.error", "SSL_write-SSL_ERROR_WANT_READ");
       break;
     case SSL_ERROR_WANT_WRITE:
+      // 需要发送数据
     case SSL_ERROR_WANT_X509_LOOKUP: {
+      // 需要查询X509
       if (SSL_ERROR_WANT_WRITE == err) {
         SSL_INCREMENT_DYN_STAT(ssl_error_want_write);
       } else if (SSL_ERROR_WANT_X509_LOOKUP == err) {
@@ -1210,6 +1258,7 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, i
       break;
     }
     case SSL_ERROR_SYSCALL:
+      // 在OpenSSL API调用系统API时遇到了错误
       TraceOut(trace, get_remote_addr(), get_remote_port(), "Syscall Error: %s", strerror(errno));
       r = -errno;
       SSL_INCREMENT_DYN_STAT(ssl_error_syscall);
@@ -1217,12 +1266,15 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, i
       break;
     // end of stream
     case SSL_ERROR_ZERO_RETURN:
+      // 通常表示连接中断
+      // 区别于 read 操作，不返回EOS，因为不会对Write VIO回调VC_EVENT_EOS
       TraceOut(trace, get_remote_addr(), get_remote_port(), "SSL Error: zero return");
       r = -errno;
       SSL_INCREMENT_DYN_STAT(ssl_error_zero_return);
       Debug("ssl.error", "SSL_write-SSL_ERROR_ZERO_RETURN");
       break;
     case SSL_ERROR_SSL:
+      // 表示遇到 SSL 内部错误
     default: {
       char buf[512];
       unsigned long e = ERR_peek_last_error();
@@ -1233,6 +1285,7 @@ SSLNetVConnection::load_buffer_and_write(int64_t towrite, int64_t &wattempted, i
       SSL_CLR_ERR_INCR_DYN_STAT(this, ssl_error_ssl, "SSL_write-SSL_ERROR_SSL errno=%d", errno);
     } break;
     }
+    // 返回调用者
     return (r);
   }
 }
