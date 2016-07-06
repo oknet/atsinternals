@@ -269,8 +269,10 @@ public:
   LINK(UnixNetVConnection, active_queue_link);
 
   // 定义inactivity timeout，我理解为IDLE Timeout，就是这个连接上没有任何数据传输的时候，最长等待时间
+  // 每次读、写操作都会重置IDLE Timeout的计时器
   ink_hrtime inactivity_timeout_in;
-  // 定义active timeout，我理解为OPERATION Timeout，就是当进行一个异步读、写操作时，最长等待时间
+  // 定义active timeout，我理解为NetVC LifeCycle Timeout，就是一个NetVC可以生存多久
+  // 重设可以延长NetVC的寿命
   ink_hrtime active_timeout_in;
 #ifdef INACTIVITY_TIMEOUT
   Event *inactivity_timeout;
@@ -287,10 +289,12 @@ public:
   NetHandler *nh;
   // 此连接的唯一ID，自增长值，通过UnixNetProcessor.cc::net_next_connection_number()分配
   unsigned int id;
-  // 服务器端的地址（感觉此处仅仅是为了兼容性）
-  //     在NetAccept中，在connect_re_internal中，都使用ats_ip_copy方法，从con.addr直接内存复制过来
-  //     在Connection::connect中调用setRemote方法，也使用ats_ip_copy方法，从target直接内存复制到con.addr
-  // AMC大神在这里做了一个注释，觉得这儿重复定义了，其实可以使用con.addr
+  // 对端（peer side）的地址
+  //     当ATS接受一个客户端的连接时，把客户端的IP地址填入这个变量。
+  //     当ATS连接一个服务端的时候，把服务端IP地址填入这个变量。
+  //     因此这相当于get_remote_addr()的结果，不要被server_addr的字面意思弄晕了。
+  // AMC大神在这里做了一个注释，觉得这儿重复定义了，其实可以使用remote_addr或con.addr代替
+  // 我提交了一个patch，使用get_remote_addr()来代替server_addr这个变量
   // amc - what is this for? Why not use remote_addr or con.addr?
   IpEndpoint server_addr; /// Server address and port.
 
@@ -949,8 +953,8 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 // I could overwrite it for the SSL implementation
 // (SSL read does not support overlapped i/o)
 // without duplicating all the code in write_to_net.
-// 通过MIOBufferAccessor buf消费MIOBuffer内指定长度为towrite的数据，
-// 参数，调用前必须初始化为0：
+// 通过MIOBufferAccessor buf消费MIOBuffer内指定长度为towrite的数据，并发送出去
+// 以下参数，调用前必须初始化为0：
 //     wattempted 为一个地址，在返回时设置为最后一次调用write/writev时，尝试发送的数据长度
 //  total_written 为一个地址，在返回时设置为尝试发送的数据长度，调用者需要根据返回值来计算发送成功的数据长度。
 //                    r  < 0 : total_written - wattempted;
@@ -1142,6 +1146,231 @@ ATS通过给VC设置一个重入计数器来解决这个问题。
 
 实现了数据流在socket与buffer之间的传递，因此我更觉的read_from_net，write_to_net和write_to_net_io是NetHandler的一部分，而只有 net_read_io，load_buffer_and_write 才算是 UnixNetVConnection的方法，因为继承自它的SSLNetVConnection需要重载这两个方法来实现数据的加解密。
 
+## 超时控制和管理
+
+对于Active Timeout 和 Inactivity Timeout，ATS分别提供了下面的方法：
+
+  - get_(inactivity|active)_timeout
+  - set_(inactivity|active)_timeout
+  - cancel_(inactivity|active)_timeout
+
+```
+// get方法比较简单，直接返回成员的值
+// 这里的后缀 _in 跟 schedule_in 的后缀是一个意思，是相对当前时间的，相对超时时间
+TS_INLINE ink_hrtime
+UnixNetVConnection::get_active_timeout()
+{
+  return active_timeout_in;
+}
+
+TS_INLINE ink_hrtime
+UnixNetVConnection::get_inactivity_timeout()
+{
+  return inactivity_timeout_in;
+}
+
+// set方法需要根据超时机制的方式，由宏定义确定
+// 但是无论哪种方式都需要设置 inactivity_timeout_in 的值
+TS_INLINE void
+UnixNetVConnection::set_inactivity_timeout(ink_hrtime timeout)
+{
+  Debug("socket", "Set inactive timeout=%" PRId64 ", for NetVC=%p", timeout, this);
+  inactivity_timeout_in = timeout;
+#ifdef INACTIVITY_TIMEOUT
+  // 如果之前设置了inactivity_timeout，就要先取消之前设置的
+  if (inactivity_timeout)
+    inactivity_timeout->cancel_action(this);
+
+  // 然后再判断是否要设置新的超时控制，inactivity_timeout_in == 0 表示取消超时控制
+  if (inactivity_timeout_in) {
+    if (read.enabled) {
+      // 读操作激活，设置读操作的超时事件
+      ink_assert(read.vio.mutex->thread_holding == this_ethread() && thread);
+      // 分为同步调度和异步调度，设定在 inactivity_timeout_in 时间之后回调VC状态机的mainEvent
+      if (read.vio.mutex->thread_holding == thread)
+        inactivity_timeout = thread->schedule_in_local(this, inactivity_timeout_in);
+      else
+        inactivity_timeout = thread->schedule_in(this, inactivity_timeout_in);
+    } else if (write.enabled) {
+      // 在读操作没有设置的情况下，判断
+      // 写操作激活，设置写操作的超时事件
+      ink_assert(write.vio.mutex->thread_holding == this_ethread() && thread);
+      // 分为同步调度和异步调度，设定在 inactivity_timeout_in 时间之后回调VC状态机的mainEvent
+      if (write.vio.mutex->thread_holding == thread)
+        inactivity_timeout = thread->schedule_in_local(this, inactivity_timeout_in);
+      else
+        inactivity_timeout = thread->schedule_in(this, inactivity_timeout_in);
+    } else {
+      // 读写操作都未设置，超时设置不生效
+      // 清除指向event的指针
+      inactivity_timeout = 0;
+    }
+  } else {
+    // 清除指向event的指针
+    inactivity_timeout = 0;
+  }
+#else
+  // 设置 inactivity_timeout 对应的超时时间的绝对值
+  next_inactivity_timeout_at = Thread::get_hrtime() + timeout;
+#endif
+}
+
+// set方法需要根据超时机制的方式，由宏定义确定
+// 但是无论哪种方式都需要设置 active_timeout_in 的值
+// 流程上与 set_inactivity_timeout 完全一致
+TS_INLINE void
+UnixNetVConnection::set_active_timeout(ink_hrtime timeout)
+{
+  Debug("socket", "Set active timeout=%" PRId64 ", NetVC=%p", timeout, this);
+  active_timeout_in = timeout;
+#ifdef INACTIVITY_TIMEOUT
+  if (active_timeout)
+    active_timeout->cancel_action(this);
+  if (active_timeout_in) {
+    if (read.enabled) {
+      ink_assert(read.vio.mutex->thread_holding == this_ethread() && thread);
+      if (read.vio.mutex->thread_holding == thread)
+        active_timeout = thread->schedule_in_local(this, active_timeout_in);
+      else
+        active_timeout = thread->schedule_in(this, active_timeout_in);
+    } else if (write.enabled) {
+      ink_assert(write.vio.mutex->thread_holding == this_ethread() && thread);
+      if (write.vio.mutex->thread_holding == thread)
+        active_timeout = thread->schedule_in_local(this, active_timeout_in);
+      else
+        active_timeout = thread->schedule_in(this, active_timeout_in);
+    } else
+      active_timeout = 0;
+  } else
+    active_timeout = 0;
+#else
+  next_activity_timeout_at = Thread::get_hrtime() + timeout;
+#endif
+}
+
+// 取消超时设置
+// cancel方法也需要根据超时机制的方式，由宏定义确定
+// 但是无论哪种方式都需要对 inactivity_timeout_in 的值清零
+TS_INLINE void
+UnixNetVConnection::cancel_inactivity_timeout()
+{
+  Debug("socket", "Cancel inactive timeout for NetVC=%p", this);
+  inactivity_timeout_in = 0;
+#ifdef INACTIVITY_TIMEOUT
+  // 取消事件
+  if (inactivity_timeout) {
+    Debug("socket", "Cancel inactive timeout for NetVC=%p", this);
+    inactivity_timeout->cancel_action(this);
+    inactivity_timeout = NULL;
+  }
+#else
+  // 设置 inactivity_timeout 对应的超时时间的绝对值为 0
+  next_inactivity_timeout_at = 0;
+#endif
+}
+
+// cancel方法也需要根据超时机制的方式，由宏定义确定
+// 但是无论哪种方式都需要对 active_timeout_in 的值清零
+// 流程上与 cancel_inactivity_timeout 完全一致
+TS_INLINE void
+UnixNetVConnection::cancel_active_timeout()
+{
+  Debug("socket", "Cancel active timeout for NetVC=%p", this);
+  active_timeout_in = 0;
+#ifdef INACTIVITY_TIMEOUT
+  if (active_timeout) {
+    Debug("socket", "Cancel active timeout for NetVC=%p", this);
+    active_timeout->cancel_action(this);
+    active_timeout = NULL;
+  }
+#else
+  next_activity_timeout_at = 0;
+#endif
+}
+```
+
+不管是 Inactivity Timeout 还是 Active Timeout 都要求激活了读、写操作才能设置，那么这两种Timeout到底有什么区别？
+
+在 iocore/net/NetVCTest.cc 文件中：
+
+```
+void
+NetVCTest::start_test()
+{
+  test_vc->set_inactivity_timeout(HRTIME_SECONDS(timeout));
+  test_vc->set_active_timeout(HRTIME_SECONDS(timeout + 5));
+
+  read_buffer = new_MIOBuffer();
+  write_buffer = new_MIOBuffer();
+
+  reader_for_rbuf = read_buffer->alloc_reader();
+  reader_for_wbuf = write_buffer->alloc_reader();
+
+  if (nbytes_read > 0) {
+    read_vio = test_vc->do_io_read(this, nbytes_read, read_buffer);
+  } else {
+    read_done = true;
+  }
+
+  if (nbytes_write > 0) {
+    write_vio = test_vc->do_io_write(this, nbytes_write, reader_for_wbuf);
+  } else {
+    write_done = true;
+  }
+}
+```
+
+设置的 active_timeout 要多出5秒，由此可以猜测，active_timeout 要比 inactivity_timeout 的时间长。
+
+在 iocore/net/I_NetVConnection.h 中的注释，说明了差别(配上简单翻译)：
+
+```
+  /**
+    在状态机使用此NetVC一定时间之后，会收到VC_EVENT_ACTIVE_TIMEOUT事件。
+    如果读、写都未在此NetVC激活，那么此值会被忽略。
+    这个功能防止状态机较长时间的保持连接的打开状态。
+    
+    Sets time after which SM should be notified.
+    Sets the amount of time (in nanoseconds) after which the state
+    machine using the NetVConnection should receive a
+    VC_EVENT_ACTIVE_TIMEOUT event. The timeout is value is ignored
+    if neither the read side nor the write side of the connection
+    is currently active. The timer is reset if the function is
+    called repeatedly This call can be used by SMs to make sure
+    that it does not keep any connections open for a really long
+    time.
+    ...
+   */
+  virtual void set_active_timeout(ink_hrtime timeout_in) = 0;
+    
+  /**
+    当状态机请求在此NetVC执行的IO操作没有完成时，
+    在读写都处于IDLE状态一定时间之后，状态机会收到VC_EVENT_INACTIVITY_TIMEOUT事件
+    任何读写操作的发生，都会导致计时器被重置。
+    如果读、写都未在此NetVC激活，那么此值会被忽略。
+    
+    Sets time after which SM should be notified if the requested
+    IO could not be performed. Sets the amount of time (in nanoseconds),
+    if the NetVConnection is idle on both the read or write side,
+    after which the state machine using the NetVConnection should
+    receive a VC_EVENT_INACTIVITY_TIMEOUT event. Either read or
+    write traffic will cause timer to be reset. Calling this function
+    again also resets the timer. The timeout is value is ignored
+    if neither the read side nor the write side of the connection
+    is currently active. See section on timeout semantics above.
+   */
+  virtual void set_inactivity_timeout(ink_hrtime timeout_in) = 0;
+```
+
+所以，
+
+ - Active Timeout，是设置一个NetVC的最大生存时间
+ - Inactivity Timeout，是设置一个最长的IDLE时间
+
+上面介绍了获取超时设置，设置超时时间，取消超时控制的方法，那么在ATS中是由谁具体实现了超时的功能呢？
+
+请继续阅读下面mainEvent回调函数的分析。
+
 ## UnixNetVConnection 状态机的回调函数
 
 UnixNetVConnection 具有多态性，它除了具有与Event类型相似的传递事件的功能，同时也是一个状态机，有它自己的回调函数。
@@ -1269,19 +1498,40 @@ UnixNetVConnection::startEvent(int /* event ATS_UNUSED */, Event *e)
 
 ### 主处理函数（mainEvent）
 
-mainEvent 主要用来实现超时控制，Inactivity Timeout 和 Active Timeout的控制都在这里
-
-由于 ```#define INACTIVITY_TIMEOUT``` 这一行在[P_UnixNet.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNet.h)中被注释掉了，因此，为了便于分析，下面的代码删除了相关的内容。
+mainEvent 主要用来实现超时控制，Inactivity Timeout 和 Active Timeout的控制都在这里。
 
 在ATS中，对TIMEOUT的处理分为两种模式：
 
-  - 通过active_timeout和inactivity_timeout两个 Event 来完成
+  - 通过 active_timeout 和 inactivity_timeout 两个 Event 来完成
     - 就是把每一个 vc 的超时控制封装成一个定时执行的 Event 放入 EventSystem 来处理
     - 这会导致一个 vc 生成两个 Event，对EventSystem的处理压力非常的大，因此ATS设计了InactivityCop
-    - 这种方式，如果你有兴趣可以自己分析一下，比较简单
+    - ATS 5.3.x 及之前版本采用这种方式
   - 通过InactivityCop来完成
-    - 这是一个专门管理连接超时的状态机
-    - ATS 默认采用这种方式
+    - 这是一个专门管理连接超时的状态机，后面会专门介绍这个状态机
+    - ATS 6.0.0 开始采用这种方式
+
+在6.0.0之前，在[P_UnixNet.h](http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNet.h)中，定义了
+
+```
+#define INACTIVITY_TIMEOUT
+```
+
+这是采用基于EventSystem定时Event的机制实现的超时控制，在UnixNetVConnection中也定义了两个成员来配合实现：
+
+```
+#ifdef INACTIVITY_TIMEOUT
+  Event *inactivity_timeout;
+  Event *activity_timeout;
+#else
+  ink_hrtime next_inactivity_timeout_at;
+  ink_hrtime next_activity_timeout_at;
+#endif
+```
+
+但是在6.0.0开始，这一行被注释掉了，则使用一个独立的状态机InactivityCop来实现超时控制。
+
+本章节中以介绍早期的超时处理机制为主，在后面的章节中专门介绍InactivityCop状态机。
+
 
 ```
 //
@@ -1312,6 +1562,12 @@ UnixNetVConnection::mainEvent(int event, Event *e)
   // 判断Write VIO没有被更改
       (write.vio.mutex.m_ptr && wlock.get_mutex() != write.vio.mutex.m_ptr)) {
     // 上述判断若有一个失败，则需要重新调度
+#ifdef INACTIVITY_TIMEOUT
+    // 但是只有由active_timeout事件回调才重新调度
+    // 为什么inactivity_timeout事件的回调在上锁失败后就直接返回了，而不进行重新调度呢？？？
+    //     因为出现上锁失败的时候，那就意味着有一个能够重置inactivity_timeout计时器的操作正在进行，所以就没有必要再重新调度了
+    if (e == active_timeout)
+#endif
       e->schedule_in(HRTIME_MSECONDS(net_retry_delay));
     return EVENT_CONT;
   }
@@ -1324,48 +1580,102 @@ UnixNetVConnection::mainEvent(int event, Event *e)
 
   // 接下来要判断是Active Timeout还是Inactivity Timeout
   int signal_event;
-  Event **signal_timeout;
   Continuation *reader_cont = NULL;
   Continuation *writer_cont = NULL;
   ink_hrtime *signal_timeout_at = NULL;
   Event *t = NULL;
+  // signal_timeout 是用来支持老的超时控制模式的，在新模式下固定的指向 t
+  Event **signal_timeout;
   signal_timeout = &t;
 
+#ifdef INACTIVITY_TIMEOUT
+  // 采用EventSystem实现超时控制时：
+  //     传入的 e 应该是inactivity_timeout或者active_timeout
+  // 根据 e 的值判断超时发生的类型，设置参数
+  if (e == inactivity_timeout) {
+    signal_event = VC_EVENT_INACTIVITY_TIMEOUT;
+    signal_timeout = &inactivity_timeout;
+  } else {
+    ink_assert(e == active_timeout);
+    signal_event = VC_EVENT_ACTIVE_TIMEOUT;
+    signal_timeout = &active_timeout;
+  }
+#else
+  // 采用InactivityCop实现超时控制时：
   if (event == EVENT_IMMEDIATE) {
+    // 如果是来自InactivityCop的回调，则传入的event固定为EVENT_IMMEDIATE
+    // 这表示发生了 Inactivity Timeout
     // Inactivity Timeout
     /* BZ 49408 */
     // ink_assert(inactivity_timeout_in);
     // ink_assert(next_inactivity_timeout_at < ink_get_hrtime());
+    // 如果：
+    //     没有设置Inactivity Timeout (inactivity_timeout_in==0)
+    //     没有出现Inactivity Timeout (next_inactivity_timeout_at > Thread::get_hrtime())
+    // 直接返回 EVENT_CONT
     if (!inactivity_timeout_in || next_inactivity_timeout_at > Thread::get_hrtime())
       return EVENT_CONT;
+    // 出现了Inactivity Timeout，因此设置回调上层状态机的 event 类型为 INACTIVITY_TIMEOUT
     signal_event = VC_EVENT_INACTIVITY_TIMEOUT;
+    // 指针指向超时时间，这样后面就不用再根据超时类型判断应该取那个超时时间了
     signal_timeout_at = &next_inactivity_timeout_at;
   } else {
+    // 当传入的event为EVENT_INTERVAL
+    // 这表示发生了Active Timeout
+    // 通常只有EventSystem对于定时、周期性执行的事件的回调才会传入EVENT_INTERVAL
+    //     但是没有看到有任何地方做schedule，如果由EventSystem回调，那么传入的event是在哪里创建的？？？
     // event == EVENT_INTERVAL
     // Active Timeout
+    // 出现了Active Timeout，因此设置回调上层状态机的 event 类型为 ACTIVE_TIMEOUT
     signal_event = VC_EVENT_ACTIVE_TIMEOUT;
+    // 指针指向超时时间
     signal_timeout_at = &next_activity_timeout_at;
   }
+#endif
 
+  // 重置超时值
   *signal_timeout = 0;
+  // 重置超时时间的绝对值
   *signal_timeout_at = 0;
+  // 记录 writer_cont
   writer_cont = write.vio._cont;
 
+  // 判断vc已经关闭的话，直接调用close_UnixNetVConnection关闭该vc
   if (closed) {
     close_UnixNetVConnection(this, thread);
     return EVENT_DONE;
   }
 
+  // 从此处开始，下面的代码逻辑是按照 iocore/net/I_NetVConnection.h 的Line: 380 ~ 393
+  //     在 Timeout symantics 一节中的描述来实现。
+
+  // 如果：
+  //     设置了Read VIO，op值可能为：VIO::READ 或者 VIO::NONE
+  //     并且没有对读取端做半关闭，就是VC对应的Socket处于可读状态
   if (read.vio.op == VIO::READ && !(f.shutdown & NET_VC_SHUTDOWN_READ)) {
+    // 记录 reader_cont
     reader_cont = read.vio._cont;
+    // 向上层状态机回调超时事件，此时reader_cont已经被回调过了
     if (read_signal_and_update(signal_event, this) == EVENT_DONE)
       return EVENT_DONE;
   }
 
+  // 前三个条件主要判断在刚才reader_cont回调时，是否又重新设置了超时控制，以及可能关闭vc（这个看上去多余？）：
+  //     第一个条件判断超时是否被设置：!*signal_timeout
+  //     第二个条件判断超时是否被设置：!*signal_timeout_at
+  //     第三个条件判断vc是否被关闭：!closed，之前判断过，回调reader_cont时如果关闭了VC，那么会在上面返回EVENT_DONE
+  // 如果：
+  //     设置了Write VIO，op值可能为：VIO::WRITE 或者 VIO::NONE
+  //     并且没有对发送端做半关闭，就是VC对应的Socket处于可写状态
+  //     并且Write VIO对应的状态机不是刚刚回调过的reader_cont
+  //     并且当前的Write VIO仍然是之前记录的writer_cont，因为前面回调reader_cont的时候，Write VIO状态机可能会被重设
   if (!*signal_timeout && !*signal_timeout_at && !closed && write.vio.op == VIO::WRITE && !(f.shutdown & NET_VC_SHUTDOWN_WRITE) &&
       reader_cont != write.vio._cont && writer_cont == write.vio._cont)
+    // 向上层状态机回调超时事件
     if (write_signal_and_update(signal_event, this) == EVENT_DONE)
       return EVENT_DONE;
+
+  // 最后总是返回 EVENT_DONE
   return EVENT_DONE;
 }
 ```
@@ -1376,7 +1686,116 @@ UnixNetVConnection::mainEvent(int event, Event *e)
 
 如何创建与源服务器的连接？
 
-### 激活 VIO & VC
+```
+int
+UnixNetVConnection::connectUp(EThread *t, int fd)
+{
+  int res;
+
+  // 设置新vc的管理线程为 t
+  thread = t;
+  
+  // 如果超出了允许的最大连接数，则立即宣告失败
+  // 回调创建此vc的状态机，状态机需要关闭此vc
+  if (check_net_throttle(CONNECT, submit_time)) {
+    check_throttle_warning();
+    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, (void *)-ENET_THROTTLING);
+    free(t);
+    return CONNECT_FAILURE;
+  }
+
+  // Force family to agree with remote (server) address.
+  options.ip_family = server_addr.sa.sa_family;
+
+  //
+  // Initialize this UnixNetVConnection
+  //
+  // 打印调试信息
+  if (is_debug_tag_set("iocore_net")) {
+    char addrbuf[INET6_ADDRSTRLEN];
+    Debug("iocore_net", "connectUp:: local_addr=%s:%d [%s]\n",
+          options.local_ip.isValid() ? options.local_ip.toString(addrbuf, sizeof(addrbuf)) : "*", options.local_port,
+          NetVCOptions::toString(options.addr_binding));
+  }
+
+  // If this is getting called from the TS API, then we are wiring up a file descriptor
+  // provided by the caller. In that case, we know that the socket is already connected.
+  // 如果没有创建底层的socket fd，那么就创建一个
+  if (fd == NO_FD) {
+    res = con.open(options);
+    if (res != 0) {
+      goto fail;
+    }
+  } else {
+    // 通常，来自TS API的调用，底层的socket fd已经创建好了
+    int len = sizeof(con.sock_type);
+
+    // This call will fail if fd is not a socket (e.g. it is a
+    // eventfd or a regular file fd.  That is ok, because sock_type
+    // is only used when setting up the socket.
+    // 只需要设置一下 con 对象的成员
+    safe_getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *)&con.sock_type, &len);
+    safe_nonblocking(fd);
+    con.fd = fd;
+    con.is_connected = true;
+    con.is_bound = true;
+  }
+
+  // Must connect after EventIO::Start() to avoid a race condition
+  // when edge triggering is used.
+  // 通过 EventIO::start 把 vc 放入 epoll_wait 的监控下，READ & WRITE
+  //     这里的注释说，当采用EPOLL ET模式时，必须先执行start再执行connect，来避免一个竞争条件
+  //     但是我没看懂，到底是什么竞争条件？？？
+  if (ep.start(get_PollDescriptor(t), this, EVENTIO_READ | EVENTIO_WRITE) < 0) {
+    lerrno = errno;
+    Debug("iocore_net", "connectUp : Failed to add to epoll list\n");
+    action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, (void *)0); // 0 == res
+    free(t);
+    return CONNECT_FAILURE;
+  }
+
+  // 对于底层socket fd没有创建的情况，才需要调用connect来发起连接
+  // 注意，这里是非阻塞IO，所以后面要在状态机里判断socket fd可写才算是连接建立成功
+  //     这里再去看上面提到的竞争条件，如果socket fd已经创建时，那么就出现了connect在EventIO::start之前的情况
+  //     那么此处的竞争条件到底是什么？？？
+  if (fd == NO_FD) {
+    res = con.connect(&server_addr.sa, options);
+    if (res != 0) {
+      goto fail;
+    }
+  }
+
+  check_emergency_throttle(con);
+
+  // start up next round immediately
+
+  // 切换vc的handler为mainEvent
+  SET_HANDLER(&UnixNetVConnection::mainEvent);
+
+  // 放入 open_list 队列
+  nh = get_NetHandler(t);
+  nh->open_list.enqueue(this);
+
+  ink_assert(!inactivity_timeout_in);
+  ink_assert(!active_timeout_in);
+  this->set_local_addr();
+  // 回调创建此vc的状态机，NET_EVENT_OPEN，创建此vc的状态机会继续回调上层状态机
+  // 在上层状态机，可以设置VIO，之后上层状态机就可以收到READ|WRITE_READY的事件了
+  // 注意，这里并未判断非阻塞的connect方法是否成功打开了连接
+  action_.continuation->handleEvent(NET_EVENT_OPEN, this);
+  return CONNECT_SUCCESS;
+
+fail:
+  // 失败处理，保存errno的值
+  lerrno = errno;
+  // 回调创建此vc的状态机，状态机需要关闭此vc
+  action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, (void *)(intptr_t)res);
+  free(t);
+  return CONNECT_FAILURE;
+}
+```
+
+### 激活 VIO & VC（reenable & reenable_re）
 
 在UnixNetVConnection中提供了 reenable 和 reenable_re 两个方法，分别对应了在[P_VIO.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_VIO.h)中定义的VIO的 reenable 和 reenable_re 两个方法。
 
@@ -1388,10 +1807,10 @@ VIO::reenable()
     vc_server->reenable(this);
 }
 TS_INLINE void
-VIO::reenable()
+VIO::reenable_re()
 {
   if (vc_server)
-    vc_server->reenable(this);
+    vc_server->reenable_re(this);
 }
 ```
 
@@ -1548,9 +1967,188 @@ UnixNetVConnection::reenable_re(VIO *vio)
 
 由于此方法会导致潜在的阻塞问题，在ATS中只有很少的地方使用到了reenable_re这个方法。
 
-## Inactivity Timeout 的实现
+关于上锁的总结：
 
-## InactivityCop 状态机
+  - 调用reenable之前要首先对VIO上锁，通常VIO的锁就是上层状态机的锁，基本都会上锁
+  - 在reenable执行时会对NetHandler上锁，这是因为：
+    - 在A线程中可能会reenable一个在B线程中管理的vc
+    - 而此时，NetHandler可能正在调用processor_enabled_list来批量处理B线程中管理的所有 vc
+    - 这样就会出现资源访问的竞争条件
+
+### 关闭和释放（close & free）
+
+所有的NetVC及其继承类，都会调用close_UnixNetVConnection这个函数，它不是某个NetVC类的成员函数。
+
+因此，对于SSLNetVConnection的关闭也会调用此函数，但是由于free方法是成员函数，所以```vc->free(t)```执行了对应NetVConnection继承类型的释放操作。
+
+```
+//
+// Function used to close a UnixNetVConnection and free the vc
+//
+// 传入两个变量，一个是想要关闭的vc，另一个是当前EThread
+void
+close_UnixNetVConnection(UnixNetVConnection *vc, EThread *t)
+{
+  NetHandler *nh = vc->nh;
+  
+  // 取消带外数据的发送状态机
+  vc->cancel_OOB();
+  // 让epoll_wait停止监控此vc的socket fd
+  vc->ep.stop();
+  // 关闭socket fd
+  vc->con.close();
+
+  // 这里没有异步处理策略，必须保证是由管理此vc的线程发起调用
+  // 事实上这里 t == this_ethread()，可以查阅ATS代码中调用close_UnixNetVConnection的地方来确认
+  ink_release_assert(vc->thread == t);
+
+  // 清理超时计数器
+  vc->next_inactivity_timeout_at = 0;
+  vc->next_activity_timeout_at = 0;
+  vc->inactivity_timeout_in = 0;
+  vc->active_timeout_in = 0;
+
+  // 之前的版本没有判断nh是否为空，存在bug
+  // 当nh不为空，就要将vc从几个队列中删除
+  if (nh) {
+    // 四个本地队列
+    nh->open_list.remove(vc);
+    nh->cop_list.remove(vc);
+    nh->read_ready_list.remove(vc);
+    nh->write_ready_list.remove(vc);
+    
+    // 两个enable_list是原子队列
+    // 但是 in_enable_list 的操作却无法与原子操作同步，此处我觉得存在问题！！！
+    if (vc->read.in_enabled_list) {
+      nh->read_enable_list.remove(vc);
+      vc->read.in_enabled_list = 0;
+    }
+    if (vc->write.in_enabled_list) {
+      nh->write_enable_list.remove(vc);
+      vc->write.in_enabled_list = 0;
+    }
+    
+    // 两个仅用于InactivityCop本地队列
+    vc->remove_from_keep_alive_queue();
+    vc->remove_from_active_queue();
+  }
+  
+  // 最后调用vc的free方法
+  vc->free(t);
+}
+```
+
+在vc关闭后，就需要对资源进行回收，由于vc的内存资源是通过allocate_vc函数分配的，因此在回收时也要将内存归还到内存池。
+
+每一种类型的NetVC的继承类，都会有匹配的NetProcessor继承类提供allocate_vc函数和其自身提供的free函数。
+
+```
+void
+UnixNetVConnection::free(EThread *t)
+{
+  // 只有当前线程可以释放vc资源
+  // 这里 t == thread，与close_UnixNetVConnection是一样的。
+  ink_release_assert(t == this_ethread());
+  NET_SUM_GLOBAL_DYN_STAT(net_connections_currently_open_stat, -1);
+  
+  // clear variables for reuse
+  // 释放vc的mutex
+  this->mutex.clear();
+  // 释放上层状态机的mutex
+  action_.mutex.clear();
+  got_remote_addr = 0;
+  got_local_addr = 0;
+  attributes = 0;
+  // 释放vio的mutex，可能等于上层状态机的mutex，有判断，不会重复释放内存
+  read.vio.mutex.clear();
+  write.vio.mutex.clear();
+  // 重置半关闭状态
+  flags = 0;
+  // 重置回调函数
+  SET_CONTINUATION_HANDLER(this, (NetVConnHandler)&UnixNetVConnection::startEvent);
+  // NetHandler 为空
+  nh = NULL;
+  // 重置 NetState 
+  read.triggered = 0;
+  write.triggered = 0;
+  read.enabled = 0;
+  write.enabled = 0;
+  // 重置VIO
+  read.vio._cont = NULL;
+  write.vio._cont = NULL;
+  read.vio.vc_server = NULL;
+  write.vio.vc_server = NULL;
+  // 重置options
+  options.reset();
+  // 重置 close 状态
+  closed = 0;
+  // 必须不在ready_link和enable_link中，在close_UnixNetVConnection中已经移除
+  ink_assert(!read.ready_link.prev && !read.ready_link.next);
+  ink_assert(!read.enable_link.next);
+  ink_assert(!write.ready_link.prev && !write.ready_link.next);
+  ink_assert(!write.enable_link.next);
+  ink_assert(!link.next && !link.prev);
+  // socket fd 已经关闭，在close_UnixNetVConnection中调用con.close()完成了关闭
+  ink_assert(con.fd == NO_FD);
+  ink_assert(t == this_ethread());
+
+  // 判断allocate_vc方法为vc分配内存时，是由全局内存分配还是线程本地分配
+  // 选择对应的方法归还内存资源
+  if (from_accept_thread) {
+    netVCAllocator.free(this);
+  } else {
+    THREAD_FREE(this, netVCAllocator, t);
+  }
+}
+```
+
+由于close_UnixNetVConnection和free都是不可重入的，所以在很多地方，我们都看到使用vc的重入计数器对重入进行判断。
+
+例如，在do_io_close中：
+
+```
+void
+UnixNetVConnection::do_io_close(int alerrno /* = -1 */)
+{
+  disable_read(this);
+  disable_write(this);
+  read.vio.buffer.clear();
+  read.vio.nbytes = 0;
+  read.vio.op = VIO::NONE;
+  read.vio._cont = NULL;
+  write.vio.buffer.clear();
+  write.vio.nbytes = 0;
+  write.vio.op = VIO::NONE;
+  write.vio._cont = NULL;
+
+  EThread *t = this_ethread();
+  // 通过重入计数器判断是否可以直接调用close_UnixNetVConnection
+  bool close_inline = !recursion && (!nh || nh->mutex->thread_holding == t);
+
+  INK_WRITE_MEMORY_BARRIER;
+  if (alerrno && alerrno != -1)
+    this->lerrno = alerrno;
+  if (alerrno == -1)
+    closed = 1;
+  else
+    closed = -1;
+
+  if (close_inline)
+    close_UnixNetVConnection(this, t);
+  // 此处对于不能立即关闭vc的情况没有任何操作了，也没有重新调度来延迟关闭vc
+  // 那么什么时候调用close_UnixNetVConnection来关闭vc呢？答案是：在InactivityCop中会做出处理
+}
+```
+
+### 关于 in_enable_list 操作的原子性问题的备忘录
+
+在close_UnixNetVConnection中直接对in_enable_list进行判断和置0的操作
+
+  - 如果没有对NetHandler上锁，那么就无法与原子操作同步
+  - 那么到底NetHandler有没有上锁呢？答案是上锁了！
+  - 但是在哪儿上锁的呢？
+
+提示：NetAccept的mutex在init_accept_per_thread里面为何被设置为```get_NetHandler(t)->mutex``` ?
 
 ## 参考资料
 

@@ -23,6 +23,7 @@
     - 由上层状态机，如HttpSM等，通过add_to_active_queue将vc放入，用于实现inactive timeout
     - 在InactivityCop中，通过manage_active_queue来清理
     - 另外还提供了remove_from_active_queue的方法，从队列中删除vc
+    - 注意：active_queue 和 keep_alive_queue 是互斥的，一个NetVC不可以同时出现在这两个队列中，这由add_(keep_alive|active)_queue保证
   - Que: keep_alive_queue
     - 由上层状态机，如HttpSM等，通过add_to_keep_alive_queue将vc放入，用于实现keep alive timeout
     - 在InactivityCop中，通过manage_keep_alive_queue来清理
@@ -556,6 +557,8 @@ ATS这种设计是否有问题呢？
 
 ## 参考资料
 
+![NetHandler - NetVC - VIO - UpperSM](https://cdn.rawgit.com/oknet/atsinternals/master/CH02-IOCoreNET/CH02-IOCoreNet-001.svg)
+
 - [P_UnixNet.h]
 (http://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNet.h)
 - [P_UnixPollDescriptor.h]
@@ -564,3 +567,4 @@ ATS这种设计是否有问题呢？
 (http://github.com/apache/trafficserver/tree/master/iocore/net/UnixNetVConnection.cc)
 - [UnixNet.cc]
 (http://github.com/apache/trafficserver/tree/master/iocore/net/UnixNet.cc)
+
