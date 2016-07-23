@@ -7,7 +7,7 @@
   - [CH03: SSLNextProtocolTrampoline](https://github.com/oknet/atsinternals/blob/master/CH03-IOCoreSSL/CH03S04-Base-SSLNextProtocolTrampoline.md)
   - [CH03: SessionAccept](https://github.com/oknet/atsinternals/blob/master/CH03-IOCoreSSL/CH03S02-Base-SessionAccept.md)
 
-本章节讲以Http协议的Session处理为主，介绍各个协议如何与IOCore进行衔接。
+本章节将以Http协议的Session处理为主，介绍NetVC是如何从IOCore来到各个协议的状态机的。
 
 ## 定义
 
