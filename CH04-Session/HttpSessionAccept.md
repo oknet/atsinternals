@@ -100,6 +100,7 @@ HttpSessionAccept::accept(NetVConnection *netvc, MIOBuffer *iobuf, IOBufferReade
     ////////////////////////////////////////////////////
     // 如果没有通过 ip_allow 的检查，就执行 do_io_close()
     // ??memleak?? 传入的 MIOBuffer 没有释放？
+    // Bug确认：https://issues.apache.org/jira/browse/TS-4697
     Warning("client '%s' prohibited by ip-allow policy", ats_ip_ntop(client_ip, ipb, sizeof(ipb)));
     netvc->do_io_close();
 
