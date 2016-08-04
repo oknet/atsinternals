@@ -215,7 +215,12 @@ ATS 定义了三个方法来支持：
 
 在 ProxyClientSession 中定义的这一套，三个方法是处于 Global 和 Session 层次的：
 
+  - do_api_callout 发起对指定Hook ID上的plugin函数的调用
+  - 如果没有任何plugin hook在指定的Hook ID上，就直接调用handle_api_return回到ATS的主流程
+  - 否则，通过state_api_callout来实现对plugin函数的回调
+
 ```
+// 发起对指定Hook ID上的plugin函数的调用
 void
 ProxyClientSession::do_api_callout(TSHttpHookID id)
 {
@@ -249,54 +254,109 @@ ProxyClientSession::do_api_callout(TSHttpHookID id)
 ```
 
 ```
+// Hook ID的合法性检查
+static bool
+is_valid_hook(TSHttpHookID hookid)
+{
+  return (hookid >= 0) && (hookid < TS_HTTP_LAST_HOOK);
+}
+```
+
+```
+// 实现对plugin函数的回调
 int
 ProxyClientSession::state_api_callout(int event, void * /* data ATS_UNUSED */)
 {
   switch (event) {
-  case EVENT_NONE:
-  case EVENT_INTERVAL:
-  case TS_EVENT_HTTP_CONTINUE:
+  case EVENT_NONE:  // 表示首次触发，此时：
+                    //   this->api_hookid  为触发的Hook ID
+                    //   this->api_scope   为触发的层次：Global, Local, None 分别表示全局、会话、事务但哥级别
+                    //   this->api_current 为NULL，之后将会指向正在执行的plugin回调函数
+  case EVENT_INTERVAL:  // 表示这是直接来自EventSystem的定时回调
+                        // 通常在回调 Plugin 时需要上锁，如果上锁失败，则会安排EventSystem延时重新回调
+  case TS_EVENT_HTTP_CONTINUE:  // 表示这是来自 Plugin 的通知消息，让ATS继续处理这个会话
+                                // 通过 TSHttpSsnReenable 可以向 ClientSession 发送消息
+    // 判断 api_hookid 是否是一个合法有效的Hook ID
     if (likely(is_valid_hook(this->api_hookid))) {
+      // api_current == NULL 表示当前没有正在执行的plugin回调函数
+      // api_scope == GLOBAL 表示需要从全局层级开始查找plugin回调函数的设定
       if (this->api_current == NULL && this->api_scope == API_HOOK_SCOPE_GLOBAL) {
+        // 获取 api_hookid 对应的全局层级的 plugin 回调函数
+        // 如果没有找到，那么返回NULL，则api_current == NULL
+        // 这里 http_global_hooks 为全局变量
         this->api_current = http_global_hooks->get(this->api_hookid);
+        // 设置下一个探查层级为会话层级
         this->api_scope = API_HOOK_SCOPE_LOCAL;
       }
 
+      // 如果获取全局层级失败，则 api_current == NULL
+      //     则继续获 api_hookid 对应的取会话层级的 plugin 回调函数
+      // 如果获取全局层级成功，则跳过
       if (this->api_current == NULL && this->api_scope == API_HOOK_SCOPE_LOCAL) {
+        // 获取 api_hookid 对应的会话层级的 plugin 回调函数
+        // 如果没有找到，那么返回NULL，则api_current == NULL
+        // 这里 ssn_hook_get 为成员函数
         this->api_current = ssn_hook_get(this->api_hookid);
+        // 设置下一个探查层级为事务层级
         this->api_scope = API_HOOK_SCOPE_NONE;
       }
 
+      // 由于 TS_HTTP_SSN_START_HOOK 和 TS_HTTP_SSN_CLOSE_HOOK 不支持会话层级
+      // 因此这里没有继续判断，获取会话层级的 plugin 回调函数
+
+      // 如果获取 plugin 回调函数成功，这里可能是 全局 或 会话 层级
       if (this->api_current) {
         bool plugin_lock = false;
         APIHook *hook = this->api_current;
+        // 创建自动指针
         Ptr<ProxyMutex> plugin_mutex;
 
+        // 每一个 plugin 的回调函数都由 Continuation 来封装，因此都会有一个 mutex
+        // 如果这个mutex被正确设置了，则需要对mutex上锁，
+        // 但是，也会存在mutex未设置的情况，此时则跳过上锁过程。
         if (hook->m_cont->mutex) {
           plugin_mutex = hook->m_cont->mutex;
+          // 对 plugin 的 Cont 尝试上锁
           plugin_lock = MUTEX_TAKE_TRY_LOCK(hook->m_cont->mutex, mutex->thread_holding);
+          // 上锁失败，则在 10ms 之后重新调用 state_api_callout 重试
           if (!plugin_lock) {
             SET_HANDLER(&ProxyClientSession::state_api_callout);
             mutex->thread_holding->schedule_in(this, HRTIME_MSECONDS(10));
             return 0;
           }
+          // 注意此处没有自动解锁！！
         }
 
+        // 如果有多个 plugin 都对同一个Hook ID有兴趣，那么则继续设置该Hook ID对应的下一个 plugin 的回调函数
+        // 如果这是该 Hook ID 在当前层级的最后一个 plugin，那么会返回 NULL
         this->api_current = this->api_current->next();
+        // 回调 plugin 的 Hook 函数
+        // 对于没有正确设置mutex的情况，不对plugin的mutex上锁，那么直接回调 plugin 难道不会有问题吗？？？
+        // invoke 方法，相当于直接调用了 plugin 里设置的回调函数，通过eventmap数组把Hook ID转换为对应的Event ID
         hook->invoke(eventmap[this->api_hookid], this);
 
+        // 如果之前成功上锁，这里要显示解锁
         if (plugin_lock) {
           Mutex_unlock(plugin_mutex, this_ethread());
         }
 
+        // 成功回调之后，直接返回
+        // 等待 Plugin 调用 TSHttpSsnReenable 方法，此时会重新调用 ClientSession 的 handleEvent()
+        // 而 handleEvent 则指向 state_api_callout
+        // Plugin 会传入两种类型的事件：TS_EVENT_HTTP_CONTINUE 或 TS_EVENT_HTTP_ERROR
+        // 感觉这里设计的也不是特别好，与HTTP协议相关的EVENT，竟然放在了ProxyClientSession的基类里
+        // 这里实际上是返回的 EVENT_DONE = 0
         return 0;
       }
     }
 
+    // 如果在 全局 和 会话 级别都没有找到与 Hook ID 关联的 Plugin，则直接通过 handle_api_return 返回到ATS的主流程
     handle_api_return(event);
     break;
 
-  case TS_EVENT_HTTP_ERROR:
+  case TS_EVENT_HTTP_ERROR:  // 表示这是来自 Plugin 的通知消息，通知ATS这个会话出现了错误，需要由ATS终止这个会话
+                             // 通过 TSHttpSsnReenable 可以向 ClientSession 发送消息
+    // 通过将 TS_EVENT_HTTP_ERROR 传递给 handle_api_return 来完成错误处理
     this->handle_api_return(event);
     break;
 
@@ -305,6 +365,7 @@ ProxyClientSession::state_api_callout(int event, void * /* data ATS_UNUSED */)
     ink_assert(false);
   }
 
+  // 这里实际上是返回的 EVENT_DONE = 0
   return 0;
 }
 ```
