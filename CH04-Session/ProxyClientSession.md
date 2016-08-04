@@ -21,9 +21,14 @@ class ProxyClientSession : public VConnection
 public:
   ProxyClientSession();
 
+  // 回收 ClientSession 的资源，并释放自身
+  // 调用该方法之前必须首先执行 do_io_close 和 release_netvc 两个方法。
+  // 这里是否应该声明为纯虚函数？
   virtual void destroy();
+  // 开始一个事务
   virtual void start() = 0;
 
+  // 开始一个会话
   virtual void new_connection(NetVConnection *new_vc, MIOBuffer *iobuf, IOBufferReader *reader, bool backdoor) = 0;
 
   virtual void
@@ -38,7 +43,9 @@ public:
     this->api_hooks.prepend(id, cont);
   }
 
+  // 获取与ClientSession对应的netvc
   virtual NetVConnection *get_netvc() const = 0;
+  // 与netvc解除关联，但是不会关闭netvc
   virtual void release_netvc() = 0;
 
   APIHook *
@@ -94,9 +101,14 @@ protected:
   bool hooks_on;
 
 private:
+  // 当前正在处理的Hook信息
+  //     Hook 等级（全局、会话、事务）
   APIHookScope api_scope;
+  //     Hook ID
   TSHttpHookID api_hookid;
+  //     当前正在回调的与此Hook ID关联的Plugin回调函数
   APIHook *api_current;
+  // 所有注册到当前 ClientSession 的Plugin回调函数与Hook ID的对应关系
   HttpAPIHooks api_hooks;
   void *user_args[HTTP_SSN_TXN_MAX_USER_ARG];
 
@@ -370,6 +382,88 @@ ProxyClientSession::state_api_callout(int event, void * /* data ATS_UNUSED */)
 }
 ```
 
+```
+// 回到ATS的主流程
+void
+ProxyClientSession::handle_api_return(int event)
+{
+  // 保存当前的 Hook ID
+  TSHttpHookID hookid = this->api_hookid;
+  // 设置回调函数为 state_api_callout
+  // 这是一个保护性设置，但是在应用中不会被回调
+  //     如果不幸被回调了，会触发assert
+  SET_HANDLER(&ProxyClientSession::state_api_callout);
+
+  // 重置 ClientSession 的 Hook 状态
+  this->api_hookid = TS_HTTP_LAST_HOOK;
+  this->api_scope = API_HOOK_SCOPE_NONE;
+  this->api_current = NULL;
+
+  // 根据之前保存的 Hook ID 来执行对应的操作
+  switch (hookid) {
+  case TS_HTTP_SSN_START_HOOK:
+    // 如果 Hook ID 是 SSN START
+    if (event == TS_EVENT_HTTP_ERROR) {
+      // 如果之前通过 TSHttpSsnReenable 传递的是 ERROR，则执行关闭ClientSession的操作
+      this->do_io_close();
+    } else {
+      // 如果是 CONTINUE，则开始一个事务
+      this->start();
+    }
+    break;
+  case TS_HTTP_SSN_CLOSE_HOOK: {
+    // 如果 Hook ID 是 SSN CLOSE
+    NetVConnection *vc = this->get_netvc();
+    if (vc) {
+      // 由于是 SSN CLOSE HOOK，无论出现任何错误，都是要关闭ClientSession的，所以就不需要对 event 进行判断了
+      // 关闭 netvc
+      vc->do_io_close();
+      // 把保存了 netvc 的成员变量设置为 NULL
+      this->release_netvc();
+    }
+    // 首先，释放继承类的成员对象
+    // 然后，释放 ProxyClientSession 的 api_hooks 和 mutex
+    // 最后，回收 ClientSession 对象的内存
+    this->destroy();
+    break;
+  }
+  default:
+    Fatal("received invalid session hook %s (%d)", HttpDebugNames::get_api_hook_name(hookid), hookid);
+    break;
+  }
+}
+```
+可以看到在ProxyClientSession这个基类里只实现了对SSN START和SSN CLOSE两个Hook点返回到ATS主流程之后的处理。
+
+但是在 SSN START 遇到错误关闭 ClientSession 时，与 SSN CLOSE 之后关闭 ClientSession 的代码又完全不一样，这是为什么？
+
+  - 在调用 this->do_io_close() 之后，仍然需要触发 SSN CLOSE Hook
+  - 在 SSN CLOSE Hook 之后，直接关闭NetVC，并释放 ClientSession 的资源就可以了
+
+所以：
+
+  - this->do_io_close() 被设计用来
+    - 执行对 ClientSession 的关闭，只是设置状态为关闭，但是不回收任何资源
+    - 然后触发 SSN CLOSE Hook
+  - 由 Plugin 返回后，来到 handle_api_return 的 SSN CLOSE Hook 的处理点
+    - 在这里才是最后关闭 NetVC
+    - 然后回收 ClientSession 的资源
+
+## 与 SessionAccept 的关系
+
+XxxSessionAccept::accept()
+  - cs = THREAD_ALLOC(XxxClientSession)
+  - cs->new_connection()
+
+XxxClientSession::new_connection()
+  - do_api_callout(TS_HTTP_SSN_START_HOOK)
+  - handle_api_return(TS_HTTP_SSN_START_HOOK)
+  - start()
+
+XxxClientSession::start()
+  - 开始事务处理
+  - Http 协议相对简单，在 start() 中调用 new_transaction()
+  - H2 协议相对复杂，需要做更多的操作，则未定义 new_transaction()
 
 ## 参考资料
 
