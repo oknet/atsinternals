@@ -250,7 +250,7 @@ public:
     - 表示当前 HttpClientSession 进入关闭状态
     - 接下来会触发 TS_HTTP_SSN_CLOSE_HOOK，然后就会关闭 NetVConnection
 
-在上面的介绍种，同时介绍了两个回调函数
+在上面的介绍中，同时介绍了两个回调函数
 
   - state_keep_alive
   - state_wait_for_close
