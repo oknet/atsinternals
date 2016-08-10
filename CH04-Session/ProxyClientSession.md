@@ -452,18 +452,26 @@ ProxyClientSession::handle_api_return(int event)
 ## 与 SessionAccept 的关系
 
 XxxSessionAccept::accept()
+
   - cs = THREAD_ALLOC(XxxClientSession)
   - cs->new_connection()
 
 XxxClientSession::new_connection()
+
   - do_api_callout(TS_HTTP_SSN_START_HOOK)
   - handle_api_return(TS_HTTP_SSN_START_HOOK)
   - start()
 
 XxxClientSession::start()
+
   - 开始事务处理
   - Http 协议相对简单，在 start() 中调用 new_transaction()
   - H2 协议相对复杂，需要做更多的操作，则未定义 new_transaction()
+
+XxxxSessionAccept 通常用来创建 XxxxClientSession，例如：
+
+  - HttpSessionAccept 创建 HttpClientSession
+  - Http2SessionAccept 创建 Http2ClientSession
 
 ## 参考资料
 
