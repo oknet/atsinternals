@@ -18,8 +18,8 @@ HttpClientSession 是 ProxyClientSession 的继承类。
 |     Type    |   NetVConnection   |    HttpClientSession   |
 |:-----------:|:------------------:|:----------------------:|
 |     资源    |       con.fd       |        client_vc       |
-|      读     |     read._cont     | client_vc->read._cont  |
-|      写     |     write._cont    | client_vc->write._cont |
+|    读回调   |     read._cont     | client_vc->read._cont  |
+|    写回调   |     write._cont    | client_vc->write._cont |
 |     驱动    |     NetHandler     |           none         |
 
 很有趣的现象：
@@ -29,16 +29,20 @@ HttpClientSession 是 ProxyClientSession 的继承类。
     - 而 HttpClientSession 又对 NetVConnection 做了一层封装
     - 所以 XxxSM 也会把 HttpClientSession 当作资源来访问
   - HttpClientSession 直接把 do_io 操作透传给了 NetVConnection
-  - 前面讲过 NetVConnection 自身也是一个状态机，有三个状态及对应的事件回调函数
-    - startEvent 处理connect
-    - acceptEvent 处理accept
-    - mainEvent 处理timeout
-  - HttpClientSession 自身也是一个状态机，也有对应的状态回调函数
-    - state_wait_for_close
-    - state_keep_alive
-    - state_slave_keep_alive
-    - 具体的功能，接下来进行分析
 
+前面的章节讲过 NetVConnection 自身也是一个状态机，有三个状态及对应的回调函数：
+
+  - startEvent 处理connect
+  - acceptEvent 处理accept
+  - mainEvent 处理timeout
+
+HttpClientSession 自身也是一个状态机，也有多个状态及对应的回调函数：
+
+  - state_wait_for_close
+  - state_keep_alive
+  - state_slave_keep_alive
+
+具体的状态和功能，接下来进行分析。
 
 ## 定义
 
@@ -218,6 +222,54 @@ public:
 ```
 
 ## 状态（State）
+
+在 HttpClientSession 的定义中通过一个枚举类型定义了五个状态值，用来指示 HttpClientSession 的状态：
+
+  - HCS_INIT
+    - 构造函数设置的初始值，没有什么用处
+  - HCS_ACTIVE_READER
+    - 表示当前正在由 HttpSM 来接管来自 NetVC 的数据流
+    - 这里把 HttpSM 称之为 reader，因为 HttpClientSession 本身也是一个 VConnection
+    - VConnection 一端连接了可以读写的资源，一端连接了状态机。
+  - HCS_KEEP_ALIVE
+    - 表示当前 HttpSM 已经与 HttpClientSession 分离
+    - 当前由 HttpClientSession::state_keep_alive 接管 NetVConnection 的读事件
+    - ka_vio 成员保存了 do_io_read 返回的VIO
+    - read_buffer 成员作为接收数据的缓冲区
+    - Inactivity Timeout 为 ka_in
+    - 取消了 Active Timeout
+    - 当Client与ATS之间的连接支持Keep Alive时，在第一个请求处理完成之后，就会进入这个状态，直到下一个请求的到来
+  - HCS_HALF_CLOSED
+    - 由于某种原因，HttpSM 发送完响应之后，就不会再接收来自 Client 的请求了，此时会设置半关闭
+    - 此时应该由 Client 主动断开连接，当 HttpClientSession 收到 EVENT_EOS 时再完全关闭
+    - 当前由 HttpClientSession::state_wait_for_close 接管 NetVConnection 上的读事件
+    - ka_vio 成员保存了 do_io_read 返回的VIO
+    - read_buffer 成员作为接收数据的缓冲区
+    - 但是后续接收到的信息，都会被直接丢弃
+  - HCS_CLOSED
+    - 表示当前 HttpClientSession 进入关闭状态
+    - 接下来会触发 TS_HTTP_SSN_CLOSE_HOOK，然后就会关闭 NetVConnection
+
+在上面的介绍种，同时介绍了两个回调函数
+
+  - state_keep_alive
+  - state_wait_for_close
+
+还有一个回调函数
+
+  - state_slave_keep_alive
+
+在 ATS 中，HttpServerSession 被设计为 HttpClientSession 的 slave，对应的 HttpClientSession 就是 master，在 master 上收到一个请求就会创建一个 HttpSM 来解析，然后会把 slave 关联到 master 上，当处理完成一个 HTTP 请求之后，就会释放 HttpSM 对象。
+
+但是 master 与 slave 的关系仍然需要保留，这样才能在 Http Keep alive 支持中，继续把来自 Client 的请求仍然发送到上一次使用的那个TCP连接。
+
+但是在两个 HTTP 请求中存在一个间隙，这个间隙里没有 HttpSM 对象来接管来自 Client NetVConnection 和 Server NetVConnection 的读事件，于是这个任务就安排给了 HttpClientSession，所以：
+
+  - ka_vio 用来保存 Client NetVConnection 上的 do_io_read 返回的 VIO
+  - read_buffer 是用来接收数据的缓冲区
+  - ka_slave 用来保存 Server NetVConnection 上的 do_io_read 返回的 VIO
+  - ssession 指向与 HttpClientSession 关联的 HttpServerSession 对象
+  - ssession->read_buffer 是用来接收数据的缓冲区
 
 ## 理解 ClientSession 与 NetVConnection
 
