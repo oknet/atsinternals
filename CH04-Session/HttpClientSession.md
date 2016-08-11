@@ -286,7 +286,7 @@ HttpClientSession 和 NetVConnection 同样都是继承自 VConnection 基类，
   - 可以看到，现有的设计可以更灵活的支持多种协议
   - 同时支持 NetVConnection 的多操作系统支持（UnixNetVConnection）
 
-所以 HttpClientSession 理论上就是一种更抽象的 NetVConnection，便于 HttpSM 的操作和处理。
+所以 HttpClientSession 理论上就是一种更具体的，与协议相关的 NetVConnection，方便与 HttpSM 的协同。
 
 ## 参考资料
 
