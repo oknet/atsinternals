@@ -173,7 +173,10 @@ private:
   bool tcp_init_cwnd_set;
   // 半关闭状态
   bool half_close;
-  // ???
+  // 用来帮助统计当前ATS处理的并发连接数：http_current_client_connections_stat
+  // 当前Session计入并发连接后，该值为 true
+  // 当前Session从并发连接减除后，该值为 false
+  // 但是在 do_io_close 中执行了减除操作后，为什么还要在 release 方法中再次判断？？？
   bool conn_decrease;
   // HTTP/2 支持
   bool upgrade_to_h2c; // Switching to HTTP/2 with upgrade mechanism
@@ -182,9 +185,9 @@ private:
   // 可以保证同一个连接上的请求，可以发送到对应的 HttpServerSession
   HttpServerSession *bound_ss;
 
-  // ????
+  // 对应 ka_vio 的 MIOBuffer
   MIOBuffer *read_buffer;
-  // ????
+  // 与 read_buffer 对应的 IOBufferReader
   IOBufferReader *sm_reader;
   // 指向 HttpSM 状态机
   HttpSM *current_reader;
