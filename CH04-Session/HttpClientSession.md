@@ -271,8 +271,22 @@ public:
   - ssession 指向与 HttpClientSession 关联的 HttpServerSession 对象
   - ssession->read_buffer 是用来接收数据的缓冲区
 
-## 理解 ClientSession 与 NetVConnection
+## 理解 HttpClientSession 与 NetVConnection
 
+HttpClientSession 和 NetVConnection 同样都是继承自 VConnection 基类，而且 NetVConnection 作为 HttpClientSession 的成员。
+
+可以看到 HttpClientSession 把 do_io 操作基本上透传给了 NetVConnection 成员。
+
+如果 HttpClientSession 是继承自 NetVConnection，在 NetAccept 接受一个新的 socket 连接时，直接创建 HttpClientSession，是不是也是可以的？
+
+  - 如果按照这样的设计，ATS就需要给每一种协议提供一种 NetAccept 的继承类，那么就变成了：
+    - HttpNetAccept，HttpClientSession，HttpSM
+  - 而目前的设计是：
+    - NetAccept, ProtocolSessionProbeAccept, ProtocolProbeTrampoline, HttpClientSession，HttpSM
+  - 可以看到，现有的设计可以更灵活的支持多种协议
+  - 同时支持 NetVConnection 的多操作系统支持（UnixNetVConnection）
+
+所以 HttpClientSession 理论上就是一种更抽象的 NetVConnection，便于 HttpSM 的操作和处理。
 
 ## 参考资料
 
