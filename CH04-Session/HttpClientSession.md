@@ -220,6 +220,8 @@ public:
   // been successfully parsed (PARSE_DONE) and it remains to
   // be active until the transaction goes through or the client
   // aborts.
+  // 为 true ，表示当前 HttpClientSession 上的请求已经被 HttpSM 成功解析，接下来需要等待 ATS 向客户端发送数据
+  // 此时，这个 NetVC 被认为是 active connection，需要等待该事务处理完成，或者连接异常中断。
   bool m_active;
 };
 ```
@@ -273,6 +275,458 @@ public:
   - ka_slave 用来保存 Server NetVConnection 上的 do_io_read 返回的 VIO
   - ssession 指向与 HttpClientSession 关联的 HttpServerSession 对象
   - ssession->read_buffer 是用来接收数据的缓冲区
+
+## 方法
+
+下面按照运行时，各个方法被调用的顺序进行分析，首先是被HttpSessionAccept::accept()方法调用的: new_connection()
+
+```
+void
+HttpClientSession::new_connection(NetVConnection *new_vc, MIOBuffer *iobuf, IOBufferReader *reader, bool backdoor)
+{
+  ink_assert(new_vc != NULL);
+  ink_assert(client_vc == NULL);
+  // 保存 new_vc 到 HttpClientSession
+  // 相当于把 NetVC 绑定到了 HttpClientSession，解除绑定时使用 release_netvc() 方法
+  client_vc = new_vc;
+  // 设置 magic 值，用于debug内存越界等问题
+  magic = HTTP_CS_MAGIC_ALIVE;
+  // HttpClientSession 共享 NetVC 的 mutex
+  mutex = new_vc->mutex;
+  // 尝试上锁
+  // 由于与 NetVC 共享 mutex，因此这里应该、必须上锁成功
+  MUTEX_TRY_LOCK(lock, mutex, this_ethread());
+  // 这里的 assert 是一定不会触发的，如果触发，就一定是出现了问题
+  ink_assert(lock.is_locked());
+
+  // Disable hooks for backdoor connections.
+  // 不允许 backdoor 被 hook
+  this->hooks_on = !backdoor;
+
+  // Unique client session identifier.
+  // 给 HttpClientSession 生成一个唯一ID，在 debug 日志里会打印出这个 ID，方便追踪和分析
+  con_id = ProxyClientSession::next_connection_id();
+
+  // 对 HTTP 当前并发客户端事务计数器做递增
+  HTTP_INCREMENT_DYN_STAT(http_current_client_connections_stat);
+  conn_decrease = true;
+  // 对 HTTP 客户端总连接计数器做递增
+  HTTP_INCREMENT_DYN_STAT(http_total_client_connections_stat);
+  // 如果是HTTPS请求，还需要对 HTTPS 客户端总连接计数器做递增
+  if (static_cast<HttpProxyPort::TransportType>(new_vc->attributes) == HttpProxyPort::TRANSPORT_SSL) {
+    HTTP_INCREMENT_DYN_STAT(https_total_client_connections_stat);
+  }
+
+  /* inbound requests stat should be incremented here, not after the
+   * header has been read */
+  // 用来统计HTTP进来的总连接数，跟 http_total_client_connections_stat 的区别是...？？？
+  HTTP_INCREMENT_DYN_STAT(http_total_incoming_connections_stat);
+
+  // check what type of socket address we just accepted
+  // by looking at the address family value of sockaddr_storage
+  // and logging to stat system
+  // 分别统计 ipv4 和 ipv6 的HTTP客户端连接数
+  switch (new_vc->get_remote_addr()->sa_family) {
+  case AF_INET:
+    HTTP_INCREMENT_DYN_STAT(http_total_client_connections_ipv4_stat);
+    break;
+  case AF_INET6:
+    HTTP_INCREMENT_DYN_STAT(http_total_client_connections_ipv6_stat);
+    break;
+  default:
+    // don't do anything if the address family is not ipv4 or ipv6
+    // (there are many other address families in <sys/socket.h>
+    // but we don't have a need to report on all the others today)
+    break;
+  }
+
+#ifdef USE_HTTP_DEBUG_LISTS
+  ink_mutex_acquire(&debug_cs_list_mutex);
+  debug_cs_list.push(this, this->debug_link);
+  ink_mutex_release(&debug_cs_list_mutex);
+#endif
+
+  DebugHttpSsn("[%" PRId64 "] session born, netvc %p", con_id, new_vc);
+
+  // 用来接管 SSLNetVC 中剩余未读取的数据内容
+  if (!iobuf) {
+    SSLNetVConnection *ssl_vc = dynamic_cast<SSLNetVConnection *>(new_vc);
+    if (ssl_vc) {
+      iobuf = ssl_vc->get_ssl_iobuf();
+      sm_reader = ssl_vc->get_ssl_reader();
+    }
+  }
+
+  // 如果 SSLNetVC 中没有剩余数据，就创建一个新的 MIOBuffer 准备接收来自客户端的请求
+  read_buffer = iobuf ? iobuf : new_MIOBuffer(HTTP_HEADER_BUFFER_SIZE_INDEX);
+  // 创建对应的 IOBufferReader
+  // 这里存在与 SSLNetVC 部分不同步的情况，可能导致 bug，在最新版本中，已经取消了 SSLNetVC 中的 iobuf
+  sm_reader = reader ? reader : read_buffer->alloc_reader();
+
+  // INKqa11186: Use a local pointer to the mutex as
+  // when we return from do_api_callout, the ClientSession may
+  // have already been deallocated.
+  // 由于从 do_api_callout 返回后，可能 HttpClientSession 已经被释放了，
+  // 因此这里创建了一个本地变量来保存 mutex，保证从 do_api_callout 返回后的正常解锁。
+  EThread *ethis = this_ethread();
+  Ptr<ProxyMutex> lmutex = this->mutex;
+  MUTEX_TAKE_LOCK(lmutex, ethis);
+  // 由于在 HttpClientSession 中没有定义 do_api_callout 方法，
+  // 因此这里是直接调用基类 ProxyClientSession 的 do_api_callout 方法。
+  do_api_callout(TS_HTTP_SSN_START_HOOK);
+  MUTEX_UNTAKE_LOCK(lmutex, ethis);
+  // lmutex 是自动指针，这里是不是可以不写这句？
+  lmutex.clear();
+}
+```
+
+为了便于分析，我们按照没有任何 Plugin Hook 在 SSN START 这里来分析，
+
+  - 那么 do_api_callout 会直接调用 handle_api_return(TS_EVENT_HTTP_CONTINUE)
+  - 然后 handle_api_return 会调用 start() 方法
+  - HttpClientSession::start() 直接调用了 new_transaction() 方法
+
+```
+void
+HttpClientSession::new_transaction()
+{
+  ink_assert(current_reader == NULL);
+  PluginIdentity *pi = dynamic_cast<PluginIdentity *>(client_vc);
+
+  // 用来判断 client_vc 是否是一个 plugin 创建的 vc
+  // 如果不是的话，则要把 client_vc 添加到 NetHandler 的 active queue 中
+  // ATS 通过active queue来限定最大并发连接数，
+  // 如果添加失败，则说明已经达到最大并发连接数，则直接调用 do_io_close() 关闭 HttpClientSession
+  if (!pi && client_vc->add_to_active_queue() == false) {
+    // no room in the active queue close the connection
+    this->do_io_close();
+    return;
+  }
+
+  // Defensive programming, make sure nothing persists across
+  // connection re-use
+  // 预防性设计，确保不会出现连接重用
+  half_close = false;
+
+  // 设置 HttpClientSession 的状态为 HttpSM 接管
+  read_state = HCS_ACTIVE_READER;
+  // 创建 HttpSM 对象
+  current_reader = HttpSM::allocate();
+  // 初始化 HttpSM 对象
+  current_reader->init();
+  // Http事务计数器累加
+  transact_count++;
+  DebugHttpSsn("[%" PRId64 "] Starting transaction %d using sm [%" PRId64 "]", con_id, transact_count, current_reader->sm_id);
+
+  // 绑定 HttpClientSession 与 HttpSM
+  // 此时 HttpSM 通过调用 HttpClientSession 的 do_io 方法，已经把 client_vc 的 I/O 事件回调指向了 HttpSM 状态机。
+  current_reader->attach_client_session(this, sm_reader);
+  // 对 Plugin 创建的 VC 额外处理，此处跳过，暂不做分析
+  if (pi) {
+    // it's a plugin VC of some sort with identify information.
+    // copy it to the SM.
+    current_reader->plugin_tag = pi->getPluginTag();
+    current_reader->plugin_id = pi->getPluginId();
+  }
+}
+```
+
+接下来会转入 HttpSM 的处理流程，
+
+  - 在 HttpSM 需要建立与 OS 的连接时，
+    - 会在 HttpSM::do_http_server_open() 方法中调用 httpSessionManager.acquire_session()
+    - 在该方法中会通过 get_bound_ss() 获得已经绑定的 HttpServerSession，
+    - 然后调用 HttpClientSession::attach_server_session(NULL) 清除绑定关系
+    - 然后再验证之前获得的 HttpServerSession，通过验证后调用 HttpClientSession::attach_server_session(to_return)重新绑定
+    - 未通过验证，或者之前没有绑定的 HttpServerSession，则从连接池里获取 HttpServerSession 后绑定
+  - 在 HttpSM::tunnel_handler_server() 中：
+    - 判断 OS 是否支持 Keep alive，
+    - 判断 没有遇到服务端的 EOS，TIMEOUT 事件，
+    - 判断 客户端的数据流没有出现异常中止的情况，
+    - 如果开启了 attach_server_session_to_client 功能，会调用 HttpClientSession::attach_server_session(server_session)
+    - 如果没有开启该功能，则调用 server_session->release() 把 HttpServerSession 放回到连接池
+  - 在 HttpSM::release_server_session() 中：
+    - 如果这是存在需要用户认证才建立的会话
+    - 则通过 attach_server_session(server_session, false) 绑定
+
+```
+void
+HttpClientSession::attach_server_session(HttpServerSession *ssession, bool transaction_done)
+{
+  if (ssession) {
+    // 传入的 ssession 非空，表示要把 ssession 绑定到当前的 HttpClientSession
+    ink_assert(bound_ss == NULL);
+    // 设置 HttpServerSession 的状态为 已经绑定到 HttpClientSession
+    ssession->state = HSS_KA_CLIENT_SLAVE;
+    // 把 HttpServerSession 保存到 bound_ss 成员
+    bound_ss = ssession;
+    DebugHttpSsn("[%" PRId64 "] attaching server session [%" PRId64 "] as slave", con_id, ssession->con_id);
+    ink_assert(ssession->get_reader()->read_avail() == 0);
+    ink_assert(ssession->get_netvc() != client_vc);
+
+    // handling potential keep-alive here
+    // 这里应该仅针对来自 HttpSM::tunnel_handler_server() 的调用生效
+    // 对于来自 httpSessionManager.acquire_session() 的调用，感觉此处应该存在bug？
+    if (m_active) {
+      m_active = false;
+      HTTP_DECREMENT_DYN_STAT(http_current_active_client_connections_stat);
+    }
+    // Since this our slave, issue an IO to detect a close and
+    //  have it call the client session back.  This IO also prevent
+    //  the server net conneciton from calling back a dead sm
+    // 能够被关联 HttpServerSession，说明支持 Keep alive 特性，因此直接设置由 state_keep_alive 接管 HttpServerSession
+    SET_HANDLER(&HttpClientSession::state_keep_alive);
+    slave_ka_vio = ssession->do_io_read(this, INT64_MAX, ssession->read_buffer);
+    // 这里有点奇怪，为啥 HttpServerSession 的状态机要指向到 HttpClientSession？
+    ink_assert(slave_ka_vio != ka_vio);
+
+    // Transfer control of the write side as well
+    // 关闭 HttpServerSession 的数据发送，感觉这里应该时 do_io_write(NULL, 0, NULL)
+    ssession->do_io_write(this, 0, NULL);
+
+    if (transaction_done) {
+      // 默认为 true，表示调用该方法时已经处理完一个事务
+      // 接下来将要等待客户端发起下一个事务
+      // 所以设置 inactivity timeout 为 OS 端 keep alive 超时
+      ssession->get_netvc()->set_inactivity_timeout(
+        HRTIME_SECONDS(current_reader->t_state.txn_conf->keep_alive_no_activity_timeout_out));
+      // 同时取消 active timeout
+      ssession->get_netvc()->cancel_active_timeout();
+    } else {
+      // we are serving from the cache - this could take a while.
+      // 只有从 Cache 中返回需要通过用户认证才能访问的内容时
+      // 由于是从 Cache 中返回内容，需要的时间不可控，所以暂时取消 HttpServerSession 上 NetVC 的超时检测
+      // 由于 ATS 具有缓存机制，在 keep alive 连接上，可能有的事务（请求）可以命中 Cache，有的无法命中，
+      // 因此，当命中 Cache 时，由 Cache 提供内容期间，需要保持 HttpServerSession，必须临时关闭超时控制。
+      ssession->get_netvc()->cancel_inactivity_timeout();
+      ssession->get_netvc()->cancel_active_timeout();
+    }
+  } else {
+    // 传入的 ssession 为空，表示要把绑定到当前 HttpClientSession 的信息清除
+    ink_assert(bound_ss != NULL);
+    bound_ss = NULL;
+    slave_ka_vio = NULL;
+  }
+}
+```
+
+当一个事务（请求）结束时，HttpSM 会根据情况调用 HttpClientSession::release() 或者 HttpClientSession::do_io_close()
+
+  - 如果客户端支持 keep alive，那么就会调用 release()
+  - 否则会调用 do_io_close() 
+  - 可以参考 HttpSM::tunnel_handler_ua() 的代码进行分析
+
+```
+// release 方法只是把 HttpClientSession 与 HttpSM 之间的关联断开
+// 但是 HttpClientSession 与 HttpServerSession 之间的关系，仍然不变
+// 而且不会主动关闭会话，但是由于 keep alive 连接队列满了，可能会导致被迫关闭的情况
+void
+HttpClientSession::release(IOBufferReader *r)
+{
+  // release 调用必须由上层状态机完成一个事务处理后发起
+  // 因此在调用 release 时，HttpClientSession 的状态必须为 HCS_ACTIVE_READER
+  ink_assert(read_state == HCS_ACTIVE_READER);
+  ink_assert(current_reader != NULL);
+  // 从 HttpSM 获得客户端的 keep alive 的超时时间设置
+  MgmtInt ka_in = current_reader->t_state.txn_conf->keep_alive_no_activity_timeout_in;
+
+  DebugHttpSsn("[%" PRId64 "] session released by sm [%" PRId64 "]", con_id, current_reader->sm_id);
+  // 解除 HttpClientSession 与 HttpSM 的关联
+  current_reader = NULL;
+
+  // handling potential keep-alive here
+  // 如果该连接为 active connection，则转为 inactive
+  // 同时对 HTTP 当前活动客户端连接计数器做递减
+  if (m_active) {
+    m_active = false;
+    HTTP_DECREMENT_DYN_STAT(http_current_active_client_connections_stat);
+  }
+  // Make sure that the state machine is returning
+  //  correct buffer reader
+  // 容错性检查，要求必须传入正确的 IOBufferReader
+  ink_assert(r == sm_reader);
+  if (r != sm_reader) {
+    // 否则通过立即调用 do_io_close() 关闭会话，来减小此异常/问题产生的影响
+    this->do_io_close();
+    return;
+  }
+
+  // 对 HTTP 当前并发客户端事务计数器做递减
+  HTTP_DECREMENT_DYN_STAT(http_current_client_transactions_stat);
+
+  // Clean up the write VIO in case of inactivity timeout
+  // 关闭 client_vc 上的写操作
+  this->do_io_write(NULL, 0, NULL);
+
+  // Check to see there is remaining data in the
+  //  buffer.  If there is, spin up a new state
+  //  machine to process it.  Otherwise, issue an
+  //  IO to wait for new data
+  if (sm_reader->read_avail() > 0) {
+    // 查看在读取缓冲区内是否有从 client_vc 接收到的请求数据，
+    //   例如在 pipeline 模式下，可能已经有下一个请求在读取缓冲区中了
+    // 直接调用 new_transaction() 开始下一个请求的处理。
+    DebugHttpSsn("[%" PRId64 "] data already in buffer, starting new transaction", con_id);
+    new_transaction();
+  } else {
+    // 如果没有任何数据
+    DebugHttpSsn("[%" PRId64 "] initiating io for next header", con_id);
+    // HttpClientSession 进入 HCS_KEEP_ALIVE 状态
+    read_state = HCS_KEEP_ALIVE;
+    // 由 state_keep_alive 来接管 client_vc 上读取到的数据
+    SET_HANDLER(&HttpClientSession::state_keep_alive);
+    ka_vio = this->do_io_read(this, INT64_MAX, read_buffer);
+    ink_assert(slave_ka_vio != ka_vio);
+    // 设置等待超时时间（由 HttpSM 获取）
+    client_vc->set_inactivity_timeout(HRTIME_SECONDS(ka_in));
+    // 取消 active timeout
+    client_vc->cancel_active_timeout();
+    // 将 client_vc 放入 NetHandler 的 keep_alive 连接队列
+    client_vc->add_to_keep_alive_queue();
+    // 如果连接队列满了，会立即关闭 client_vc，state_keep_alive()会收到 TIMEOUT 事件，然后调用 do_io_close()
+  }
+}
+```
+
+```
+// do_io_close 首先将 HttpClientSession 与 HttpServerSession 之间的关联断开
+// 然后把 HttpServerSession 放回连接池，然后执行会话的关闭过程
+void
+HttpClientSession::do_io_close(int alerrno)
+{
+  // 如果是由 HttpSM 处理完一个 HTTP 请求后调用，状态值应该为 HCS_ACTIVE_READER
+  // 但是 do_io_close 调用可能来自 HttpClientSession 内部，例如：
+  //   在 HCS_KEEP_ALIVE 状态时收到了 EOS 或者 TIMEOUT 事件
+  if (read_state == HCS_ACTIVE_READER) {
+    // 对 HTTP 当前并发客户端事务计数器做递减
+    HTTP_DECREMENT_DYN_STAT(http_current_client_transactions_stat);
+    // 如果该连接为 active connection，则转为 inactive
+    // 同时对 HTTP 当前活动客户端连接计数器做递减
+    if (m_active) {
+      m_active = false;
+      HTTP_DECREMENT_DYN_STAT(http_current_active_client_connections_stat);
+    }
+  }
+
+  // Prevent double closing
+  // 防止多重关闭的 assert
+  ink_release_assert(read_state != HCS_CLOSED);
+
+  // If we have an attached server session, release
+  //   it back to our shared pool
+  // 回收 HttpServerSession 到 Session Pool
+  if (bound_ss) {
+    bound_ss->release();
+    bound_ss = NULL;
+    slave_ka_vio = NULL;
+  }
+
+  if (half_close && this->current_reader) {
+    // 判断执行半关闭操作
+    read_state = HCS_HALF_CLOSED;
+    // 由 state_wait_for_close 处理半关闭
+    SET_HANDLER(&HttpClientSession::state_wait_for_close);
+    DebugHttpSsn("[%" PRId64 "] session half close", con_id);
+
+    // We want the client to know that that we're finished
+    //  writing.  The write shutdown accomplishes this.  Unfortuantely,
+    //  the IO Core semantics don't stop us from getting events
+    //  on the write side of the connection like timeouts so we
+    //  need to zero out the write of the continuation with
+    //  the do_io_write() call (INKqa05309)
+    // 向客户端发送半关闭，客户端可以通过 read() 返回值为0，判断关闭事件
+    client_vc->do_io_shutdown(IO_SHUTDOWN_WRITE);
+
+    // 关注后续 client_vc 上的数据，但是这些数据在 state_wait_for_close 直接被丢弃
+    ka_vio = client_vc->do_io_read(this, INT64_MAX, read_buffer);
+    ink_assert(slave_ka_vio != ka_vio);
+
+    // [bug 2610799] Drain any data read.
+    // If the buffer is full and the client writes again, we will not receive a
+    // READ_READY event.
+    // 直接丢弃来自 client_vc 剩余未处理的数据
+    sm_reader->consume(sm_reader->read_avail());
+
+    // Set the active timeout to the same as the inactive time so
+    //   that this connection does not hang around forever if
+    //   the ua hasn't closed
+    // 设置一个超时时间，防止客户端长时间不关闭
+    client_vc->set_active_timeout(HRTIME_SECONDS(current_reader->t_state.txn_conf->keep_alive_no_activity_timeout_out));
+  } else {
+    // 否则执行完全关闭操作 
+    read_state = HCS_CLOSED;
+    // clean up ssl's first byte iobuf
+    // 清理 SSLNetVC 的 iobuf
+    SSLNetVConnection *ssl_vc = dynamic_cast<SSLNetVConnection *>(client_vc);
+    if (ssl_vc) {
+      ssl_vc->set_ssl_iobuf(NULL);
+    }
+    // 切换到 HTTP/2，暂不做分析
+    if (upgrade_to_h2c) {
+      Http2ClientSession *h2_session = http2ClientSessionAllocator.alloc();
+
+      h2_session->set_upgrade_context(&current_reader->t_state.hdr_info.client_request);
+      h2_session->new_connection(client_vc, NULL, NULL, false /* backdoor */);
+      // Handed over control of the VC to the new H2 session, don't clean it up
+      this->release_netvc();
+      // TODO Consider about handling HTTP/1 hooks and stats
+    } else {
+      DebugHttpSsn("[%" PRId64 "] session closed", con_id);
+    }
+    // 统计 平均每个客户端连接上的 HTTP 事务数
+    HTTP_SUM_DYN_STAT(http_transactions_per_client_con, transact_count);
+    // 对 HTTP 当前并发客户端连接计数器做递减
+    HTTP_DECREMENT_DYN_STAT(http_current_client_connections_stat);
+    conn_decrease = false;
+    // 触发 SSN CLOSE HOOK
+    do_api_callout(TS_HTTP_SSN_CLOSE_HOOK);
+  }
+}
+```
+
+为了便于分析，我们按照没有任何 Plugin Hook 在 SSN CLOSE 这里来分析：
+
+  - 执行 client_vc->do_io_close() 关闭 NetVC
+  - 执行 release_netvc() 解除 HttpClientSession 与 client_vc 的关联
+  - 调用 HttpClientSession::destroy() 释放对象
+
+```
+void
+HttpClientSession::destroy()
+{
+  DebugHttpSsn("[%" PRId64 "] session destroy", con_id);
+
+  ink_release_assert(upgrade_to_h2c || !client_vc);
+  ink_release_assert(bound_ss == NULL);
+  ink_assert(read_buffer);
+
+  // 设置 magic 值，表示当前对象占用的内存空间已经不再使用
+  magic = HTTP_CS_MAGIC_DEAD;
+  // 如果 NetVC 还没有被 HttpSM 接管，就提前导致关闭时，read_buffer 需要在这里释放
+  if (read_buffer) {
+    free_MIOBuffer(read_buffer);
+    read_buffer = NULL;
+  }
+
+#ifdef USE_HTTP_DEBUG_LISTS
+  ink_mutex_acquire(&debug_cs_list_mutex);
+  debug_cs_list.remove(this, this->debug_link);
+  ink_mutex_release(&debug_cs_list_mutex);
+#endif
+
+  // 感觉这里应该不会被运行 ...
+  // 在调用 release 之前必然会调用 do_io_close，在 do_io_close 中已经进行了处理。
+  if (conn_decrease) {
+    HTTP_DECREMENT_DYN_STAT(http_current_client_connections_stat);
+    conn_decrease = false;
+  }
+
+  // 调用 ProxyClientSession::destroy()
+  super::destroy();
+  // 释放对象所占用的内存空间
+  THREAD_FREE(this, httpClientSessionAllocator, this_thread());
+}
+```
 
 ## 理解 HttpClientSession 与 NetVConnection
 
