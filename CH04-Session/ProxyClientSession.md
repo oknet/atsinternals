@@ -15,14 +15,20 @@ ProxyClientSession 是所有 XXXClientSession的基类。
 
 ## 定义
 
+ProxyClientSession 不能直接使用，必须定义其继承类来使用。
+
 ```
 class ProxyClientSession : public VConnection
 {
 public:
   ProxyClientSession();
 
-  // 回收 ClientSession 的资源，并释放自身
-  // 调用该方法之前必须首先执行 do_io_close 和 release_netvc 两个方法。
+  // 回收 ClientSession 的资源
+  //   释放成员 api_hooks 占用的内存
+  //   释放成员 mutex 占用的内存
+  // 注意：
+  //   在继承类中需要定义此方法，用来释放对象占用的内存空间
+  //   调用该方法之前必须首先执行 do_io_close 和 release_netvc 两个方法。
   // 这里是否应该声明为纯虚函数？
   virtual void destroy();
   // 开始一个事务
