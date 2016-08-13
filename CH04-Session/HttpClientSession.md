@@ -433,12 +433,15 @@ HttpClientSession::new_transaction()
 
 接下来会转入 HttpSM 的处理流程，
 
-  - 在 HttpSM 需要建立与 OS 的连接时，
+  - 在 HttpSM 需要建立与 OS 的连接时，如果没有开启 HttpServerSession 的共享功能
     - 会在 HttpSM::do_http_server_open() 方法中调用 httpSessionManager.acquire_session()
-    - 在该方法中会通过 get_bound_ss() 获得已经绑定的 HttpServerSession，
+    - 在该方法中会通过 get_bound_ss() 获得已经绑定的 HttpServerSession，保存到 existing_ss
     - 然后调用 HttpClientSession::attach_server_session(NULL) 清除绑定关系
-    - 然后再验证之前获得的 HttpServerSession，通过验证后调用 HttpClientSession::attach_server_session(to_return)重新绑定
-    - 未通过验证，或者之前没有绑定的 HttpServerSession，则从连接池里获取 HttpServerSession 后绑定
+    - 然后再验证之前获得的 HttpServerSession，通过验证后调用 HttpSM::attach_server_session(existing_ss) 将其作为 HttpSM 的 ServerSession
+    - 未通过验证，调用 HttpClientSession::attach_server_session(NULL) 清除绑定关系
+
+然后 HttpSM 会创建 HttpTunnel，在 HttpTunnel 传递完所有数据之后：
+
   - 在 HttpSM::tunnel_handler_server() 中：
     - 判断 OS 是否支持 Keep alive，
     - 判断 没有遇到服务端的 EOS，TIMEOUT 事件，
@@ -446,8 +449,15 @@ HttpClientSession::new_transaction()
     - 如果开启了 attach_server_session_to_client 功能，会调用 HttpClientSession::attach_server_session(server_session)
     - 如果没有开启该功能，则调用 server_session->release() 把 HttpServerSession 放回到连接池
   - 在 HttpSM::release_server_session() 中：
-    - 如果这是存在需要用户认证才建立的会话
-    - 则通过 attach_server_session(server_session, false) 绑定
+    - 如果这是由 Cache 提供内容响应
+    - 则通过 HttpClientSession::attach_server_session(server_session, false) 绑定
+
+因此，HttpClientSession::attach_server_session 的功能是：
+
+  - 在 HttpSM 处理完一个事务之后，
+  - 如果需要当前的 HttpServerSession 继续处理下一个来自 HttpClientSession 的事务
+  - 那么就把当前的 HttpServerSession 绑定到 HttpClientSession 上
+  - 需要注意与 HttpSM::attach_server_session 的区别。
 
 ```
 void
