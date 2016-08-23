@@ -765,7 +765,62 @@ HttpClientSession 和 NetVConnection 同样都是继承自 VConnection 基类，
 
 所以 HttpClientSession 理论上就是一种更具体的，与协议相关的 NetVConnection，方便与 HttpSM 的协同。
 
+## TCP_INIT_CWND
+
+CWND 是 Congestion Window 的缩写，INIT CWND 表示初始拥塞窗口。
+
+在 Linux 3.0 以前，内核默认的 initcwnd 比较小，是根据 RFC3390 定义的方式，通过MSS的值计算得出：
+
+  - initcwnd = 4
+    - MSS <= 1095
+  - initcwnd = 3
+    - 1095 < MSS <= 2190
+  - initcwnd = 2
+    - MSS > 2190
+
+通常，我们的 MSS 为 1460，因此初始的拥塞控制窗口为 3。
+
+```
+/* Convert RFC3390 larger initial window into an equivalent number of packets. 
+ * This is based on the numbers specified in RFC 6861, 3.1. 
+ */  
+static inline u32 rfc3390_bytes_to_packets(const u32 smss)  
+{  
+    return smss <= 1095 ? 4 : (smss > 2190 ? 2 : 3);  
+}  
+```
+
+Linux 3.0 以后，采取了Google的建议，把初始拥塞控制窗口调到了 10。
+
+Google's advice ：《An Argument for Increasing TCP's Initial Congestion Window》
+The recommended value of initcwnd is 10*MSS.
+
+最初于 2010年10月 提出了一个 [IETF DRAFT](http://tools.ietf.org/html/draft-ietf-tcpm-initcwnd-00)，经过近10个版本的修订，于2013年4月成为 [RFC 6928](https://tools.ietf.org/html/rfc6928)。
+
+但是作为一个TCP Server，要面对不同的延迟和带宽的用户，将 initcwnd 统一的设置为10并不可取，因为对于很多通过手机上网的客户端，由于带宽较窄，反而会导致严重的网络数据拥塞。
+
+因此，ATS 创建了 [TS-940](https://issues.apache.org/jira/browse/TS-940) 来实现一个可配置的参数：
+
+  - proxy.config.http.server_tcp_init_cwnd
+
+同时为了支持基于条件，为不同的客户端设定不同的 initcwnd 的值，还支持通过 remap 来为每一个连接动态修改。
+
+TS-940 的代码提交被分为两个部分：
+
+  - https://github.com/apache/trafficserver/commit/0e4814487769a203ea3aa0522374798ec60dfe4c
+    - 在 UnixNetProcessor::accept_internal 中对 listen fd 设置 initcwnd 的值
+    - 该设置应该只对 Solaris 10+ 的版本支持
+    - 这个设置对于所有accept的连接都是有效的
+  - https://github.com/apache/trafficserver/commit/341a2c5aeac4a3073c5c84ea410455194cc909ab
+    - 这个是在 HttpClientSession::do_io_write 中对首次执行写操作之前对当前 socket 连接设置 initcwnd 的值
+    - 在进行首次 do_io_write 调用之前，肯定是已经从客户端读取到了 HTTP 请求，因此 remap 已经被执行过了
+    - 通过 remap 插件 conf_remap 可以对当前连接的 initcwnd 进行动态修改
+    - 相关的 InkAPI：
+      - TSHttpTxnConfigIntSet(TSHttpTxn txnp, TS_CONFIG_HTTP_SERVER_TCP_INIT_CWND, value)
+
+
 ## 参考资料
 
 - [HttpClientSession.h](http://github.com/apache/trafficserver/tree/master/proxy/http/HttpClientSession.h)
 - [HttpClientSession.cc](http://github.com/apache/trafficserver/tree/master/proxy/http/HttpClientSession.cc)
+- [TCP_INIT_CWND相关](http://kb.cnblogs.com/page/209101/)
