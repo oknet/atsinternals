@@ -112,6 +112,16 @@ public:
   }
 
   // 关联一个 HttpServerSession 到当前的 HttpClientSession
+  // 当 HttpSM 处理完一个 HTTP请求 后，就会：
+  //     通过 attach_server_session 把 Server NetVConnection 的回调交给 HttpClientSession，
+  //     然后释放 HttpSM 自身。
+  // 如果该请求命中了 Cache，不需要通过 OServer 获取，那么就会提前把 Server NetVConnection 关联到 HttpClientSession，
+  //     此时，由于 HttpSM 并未完成一个完整的请求处理过程，会设置 transaction_done = false;
+  // 如果传入的 HttpServerSession 为 NULL：
+  //     则表示取消当前 HttpClientSession 上的关联。
+  // 当下一个 HTTP请求 进入后，再由 HttpClientSession 创建一个新的 HttpSM 来处理，当 HttpSM 需要与 OServer 建立连接时，
+  //     会向 HttpClientSession 查找是否有之前使用过的 HttpServerSession，
+  // 此时则可以把之前关联的 HttpServerSession 通过 get_server_session 取回。
   virtual void attach_server_session(HttpServerSession *ssession, bool transaction_done = true);
   // 返回已经关联到 HttpClientSession 的 HttpServerSession
   HttpServerSession *
@@ -491,7 +501,7 @@ HttpClientSession::attach_server_session(HttpServerSession *ssession, bool trans
     ink_assert(slave_ka_vio != ka_vio);
 
     // Transfer control of the write side as well
-    // 关闭 HttpServerSession 的数据发送，感觉这里应该时 do_io_write(NULL, 0, NULL)
+    // 关闭 HttpServerSession 的数据发送，感觉这里应该是 do_io_write(NULL, 0, NULL)
     ssession->do_io_write(this, 0, NULL);
 
     if (transaction_done) {
