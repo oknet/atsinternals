@@ -792,8 +792,9 @@ static inline u32 rfc3390_bytes_to_packets(const u32 smss)
 
 Linux 3.0 以后，采取了Google的建议，把初始拥塞控制窗口调到了 10。
 
-Google's advice ：《An Argument for Increasing TCP's Initial Congestion Window》
-The recommended value of initcwnd is 10*MSS.
+Google's advice：[An Argument for Increasing TCP's Initial Congestion Window](http://code.google.com/speed/articles/tcp_initcwnd_paper.pdf)
+
+  - The recommended value of initcwnd is 10*MSS.
 
 最初于 2010年10月 提出了一个 [IETF DRAFT](http://tools.ietf.org/html/draft-ietf-tcpm-initcwnd-00)，经过近10个版本的修订，于2013年4月成为 [RFC 6928](https://tools.ietf.org/html/rfc6928)。
 
