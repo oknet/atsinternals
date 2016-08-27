@@ -160,6 +160,9 @@ Thread::set_specific()
 
 ```
 
+使用同一个 key，在不同的线程中，获得的数据是不同的，同样的，绑定的数据也只与当前线程关联。
+因此，对 thread specific 相关函数的调用是与其所在的线程紧密相关的。
+
 ```
 TS_INLINE Thread *
 this_thread()
