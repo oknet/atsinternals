@@ -143,8 +143,8 @@ public:
 
   // Copy of the owning SM's server session sharing settings
   // 在 HttpSM::state_http_server_open 中，复制当前 HttpSM 中的会话共享设置
-  TSServerSessionSharingMatchType sharing_match;
-  TSServerSessionSharingPoolType sharing_pool;
+  TSServerSessionSharingMatchType sharing_match; // 匹配方式（None，IP，Host，Both）
+  TSServerSessionSharingPoolType sharing_pool;   // 采用全局会话池或线程本地会话池
   //  int share_session;
 
   LINK(HttpServerSession, ip_hash_link);
