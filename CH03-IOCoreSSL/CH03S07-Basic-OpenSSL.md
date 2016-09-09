@@ -5,8 +5,15 @@ ATS 对 TLS/SSL 的底层支持是通过 OpenSSL 开发库实现的，因此我�
 使用 OpenSSL 的步骤如下：
 
   - 通过 SSL_CTX_new 方法创建一个 SSL_CTX 对象
-    - 该对象可以用来承载多种属性，如：证书，加解密的算法等
-  - 等网络连接创建之后，可以通过 SSL_set_fd 或 SSL_set_bio 方法把 socket fd 与 SSL 对象关联起来
+    - 该对象可以用来承载多种属性，如：
+      - 加解密的算法
+      - Session Cache
+      - Callback
+      - 证书 & 私钥
+      - 其它控制项
+  - 等网络连接创建之后，在通过 SSL_new 创建 SSL 对象
+    - 该对象可以通过 SSL_set_fd 或 SSL_set_bio 方法把 socket fd 与其关联起来
+    - 在后面对 SSL 连接进行操作时，都需要提供这个 SSL 对象
   - 使用 SSL_accept 或 SSL_connect 方法完成 SSL 握手过程
   - 然后使用 SSL_read 和 SSL_write 方法 接收 和 发送 数据
   - 最后，使用 SSL_shutdown 方法来关闭 TLS/SSL 连接
@@ -118,6 +125,57 @@ OpenSSL API 调用后会返回一些错误信息，对常见的错误信息解�
     - 表示操作正常完成，没有错误 
 
 只有这个，才是没有任何错误的完成了一个方法的调用。
+
+## 在 ATS 中创建 SSL 会话
+
+```
+static SSL *
+make_ssl_connection(SSL_CTX *ctx, SSLNetVConnection *netvc)
+{
+  SSL *ssl;
+
+  if (likely(ssl = SSL_new(ctx))) {
+    // 通过 SSL_CTX 创建 SSL 会话成功
+    // 在 netvc 中保存指向该 SSL 会话的指针
+    netvc->ssl = ssl;
+
+    // Only set up the bio stuff for the server side
+    if (netvc->getSSLClientConnection()) {
+      // 如果是ATS与OS之间的连接，则直接在读写两侧同时设置 fd BIO
+      // 因为不需要 probe 协议类型
+      SSL_set_fd(ssl, netvc->get_socket());
+    } else {
+      // 如果是Client与ATS之间的连接，那么就比较复杂：
+      // 首先，需要在Read Side设置一个 内存块 BIO
+      //     这样就可以读取一部分数据进行 probe
+      // 然后，在Write Side则直接设置 fd BIO
+      //     只有读取到的数据符合 SSL 协议要求，OpenSSL API才会执行写操作
+      netvc->initialize_handshake_buffers();
+      BIO *rbio = BIO_new(BIO_s_mem());
+      BIO *wbio = BIO_new_fd(netvc->get_socket(), BIO_NOCLOSE);
+      BIO_set_mem_eof_return(wbio, -1);
+      SSL_set_bio(ssl, rbio, wbio);
+    }
+
+    // 保存当前的 netvc 的地址到 SSL 会话里
+    //     相当于是 SSL 会话指回到 netvc 的反向指针
+    // SSL_set_app_data 是一个宏，相当于 SSL_set_ex_data(ssl, 0 /* ssl_client_data_index */, netvc);
+    // ssl_client_data_index 为 SSL_get_ex_new_index() 的返回值，
+    // 而 SSL_get_ex_new_index() 被 SSLInitClientContext() 调用，
+    // 而 SSLInitClientContext() 被 SSLNetProcessor::start() 调用，
+    // 而 SSL_get_ex_new_index() 只被调用了一次，因此 ssl_client_data_index 为 0
+    // 所以这里对于 ATS与OS之间的SSL连接 和 Client与ATS之间的SSL连接 ，可以使用：
+    //      SSL_set_app_data(ssl, netvc) 或 SSL_set_ex_data(ssl, ssl_client_data_index, netvc) 来设置netvc与SSL会话的关联
+    //      SSL_get_app_data(ssl) 或 SSL_get_ex_data(ssl, ssl_client_data_index) 来获取netvc与SSL会话的关联
+    SSL_set_app_data(ssl, netvc);
+  }
+
+  // 返回创建的 SSL 会话对象
+  return ssl;
+}
+```
+
+感觉这里应该用 ssl_netvc_data_index 来代替 ssl_client_data_index 的命名，毕竟在 server 和 client 都使用了。
 
 # 参考资料
 

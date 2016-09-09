@@ -289,10 +289,12 @@ public:
   NetHandler *nh;
   // 此连接的唯一ID，自增长值，通过UnixNetProcessor.cc::net_next_connection_number()分配
   unsigned int id;
-  // 服务器端的地址（感觉此处仅仅是为了兼容性）
-  //     在NetAccept中，在connect_re_internal中，都使用ats_ip_copy方法，从con.addr直接内存复制过来
-  //     在Connection::connect中调用setRemote方法，也使用ats_ip_copy方法，从target直接内存复制到con.addr
-  // AMC大神在这里做了一个注释，觉得这儿重复定义了，其实可以使用con.addr
+  // 对端（peer side）的地址
+  //     当ATS接受一个客户端的连接时，把客户端的IP地址填入这个变量。
+  //     当ATS连接一个服务端的时候，把服务端IP地址填入这个变量。
+  //     因此这相当于get_remote_addr()的结果，不要被server_addr的字面意思弄晕了。
+  // AMC大神在这里做了一个注释，觉得这儿重复定义了，其实可以使用remote_addr或con.addr代替
+  // 我提交了一个patch，使用get_remote_addr()来代替server_addr这个变量
   // amc - what is this for? Why not use remote_addr or con.addr?
   IpEndpoint server_addr; /// Server address and port.
 
@@ -951,8 +953,8 @@ write_to_net_io(NetHandler *nh, UnixNetVConnection *vc, EThread *thread)
 // I could overwrite it for the SSL implementation
 // (SSL read does not support overlapped i/o)
 // without duplicating all the code in write_to_net.
-// 通过MIOBufferAccessor buf消费MIOBuffer内指定长度为towrite的数据，
-// 参数，调用前必须初始化为0：
+// 通过MIOBufferAccessor buf消费MIOBuffer内指定长度为towrite的数据，并发送出去
+// 以下参数，调用前必须初始化为0：
 //     wattempted 为一个地址，在返回时设置为最后一次调用write/writev时，尝试发送的数据长度
 //  total_written 为一个地址，在返回时设置为尝试发送的数据长度，调用者需要根据返回值来计算发送成功的数据长度。
 //                    r  < 0 : total_written - wattempted;
