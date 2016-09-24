@@ -241,4 +241,4 @@ ATS的锁被设计为自动锁，你会看到在代码里很少看到使用MUTEX
 
 - [I_Lock.h]
 (http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Lock.h)
-- [ProxyMutex](CH01S03-Basic-ProxyMutex.md)
+- [ProxyMutex](CH01S03-Basic-ProxyMutex.zh.md)
