@@ -654,8 +654,10 @@ cache/I_CacheDefs.h:#define CACHE_DB_FDS 128
 但是却没有找到任何地方使用了这个宏，与社区中其它开发者进行讨论之后：
 
   - 每个硬盘 8 个文件描述符
+    - 随源代码发布的缺省配置文件records.config里面 proxy.config.cache.threads_per_disk INT 8
+    - 但是源代码里缺省为 12，如果在records.config里面没有定义该配置项则为 12
   - 早期的硬件环境是 SCSI 硬盘
-  - 每个SCSI通道最多可以连接 16 块磁盘
+    - 每个SCSI通道最多可以连接 16 块磁盘
 
 因此，用于CACHE_DB的文件描述符数量为：8 * 16 ＝ 128。
 
