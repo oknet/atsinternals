@@ -5,19 +5,23 @@ Throttle 并不是一个类，而是几个全局变量、统计值和一组函�
 通过在下面的方法中调用这些相关的函数，实现了Throttle
 
   - NetAccept::do_blocking_accept
-  - UnixNetAccept::connectUp
-  - UnixNetProcessor::connect_re_internal
+  - NetAccept::acceptFastEvent
+  - UnixNetVConnection::connectUp
 
 ATS 的 Throttle 的设计分为：
 
   - Net Throttle，这包括：
-    - ACCEPT 部分
-    - CONNECT 部分
+    - ACCEPT 方向
+    - CONNECT 方向
   - Emergency Throttle，这包括：
     - 最大文件句柄控制部分
     - 保留文件句柄用于 backdoor 的部分
 
-# 定义
+## 定义
+
+由于 Throttle 的实现并不是一个类，因此分散在多个源代码文件中。下面的介绍中，为了方便，对顺序作了调整。
+
+### 常量和变量
 
 首先是几个常量宏定义和枚举值：
 
@@ -94,7 +98,7 @@ ink_hrtime emergency_throttle_time;
 ink_hrtime last_transient_accept_error;
 ```
 
-最后是一组函数
+### 内部方法
 
 ```
 source: P_UnixNet.h
@@ -121,33 +125,6 @@ net_connections_to_throttle(ThrottleType t)
   return (int)(currently_open * headroom);
 }
 
-// PUBLIC: 这是提供给 IOCore Net Subsystem 的 Interface
-// 避免输出大量重复的“连接已达到溢出限定值”的警告信息
-// * 这个方法没有任何地方使用
-// 限制输出“number of connections reaching shedding limit”警告信息的时间间隔为 10 秒及以上
-TS_INLINE void
-check_shedding_warning()
-{
-  ink_hrtime t = Thread::get_hrtime();
-  if (t - last_shedding_warning > NET_THROTTLE_MESSAGE_EVERY) {
-    last_shedding_warning = t;
-    RecSignalWarning(REC_SIGNAL_SYSTEM_ERROR, "number of connections reaching shedding limit");
-  }
-}
-
-// PUBLIC: 这是提供给 IOCore Net Subsystem 的 Interface
-// 避免输出大量重复的“连接已达限定值”的警告信息
-// 限制输出“too many connections, throttling”警告信息的时间间隔为 10 秒及以上
-TS_INLINE void
-check_throttle_warning()
-{
-  ink_hrtime t = Thread::get_hrtime();
-  if (t - last_throttle_warning > NET_THROTTLE_MESSAGE_EVERY) {
-    last_throttle_warning = t;
-    RecSignalWarning(REC_SIGNAL_SYSTEM_ERROR, "too many connections, throttling");
-  }
-}
-
 // PRIVATE: 这是一个 Throttle 内部方法
 //   目前仅由 check_net_throttle() 调用
 // 用来判定当前是否处于正在限制连接的时刻
@@ -159,7 +136,12 @@ emergency_throttle(ink_hrtime now)
 {
   return (bool)(emergency_throttle_time > now);
 }
+```
 
+### 外部方法
+
+```
+source: P_UnixNet.h
 // PUBLIC: 这是提供给 IOCore Net Subsystem 的 Interface
 // 用于检测当前的 Throttle 状态
 //   首先判定已经打开的网络连接是否超过限制（根据ACCEPT／CONNECT类型分别加权判定）
@@ -227,7 +209,11 @@ check_emergency_throttle(Connection &con)
   }
   return false;
 }
+```
 
+### 加载配置项
+
+```
 // PUBLIC: 这是提供给 IOCore Net Subsystem 的 Interface
 // 用来更新 net_connections_throttle 值
 // 在配置文件更新之后，重设 net_connections_throttle 的值
@@ -249,7 +235,12 @@ change_net_connections_throttle(const char *token, RecDataT data_type, RecData v
   }
   return 0;
 }
+```
 
+### 错误判定与警告信息输出
+
+```
+source: P_UnixNet.h
 // PUBLIC: 这是提供给 IOCore Net Subsystem 的 Interface
 // 针对 accept() 的错误状态进行判定
 // 参数：
@@ -313,9 +304,36 @@ check_transient_accept_error(int res)
 #endif
   }
 }
+
+// PUBLIC: 这是提供给 IOCore Net Subsystem 的 Interface
+// 避免输出大量重复的“连接已达到溢出限定值”的警告信息
+// * 这个方法没有任何地方使用
+// 限制输出“number of connections reaching shedding limit”警告信息的时间间隔为 10 秒及以上
+TS_INLINE void
+check_shedding_warning()
+{
+  ink_hrtime t = Thread::get_hrtime();
+  if (t - last_shedding_warning > NET_THROTTLE_MESSAGE_EVERY) {
+    last_shedding_warning = t;
+    RecSignalWarning(REC_SIGNAL_SYSTEM_ERROR, "number of connections reaching shedding limit");
+  }
+}
+
+// PUBLIC: 这是提供给 IOCore Net Subsystem 的 Interface
+// 避免输出大量重复的“连接已达限定值”的警告信息
+// 限制输出“too many connections, throttling”警告信息的时间间隔为 10 秒及以上
+TS_INLINE void
+check_throttle_warning()
+{
+  ink_hrtime t = Thread::get_hrtime();
+  if (t - last_throttle_warning > NET_THROTTLE_MESSAGE_EVERY) {
+    last_throttle_warning = t;
+    RecSignalWarning(REC_SIGNAL_SYSTEM_ERROR, "too many connections, throttling");
+  }
+}
 ```
 
-最后一个函数：
+### 输出警告信息到客户端
 
 ```
 source: UnixNetAccept.cc
@@ -374,7 +392,7 @@ Throttle 在网络子系统中分成两个部分来实现：
 
 下面采用修复后的代码进行分析：
 
-### 在 NetAccept 中的实现
+## 在 NetAccept 中的实现
 
 NetAccept 有多种运行模式，首先分析在 Dedicated EThread 中以 blocking accept 方式运行的：
 
@@ -620,7 +638,7 @@ UnixNetVConnection::connectUp(EThread *t, int fd)
   - safe_delay() 是一个阻塞操作
   - 当状态机遇到 NET_EVENT_OPEN_FAILED 时，错误代码为 -ENET_THROTTLING 时应该执行 reschedule 操作
 
-## THROTTLE_FD_HEADROOM 限定
+### THROTTLE_FD_HEADROOM 限定
 
 这是 ATS 为了非网络通信而保留的文件描述符，注释中解释了：
 
