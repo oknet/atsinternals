@@ -410,7 +410,7 @@ VC_EVENT_ERROR
 
   - 状态机（SM）调用它来从 VConnection 读取数据。
   - 处理机（Processor）实现这个读取功能时，首先获取锁，然后将新的数据放入buf，回调Continuation，然后释放锁。
-  - 例如：让状态机处理以特殊字符标记事务结束数据传输协议。
+  - 例如：让状态机能够处理以特殊字符作为事务结束的数据传输协议（NNTP）。
 
 可能的Event Code（在状态机回调 Continuation 时，VConn可能会使用这些值作为Event Code）
 
