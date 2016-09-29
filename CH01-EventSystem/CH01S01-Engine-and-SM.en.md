@@ -48,11 +48,11 @@ Therefore,
 We should design the sub-system in the followings:
 
 - Wheel Sub-System
-  - A system to keep the wheel running
-  - A interface to start the system
+  - A system to keep the wheel running (Wheel SM)
+  - A interface to start the system (Wheel Processor)
 - Cooling Sub-System
-  - A system to trigger the the air conditioning compressor
-  - A interface to control the system
+  - A system to trigger the the air conditioning compressor (Cooling SM)
+  - A interface to control the system (Cooling Processor)
 
 At last, the passenger(s) and the driver control State Machine respectively
 - The driver knowns we are still not arrived and step on the accelerator to run the wheel
