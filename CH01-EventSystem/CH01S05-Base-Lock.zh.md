@@ -193,9 +193,52 @@ ATS的锁被设计为自动锁，你会看到在代码里很少看到使用MUTEX
 - 可以直接调用 _l.acquire(ethread) 实现阻塞，直到加锁成功
 - 但是要小心使用
 
+## DEPRECATED
+
+在最后，有几个被标记为不建议使用的上锁方法，但是在代码中仍然有很多地方在使用他们
+
+- 阻塞型上锁，阻塞直到完成上锁
+   - MUTEX_TAKE_LOCK
+   - MUTEX_TAKE_LOCK_FOR
+- 非阻塞型上锁，需要在调用后根据返回值（true/false）进行判断，有可能没有成功上锁
+   - MUTEX_TAKE_TRY_LOCK
+   - MUTEX_TAKE_TRY_LOCK_FOR
+   - MUTEX_TAKE_TRY_LOCK_FOR_SPIN
+- 释放锁／解锁
+   - MUTEX_UNTAKE_LOCK 或者 Mutex_unlock
+
+前面介绍的加锁方法，实际上是：
+
+  - 通过宏定义，创建了一个临时的对象
+  - 对象的析构函数来调用解锁方法
+  - 这样临时对象离开作用域的时候会被自动释放
+  - 从而触发析构函数的执行，完成自动解锁
+
+但是有些时候，没法使用上面的这种方式，例如下面这段代码：
+
+```
+        if (hook->m_cont->mutex) {
+          plugin_mutex = hook->m_cont->mutex;
+          plugin_lock = MUTEX_TAKE_TRY_LOCK(hook->m_cont->mutex, mutex->thread_holding);
+          if (!plugin_lock) {
+            SET_HANDLER(&ProxyClientSession::state_api_callout);
+            mutex->thread_holding->schedule_in(this, HRTIME_MSECONDS(10));
+            return 0;
+          }
+        }
+
+        this->api_current = this->api_current->next();
+        hook->invoke(eventmap[this->api_hookid], this);
+
+        if (plugin_lock) {
+          Mutex_unlock(plugin_mutex, this_ethread());
+        }
+```
+
+可以看到上锁的时候，是在一个 if 语句的作用域里，如果用上面介绍的第一种方式来上锁，离开 if 语句的作用域就会自动解锁，这显然是不正确的，所以这时就需要使用第二种方法进行上锁，这样在离开 if 语句的作用域的时候就不会自动解锁，而是需要在最后进行显示解锁。
 
 ## 参考资料
 
 - [I_Lock.h]
 (http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Lock.h)
-- [ProxyMutex](CH01S03-Basic-ProxyMutex.md)
+- [ProxyMutex](CH01S03-Basic-ProxyMutex.zh.md)

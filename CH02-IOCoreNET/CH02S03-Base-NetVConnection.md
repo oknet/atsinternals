@@ -410,7 +410,7 @@ VC_EVENT_ERROR
 
   - 状态机（SM）调用它来从 VConnection 读取数据。
   - 处理机（Processor）实现这个读取功能时，首先获取锁，然后将新的数据放入buf，回调Continuation，然后释放锁。
-  - 例如：让状态机处理以特殊字符标记事务结束数据传输协议。
+  - 例如：让状态机能够处理以特殊字符作为事务结束的数据传输协议（NNTP）。
 
 可能的Event Code（在状态机回调 Continuation 时，VConn可能会使用这些值作为Event Code）
 
@@ -561,9 +561,167 @@ VC_EVENT_ERROR
   };
 ```
 
+## TIMEOUT 事件的回调
+
+在 ATS 的代码里，我们可以看到 do_io_read 和 do_io_write 的这两种用法：
+
+  - do_io_read(NULL, 0, NULL)
+  - do_io_read(Cont, 0, NULL)
+
+第一个参数表示此NetVC上读取到数据之后回调的Continuation，通常是一个状态机，后两个参数的含义：
+
+  - 读取 0 字节
+  - 数据接收缓冲区为 NULL
+
+那么这里很明显是表示不再关心此NetVC上将来接收到的数据。
+
+所以，看上去这个状态机永远都不会被回调，所以这两种调用方法好像没有任何区别。
+
+以 do_io_read 的代码做一个分析：
+
+```
+VIO *
+UnixNetVConnection::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
+{
+  // 如果 c 为 NULL，那么 nbytes 必须为 0（是我们看到的关闭读、写do_io调用方式其中的一种）
+  // 但是，nbytes 为 0，c 可以是任意值（就是允许我们前面看到的两种关闭读、写do_io调用方式）
+  //       nbytes 不为 0，c 就不能为 NULL（要读的数据长度不为 0，自然就会在将来回调状态机，所以 c 必然不能为 NULL）
+  ink_assert(c || 0 == nbytes);
+  if (closed) {
+    Error("do_io_read invoked on closed vc %p, cont %p, nbytes %" PRId64 ", buf %p", this, c, nbytes, buf);
+    return NULL;
+  }
+  read.vio.op = VIO::READ;
+  // 这里也对 c 为 NULL 做了判断，很明显是允许设置 c 为 NULL 的
+  read.vio.mutex = c ? c->mutex : this->mutex;
+  read.vio._cont = c; 
+  read.vio.nbytes = nbytes;
+  read.vio.ndone = 0; 
+  read.vio.vc_server = (VConnection *)this;
+  if (buf) {
+    read.vio.buffer.writer_for(buf);
+    if (!read.enabled)
+      read.vio.reenable();
+  } else {
+    // buf 为 NULL 时会关闭读，与我们之前理解的也是一样的，只要 buf 为 NULL 其实就关闭了读操作
+    read.vio.buffer.clear();
+    disable_read(this);
+  }
+  return &read.vio;
+}
+```
+
+根据上面的代码来看，ATS的设计是允许这两种调用方式存在的，所谓存在的既是合理的，那么这两种方式到底有什么区别？
+
+通过对 UnixNetVConnection::mainEvent 的代码进行分析：
+
+```
+int
+UnixNetVConnection::mainEvent(int event, Event *e)
+{
+...
+  // 强制设置以下两个值为 NULL 和 0，此处应该是一个 hack
+  //     因为在此处上面有一处详细计算这两个值的代码
+  *signal_timeout = 0;
+  *signal_timeout_at = 0;
+  // 先把 WRITE vio 的回调状态机到本地临时变量
+  writer_cont = write.vio._cont;
+
+  // 如果该 NetVC 已经设置为关闭，那么就回收资源，然后返回
+  if (closed) {
+    close_UnixNetVConnection(this, thread);
+    return EVENT_DONE;
+  }
+
+  // 如果 READ vio 是读操作，并且没有半关闭读
+  if (read.vio.op == VIO::READ && !(f.shutdown & NET_VC_SHUTDOWN_READ)) {
+    // 保存 READ vio 的回调状态机到本地临时变量
+    reader_cont = read.vio._cont;
+    // signal_event 在前面的部分被设置为 VC_EVENT_INACTIVITY_TIMEOUT 或 VC_EVENT_ACTIVE_TIMEOUT
+    // 回调状态机超时信号
+    if (read_signal_and_update(signal_event, this) == EVENT_DONE)
+      // 如果该 NetVC 关闭了，就立即返回
+      return EVENT_DONE;
+  }
+
+  // 如果 WRITE vio 是写操作，并且没有半关闭写
+  //   - !*signal_timeout && !*signal_timeout_at 必定为 true，因为上面强制设置过了
+  //   - !closed 这里应该也为 true，因为在mainEvent的开始拿到了 READ vio 和 WRITE vio 的mutex，通常会复用 vc->mutex 
+  //   - reader_cont != write.vio._cont 这里表示如果之前回调过的 READ vio 状态机跟 WRITE vio 的状态机不同的话
+  //   - writer_cont == write.vio._cont 这里检查 WRITE vio 的回调状态机是否在 READ vio 回调状态机时被修改了
+  if (!*signal_timeout && !*signal_timeout_at && !closed && write.vio.op == VIO::WRITE && !(f.shutdown & NET_VC_SHUTDOWN_WRITE) &&
+      reader_cont != write.vio._cont && writer_cont == write.vio._cont)
+    // 如果上述多个条件都通过，那么就可以回调 WRITE vio 的状态机了
+    if (write_signal_and_update(signal_event, this) == EVENT_DONE)
+      // 如果该 NetVC 关闭了，就立即返回
+      return EVENT_DONE;
+  // 全部完成后返回，感觉这里应该返回 EVENT_CONT，因为毕竟 NetVC 没有关闭
+  return EVENT_DONE;
+}
+```
+
+可以看到在 mainEvent 里对 READ vio 和 WRITE vio 的回调：
+
+  - 都是超时事件
+  - 不判断 vio 的状态，即使 vio 已经被 disable 了仍然会产生回调
+  - 首先回调 READ vio 的状态机
+  - 如果 NetVC 没有被 READ vio 的状态机关闭，还会继续回调 WRITE vio 的状态机
+    - 但是，WRITE vio 的状态机如果与 READ vio 的状态机相同则不会重复回调
+
+看到这里，答案已经得出了：
+
+  - 在关闭了 READ vio 和 WRITE vio 之后，如果 cont 不为 NULL，仍然会接受到超时事件
+  - 但是前提必须是已经设置了超时时间
+
+如果设置了超时时间之后，在关闭 READ vio 或 WRITE vio 时，不小心错误的设置 cont 为 NULL 了，会出现什么状况？
+
+  - 继续看 read_signal_and_update 的代码
+
+```
+static inline int
+read_signal_and_update(int event, UnixNetVConnection *vc)
+{
+  vc->recursion++;
+  // 如果 cont 不为 NULL
+  if (vc->read.vio._cont) {
+    // 回调状态机
+    vc->read.vio._cont->handleEvent(event, &vc->read.vio);
+  } else {
+    // 如果 cont 为 NULL
+    switch (event) {
+    case VC_EVENT_EOS:
+    case VC_EVENT_ERROR:
+    // 对于两种超时事件
+    case VC_EVENT_ACTIVE_TIMEOUT:
+    case VC_EVENT_INACTIVITY_TIMEOUT:
+      Debug("inactivity_cop", "event %d: null read.vio cont, closing vc %p", event, vc);
+      // 只是设置 closed 为 1
+      vc->closed = 1;
+      break;
+    default:
+      Error("Unexpected event %d for vc %p", event, vc);
+      ink_release_assert(0);
+      break;
+    }
+  }
+  if (!--vc->recursion && vc->closed) {
+    /* BZ  31932 */
+    ink_assert(vc->thread == this_ethread());
+    // 然后此处关闭 NetVC
+    close_UnixNetVConnection(vc, vc->thread);
+    return EVENT_DONE;
+  } else {
+    return EVENT_CONT;
+  }
+}
+```
+
+可以看到，IOCore的网络子系统为这种情况设置了缺省机制，但是这样的话，状态机就不会收到超时事件了。
+
 ## 参考资料
 - [I_VConnection.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_VConnection.h)
 - [I_VIO.h]
 (http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_VIO.h)
 - [I_IOBuffer.h]
 (http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_IOBuffer.h)
+- [UnixNetVConnection.cc](http://github.com/apache/trafficserver/tree/master/iocore/net/UnixNetVConnection.cc)

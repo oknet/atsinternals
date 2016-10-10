@@ -35,6 +35,7 @@ public:
   virtual ~Thread();
 
   static ink_hrtime cur_time;
+  // 静态变量，初始化为 init_thread_key()
   inkcoreapi static ink_thread_key thread_data_key;
   Ptr<ProxyMutex> mutex_ptr;
 
@@ -73,6 +74,232 @@ public:
 
 extern Thread *this_thread();
 ```
+
+## 方法
+
+### Thread::Thread()
+
+  - 用于初始化 mutex
+  - 并且上锁
+  - 线程总是保持对其自身 mutex 的锁定
+  - 这样凡是复用线程 mutex 对象，则相当于被线程永久锁定，成为只属于此线程的本地对象
+
+```
+Thread::Thread()
+{
+  mutex = new_ProxyMutex();
+  mutex_ptr = mutex;
+  MUTEX_TAKE_LOCK(mutex, (EThread *)this);
+  mutex->nthread_holding = THREAD_MUTEX_THREAD_HOLDING;
+}
+```
+
+### Thread::set_specific()
+
+```
+// source: iocore/eventsystem/P_Thread.h
+TS_INLINE void
+Thread::set_specific()
+{
+  把当前对象（this）关联到 key
+  ink_thread_setspecific(Thread::thread_data_key, this);
+}
+```
+
+## 关于 this_thread()
+
+  - 返回当前 Thread 对象
+  - 由于 EThread 继承自 Thread，因此
+    - 在 EThread 中调用 this_thread() 返回的是 EThread 对象
+    - 但是返回值的类型仍然是 Thread *
+    - 为了提供争取的返回值类型，在 EThread 中又定义了 this_ethread() 方法
+
+```
+  // 下面是 I_Thread.h 中的一段注释
+  The Thread class maintains a thread_key which registers *all*
+  the threads in the system (that have been created using Thread or
+  a derived class), using thread specific data calls.  Whenever, you
+  call this_thread() you get a pointer to the Thread that is currently
+  executing you.  Additionally, the EThread class (derived from Thread)
+  maintains its own independent key. All (and only) the threads created
+  in the Event Subsystem are registered with this key. Thus, whenever you
+  call this_ethread() you get a pointer to EThread. If you happen to call
+  this_ethread() from inside a thread which is not an EThread, you will
+  get a NULL value (since that thread will not be  registered with the
+  EThread key). This will hopefully make the use of this_ethread() safer.
+  Note that an event created with EThread can also call this_thread(),
+  in which case, it will get a pointer to Thread (rather than to EThread).
+  
+  // 翻译如下：
+  Thread 类中包含一个 thread_key (成员 thread_data_key)，所有的线程都通过 线程特有数据 相关
+  的调用，借助 thread_key 注册到系统中 (包含了所有创建出来的 Thread 类型和其继承类的实例)。
+  
+  任何时候，只要你调用 this_thread() 你就可以得到一个指向运行当前代码的 Thread 实例的指针。
+
+  // 这句注释没有在代码中体现，可能由于代码的删减，现在已经没有了 -------------
+  Additionally, the EThread class (derived from Thread)
+  maintains its own independent key.
+  另外，EThread 类 (继承自 Thread 类) 维护了一个独立属于它自己的 thread_key.
+  // --------------------------------------------------------------------------
+  
+  所有 EventSystem 中创建的线程都使用这个(同一个) thread_key 注册。
+  
+  // 这句注释没有在代码中体现，可能由于代码的删减，现在已经没有了 -------------
+  If you happen to call 
+  this_ethread() from inside a thread which is not an EThread, you will
+  get a NULL value (since that thread will not be  registered with the
+  EThread key). This will hopefully make the use of this_ethread() safer.
+  如果你从一个不是 EThread 的线程中调用 this_ethread()，那么你会得到 NULL。
+  因为这个线程没有使用 EThread 的 key 来注册。
+  我们希望可以让 this_ethread() 的使用更安全。
+  // --------------------------------------------------------------------------
+
+  需要注意的是，在 EThread 中可以调用 this_thread()，但是，得到的是一个指向 Thread 类型
+  的指针（而不是 EThread 类型）。
+  注：从当前的代码看，可以通过类型转换为 EThread，在 this_ethread() 里就是这么做的。
+
+```
+
+使用同一个 key，在不同的线程中，获得的数据是不同的，同样的，绑定的数据也只与当前线程关联。
+因此，对 thread specific 相关函数的调用是与其所在的线程紧密相关的。
+
+```
+TS_INLINE Thread *
+this_thread()
+{
+  通过 key 取回之前关联的对象
+  return (Thread *)ink_thread_getspecific(Thread::thread_data_key);
+}
+```
+
+### 关于 this_ethread()
+
+```
+// source: iocore/eventsystem/P_UnixEThread.h
+TS_INLINE EThread *
+this_ethread()
+{
+  直接调用 this_thread() 并进行类型转换
+  return (EThread *)this_thread();
+}
+```
+
+### Thread::start()
+
+线程的启动
+
+  - 在每个线程创建之前，会调用 set_specific() 方法绑定线程数据
+
+```
+// source: iocore/eventsystem/Thread.cc
+static void *
+spawn_thread_internal(void *a) 
+{
+  thread_data_internal *p = (thread_data_internal *)a;
+
+  // 将 Thread 对象 p->me 通过 key 设置为当前线程的特定数据
+  p->me->set_specific();
+  ink_set_thread_name(p->name);
+  // 如果函数指针 f 不为空，则调用 f
+  if (p->f)
+    p->f(p->a);
+  else
+  // 否则执行线程的默认运行函数
+    p->me->execute();
+  // 返回后释放对象 a
+  ats_free(a);
+  return NULL;
+}
+
+ink_thread
+Thread::start(const char *name, size_t stacksize, ThreadFunction f, void *a) 
+{
+  thread_data_internal *p = (thread_data_internal *)ats_malloc(sizeof(thread_data_internal));
+
+  // 参数 f 为函数指针
+  p->f = f;
+  // 参数 a 为调用 f 时传入的参数
+  p->a = a;
+  // p->me 为当前 Thread 对象
+  p->me = this;
+  memset(p->name, 0, MAX_THREAD_NAME_LENGTH);
+  ink_strlcpy(p->name, name, MAX_THREAD_NAME_LENGTH);
+  // 创建线程时，传入 spawn_thread_internal 函数，这样线程启动会会立即调用该函数
+  tid = ink_thread_create(spawn_thread_internal, (void *)p, 0, stacksize);
+
+  return tid;
+}
+```
+
+  - 在 Main.cc 里有一段很奇特的地方也调用了 set_specific
+    - 但是之后就没看到任何使用 main_thread 的地方了
+    - 从注释上看，这里是为了对 win_9xMe 的系统运行 ATS 提供的支持
+    - 针对 start_HttpProxyServer() 的调用做的优化
+
+```
+// source: proxy/Main.cc
+  // This call is required for win_9xMe
+  // without this this_ethread() is failing when
+  // start_HttpProxyServer is called from main thread
+  Thread *main_thread = new EThread;
+  main_thread->set_specific();   
+```
+
+## main() 是如何成为 [ET_NET 0] 的？
+
+在 Main.cc 的最后执行了 this_ethread()->execute()
+
+  - 原本 execute() 是在 spawn_thread_internal() 中被调用的
+  - 而spawn_thread_internal()是线程创建之后才会调用的第一个函数
+  - 但是为了节省一个线程的空间，ATS直接在main()中调用了 this_ethread()->execute() 开始执行
+  - 但是在 spawn_thread_internal() 中需要调用 set_specific() 的过程去了那里？
+  - 如果不调用 set_specific() 那么 this_ethread() 又怎么能返回 EThread 对象呢？
+
+```
+// source: iocore/eventsystem/UnixEventProcessor.cc
+int
+EventProcessor::start(int n_event_threads, size_t stacksize)
+{
+...
+  int first_thread = 1;
+
+  for (i = 0; i < n_event_threads; i++) {
+    EThread *t = new EThread(REGULAR, i); 
+    if (first_thread && !i) {
+      // 如果 i 为 0 的时候，就会执行一次 set_specific 的动作
+      ink_thread_setspecific(Thread::thread_data_key, t); 
+      global_mutex = t->mutex;
+      t->cur_time = ink_get_based_hrtime_internal();
+    }   
+    all_ethreads[i] = t;
+
+    eventthread[ET_CALL][i] = t;
+    t->set_event_type((EventType)ET_CALL);
+  }
+...
+  // for 循环是从 1 开始的，跳过了 0
+  for (i = first_thread; i < n_ethreads; i++) {
+    snprintf(thr_name, MAX_THREAD_NAME_LENGTH, "[ET_NET %d]", i);
+    // 也就是 all_ethreads[0]->start() 没有被调用
+    ink_thread tid = all_ethreads[i]->start(thr_name, stacksize);
+...
+}
+```
+
+上面的代码，可以看出在 EventProcessor::start() 方法中对 all_ethreads[0] 做了特殊的处理
+
+  - 为 all_ethreads[0] 调用 set_specific
+  - 不启动 all_ethreads[0]
+
+所以，在 main() 最后的那句 this_ethread()->execute() 就是启动了 [ET_NET 0] 的执行。
+
+重新回顾一下这个流程：
+
+  - 在 main() 的一开始首先调用了 eventProcessor.start()
+    - 启动了 [ET_NET 1] ~ [ET_NET n] 的所有线程
+    - 初始化 [ET_NET 0] 的数据，但不启动该线程
+  - 然后 main() 执行其它的启动流程
+  - 最后 main() 调用 this_ethread()->execute() 完成了 [ET_NET 0] 的启动
 
 ## 参考资料
 
@@ -985,5 +1212,5 @@ flush_signals(EThread *thr)
 - [I_EThread.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_EThread.h)
 - [P_UnixEThread.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_UnixEThread.h)
 - [ProtectedQueue.cc](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/ProtectedQueue.cc)
-- [EventProcessor](CH01S10-Interface-EventProcessor.md)
-- [Event](CH01S08-Core-Event.md)
+- [EventProcessor](CH01S10-Interface-EventProcessor.zh.md)
+- [Event](CH01S08-Core-Event.zh.md)
