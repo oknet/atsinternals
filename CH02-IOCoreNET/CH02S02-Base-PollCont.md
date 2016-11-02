@@ -1,6 +1,28 @@
 # 基础组件：PollCont
 
-PollCont 是将 PollDescriptor 封装成以Continuation为基类的状态机，提供pollEvent()方法来获取事件列表。
+作为 Polling Sub-System 中的状态机，通过周期性调用 epoll_wait() 实现了对 socket fd 的事件获取。
+
+虽然 Polling Sub-System 抽象的没有那么清晰，但是其仍然包含基本的三要素：
+
+|  EventSystem   |    epoll   |  Polling SubSystem  |
+|:--------------:|:----------:|:-------------------:|
+|      Event     |  socket fd |       EventIO       |
+|     EThread    | epoll_wait |      PollCont       |
+| EventProcessor |  epoll_ctl |       EventIO       |
+
+这里 EventIO 同时承担了 Processor 的功能，这是因为 EventIO 在作为 Processor 时总是操作当前线程的 PollDescriptor，这不同于 EventProcessor 是作用于整个线程池的。
+因此，这里将 EventIO 的 Processor 功能：
+
+  - start() / stop()
+  - modify() / refresh()
+  - close()
+
+合并到EventIO内，这有点像 Event 类自身也提供了 schedule_\*() 的方法一样。
+
+PollCont 通过调用 epoll_wait 得到了结果集，此时应该回调 NetHandler，将这个结果集传递给当前线程的 NetHandler。
+但是目前的代码实现，并未把NetHandler当作PollCont的上层状态机，所以这里说 Polling Sub-System 在系统中的定义是模糊的。
+
+但是为了便于理解，这里仍然将 Polling Sub-System 的轮廓勾勒出来。
 
 为了便于分析，以下只列出了epoll ET模式相关的代码。
 
