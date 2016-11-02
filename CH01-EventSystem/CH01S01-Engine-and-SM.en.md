@@ -101,3 +101,21 @@ The above design, State Machine trigger the air conditioner once (limited operat
 In this way, the engine will allocate resources to drive this State Machine again which is running this State Machine repeatedly until the temperature in the car is lower than 22 degree.
 
 At last, call State Machine to check the temperature inside the car in every minute.
+
+## Key Elements
+
+|    Engine    |  System   |  EventSystem   |
+|:------------:|:---------:|:--------------:|
+|   Gasoline   |   Data    |      Event     |
+|   Combustor  |  Thread   |     EThread    |
+|  Controller  | Processor | EventProcessor |
+
+Compare "Engine" with "System"
+
+- "Controller" puts "Gasoline" into "Combustor", then burn it to driven car.
+- "Processor" puts “Data” into "Thread", then callback SM according to the requests in "Data"
+
+Also Compare to "EventSystem"
+
+- "EventProcessor" puts "Event" into "EThread", then callback SM according to the Continuation in "Event"
+
