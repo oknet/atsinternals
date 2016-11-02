@@ -31,9 +31,12 @@ PollCont 通过调用 epoll_wait 得到了结果集，此时应该回调 NetHand
 ```
 source: iocore/net/P_UnixNet.h
 struct PollCont : public Continuation {
-  // 反向指回到持有此PollCont的NetHandler
+  // 指向此PollCont的上层状态机NetHandler
+  // 可以理解为 Event 中的 Continuation 成员
+  //     由于一个 PollCont 中的所有 EventIO 的上岑状态机都是同一个 NetHandler
+  //     因此，把这个 NetHandler 的对象直接放在了 PollCont 中
   NetHandler *net_handler;
-  // Poll描述符封装，主要描述符
+  // Poll描述符封装，主要描述符，用来保存 epoll fd 等
   PollDescriptor *pollDescriptor;
   // Poll描述符分装，但是这个主要用于UDP在EAGAIN错误时的子状态机 UDPReadContinuation
   // 在这个状态机中只使用了pfd[]和nfds
