@@ -23,9 +23,9 @@
 为了实现上述功能，还有一些必要的基础部件和其它部件来配合，因此整个网络子系统（Net Sub-System）由以下部分组成：
 
   - 基础部件
-    - 对 “polling” 的封装
-      - EventIO（对 epoll/kqueue 的封装）
-      - PollDescriptor（用来抽象 poll 句柄）
+    - Polling 子系统
+      - EventIO（对 epoll/kqueue 方法的封装，相当于PollingEvent 和 PollingProcessor）
+      - PollDescriptor（用来抽象 epoll/kqueue 的句柄）
       - PollCont（周期性执行 polling 操作的状态机）
     - NetVConnection（用来连接 Socket，缓冲区 和 状态机）
       - 继承自 VConnection 基类
