@@ -2,11 +2,11 @@
 
 实际上IOCoreNet子系统，与EventSystem是一样的，也有Thread，Processor和Event，只是名字不一样了：
 
-|  EventSystem   |        NetSubSystem       |
-|:--------------:|:-------------------------:|
-|      Event     |     UnixNetVConnection    |
-|     EThread    | NetHandler，InactivityCop |
-| EventProcessor |        NetProcessor       |
+|  EventSystem   |    epoll   |  Polling SubSystem  |        NetSubSystem       |
+|:--------------:|:----------:|:-------------------:|:-------------------------:|
+|      Event     |  socket fd |       EventIO       |     UnixNetVConnection    |
+|     EThread    | epoll_wait |      PollCont       | NetHandler，InactivityCop |
+| EventProcessor |  epoll_ctl |       EventIO       |        NetProcessor       |
 
 - 像 Event 一样，UnixNetVConnection 也提供了面向上层状态机的方法
   - do_io_* 系列
