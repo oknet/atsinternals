@@ -40,9 +40,7 @@
 
 UnixNetVConnection 与 SSLNetVConnection 都可能在上述几个队列中流转，：
 
-```
-稍后提供
-```
+![NetVC Routing Map](https://cdn.rawgit.com/oknet/atsinternals/master/CH02-IOCoreNET/CH02-IOCoreNet-002.svg)
 
 ## 定义
 
