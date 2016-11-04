@@ -2,7 +2,16 @@
 
 PollDescriptor 是对多种平台上的I/O Poll操作的封装，目前ATS支持epoll，kequeu，port三种。
 
-EventIO用来操作Poll fd的封装，是PollDescriptor对外提供的接口。
+我们可以把 PollDescriptor 看成是一个队列：
+
+- 把 Socket FD 放入 poll fd / PollDescriptor 队列
+- 然后通过 Polling 操作，从 poll fd / PollDescriptor 队列中批量取出一部分 Socket FD
+- 而且这是一个原子队列
+
+EventIO 是 PollDescriptor 队列的成员，也是 PollDescriptor 对外提供的接口：
+
+- 为每一个 Socket FD 提供一个 EventIO，把 Socket FD 封装到 EventIO 内
+- 提供把 EventIO 自身放入 PollDescriptor 队列的接口
 
 以下内容仅仅分析对epoll ET模式支持的实现。
 
@@ -36,7 +45,7 @@ struct epoll_event {
 };
 ```
 
-首先是PollDescriptor，用于抽象Poll句柄。
+首先是PollDescriptor，它包含 Poll 句柄和保存结果集的数组。
 
 ```
 source: iocore/net/P_UnixPollDescriptor.h
