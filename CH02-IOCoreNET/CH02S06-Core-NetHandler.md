@@ -28,6 +28,7 @@
     - 由上层状态机，如HttpSM等，通过add_to_keep_alive_queue将vc放入，用于实现keep alive timeout
     - 在InactivityCop中，通过manage_keep_alive_queue来清理
     - 另外还提供了remove_from_keep_alive_queue的方法，从队列中删除vc
+    - 对于 active_queue 和 keep_alive_queue，将在 InactivityCop 中详细分析
   - ASLLM: (read|write)_enable_list
     - 在执行异步reenable时，将vc直接放入原子队列
     - 在EThread A中要reenable一个VC，但是这个VC是由EThread B管理的，此时就属于异步reenable
