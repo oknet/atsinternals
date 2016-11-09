@@ -12,6 +12,11 @@ OneWayMultiTunnel是连接一个源VC和多个目标VC的通用状态机，它�
 
 ```
 /** Maximum number which can be tunnelled too */
+// 由于每一个目标VC都需要从MIOBuffer分配一个 IOBufferReader，而源VC也使用了一个IOBufferReader。
+// 所以，这里定义的目标VC数量的最大值要比 IOBufferReader 的最大值少一个（被源VC使用）
+// 在 I_IOBuffer.h 中定义了一个 MIOBuffer 可分配的 IOBufferReader 的最大值为 5
+//     #define MAX_MIOBUFFER_READERS 5
+// 所以这里只能定义为 4，如果需要更多的目标VC，需要同时修改 IOBufferReader 的最大值。
 #define ONE_WAY_MULTI_TUNNEL_LIMIT 4
 
 // 继承自 OneWayTunnel
