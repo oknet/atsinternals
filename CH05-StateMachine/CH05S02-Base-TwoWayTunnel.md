@@ -145,6 +145,41 @@ OneWayTunnel::SetupTwoWayTunnel(OneWayTunnel *east, OneWayTunnel *west)
   west->tunnel_peer = east;
 }
 ```
+## 状态机的设计模式
+
+我们看到 TwoWayTunnel 是由两个 OneWayTunnel 组成，它们共享一个 mutex，而且它们之间还设计了专门进行协同的事件。
+
+每一个 OneWayTunnel 管理两个VC，但是对于其中任何一个VC来说：
+
+- OneWayTunnel 要么负责接收数据，要么负责发送数据
+- 但是不会既接收又发送数据
+
+也就是说 OneWayTunnel 只管理这两个VC的一半功能。
+
+在 TwoWayTunnel 中：
+
+- 一个VC的 数据接收 被一个OneWayTunnel管理时，
+- 这个VC的 数据发送 则被另外一个OneWayTunnel管理
+
+TwoWayTunnel 的设计实现了对两个VC的完全管理，但是 TwoWayTunnel 并不是一个状态机，它是通过两个 OneWayTunnel 之间的通知机制，以及在两个 OneWayTunnel 中共享同一个 mutex 来实现了两个 OneWayTunnel 的协同。
+
+但是我们从代码的实现上也看到了 TwoWayTunnel 里存在的一个问题，就是不支持“TCP的半关闭”，当其中一个VC发起了shutdown，那么TwoWayTunnel就要同时关闭两个VC，所以我们看到 Tunnel 状态机能做的事情非常的简单，使用它来实现单纯的 TCP代理 及其 附属功能 是完全没有问题的，但是如果需要实现基于TCP通信的高级协议处理，Tunnel 状态机则会很难实现。
+
+因此，TCP代理和流处理才是 Tunnel 状态机的强项。
+
+同时，我们看到双 MIOBuffer 的功能还未在代码里实现，通过双MIOBuffer我们可以
+
+- 实现对Tunnel内数据流的修改
+- 在Tunnel里实现流量控制等功能
+
+但是当我们需要实现复杂的状态机设计时，我们会让一个状态机同时管理一个VC的数据接收和发送，例如：
+
+- 接收一个请求，发现请求是不合法的，我们可以直接发送错误信息
+- 但是当请求是合法内容时，可以通过Tunnel状态机完成数据流的传递
+
+此时我们就需要先建立一个能够与ClientVC进行交互的状态机，然后再把VC的控制权转交给Tunnel状态机，Tunnel状态机处理完成后，再返回到交互状态机。
+
+在后面介绍 HttpSM 状态机时，会看到其内包含了 Tunnel 状态机的设计，在ATS中普遍存在这种大状态机里面嵌套小状态机的设计。
 
 ## 参考资料
 - [I_OneWayTunnel.h](http://github.com/apache/trafficserver/tree/master/iocore/utils/I_OneWayTunnel.h)
