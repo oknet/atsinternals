@@ -268,6 +268,25 @@ Ldone:
 
 由于在源VC的MIOBuffer与目标VC的MIOBuffer中传递数据时，仍然调用的是继承自 OneWayTunnel 的 transform() 函数，因此 OneWayMultiTunnel 同样也仅支持 single_buffer == true 的情况。
 
+## 适用场景
+
+在 Cache 服务器的设计中，我们从源站拿到数据之后，如果这份数据需要同时发送给客户端和保存到磁盘时，就产生了对 OneWayMultiTunnel 的需求。
+
+- 此时 ServerVC 作为源VC，而 ClientVC 和 CacheVC 作为目标VC
+- OneWayMultiTunnel 从 ServerVC 读取数据
+- 然后向 ClientVC 和 CacheVC 发送数据
+- 当 ClientVC 接收了全部数据的同时，CacheVC 也接收了全部数据并保存到了磁盘
+
+在实现代理服务的合并回源功能时，也同样会需要使用 OneWayMultiTunnel
+
+- Client A 和 Client B 都发起了对 Server 的访问
+- Client A 先发起了该请求，代理服务器将请求转发给 Server
+- 在 Server 产生响应之前，Client B 的请求到达代理服务器，代理服务器判断可以与 Client A 的请求合并
+- 这样以 ServerVC 作为源VC，Client A 和 Client B 作为目标 VC 创建 OneWayMultiTunnel
+- Server VC 回应的数据会同时到达 Client A 和 Client B
+
+Tunnel 状态机提供了非常基础的数据流转发功能，在事务信息处理完成后，大多数的状态机都会借助 Tunnel 状态机完成大量数据转发的工作。
+
 ## 参考资料
 
 - [I_OneWayMultiTunnel.h](http://github.com/apache/trafficserver/tree/master/iocore/utils/I_OneWayMultiTunnel.h)
