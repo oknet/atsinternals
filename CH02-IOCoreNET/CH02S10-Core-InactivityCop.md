@@ -153,6 +153,23 @@ update_cop_config(const char *name, RecDataT data_type ATS_UNUSED, RecData data,
 #endif
 ```
 
+## Active Queue & Keep-Alive Queue
+
+在 NetHandler 中声明了两个队列：active_queue 和 keep_alive_queue，
+
+- 只用于存放 Client 与 ATS 之间的 NetVC
+- 但是 ATS 与 Origin Server 之间的 NetVC 不会放入这两个队列，而是由 ServerSessionPooll 来管理
+- 这两个队列是针对 HTTP 协议设计的
+
+显然这两个队列出现在 NetHandler 的成员中，是不太合理的，这样的设计需要进一步的抽象 / 优化。
+
+在 HTTP 协议中，一个会话可以包含多个事务，事务之间可以存在不定长时间的间隙，
+
+- 如果这个会话正在处理一个事务，那么这个会话对应的 NetVC 就被放入 active_queue
+- 如果这个会话正处于两个事务之间的间隙，那么这个会话对应的 NetVC 就被放入 keep_alive_queue
+
+当 ATS 的可用连接数不足（达到允许的连接数上限）时，会强制关闭 keep_alive_queue 中的 NetVC，甚至是 active_queue 中的 NetVC，然后才能接受这个新的会话。
+
 ## NetHandler的延伸：(add_to|remote_from)_active_queue
 
 添加NetVC到active_queue，或从active_queue中移除NetVC
