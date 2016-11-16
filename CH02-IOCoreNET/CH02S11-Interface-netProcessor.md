@@ -1,13 +1,27 @@
 # 接口界面：netProcessor
 
-NetProcessor 继承自基类 Processor，是 IOCoreNet 对外提供的一个 API 集合，例如：
+在 ATS 中声明了一个 NetProcessor 类型的全局唯一实例：netProcessor，当我们需要使用网络I/O操作的时候，可以通过该实例进行操作，例如：
 
-  - accept
-  - connect
+  - netProcessor.allocate_vc
+    - 创建一个新的 NetVC
+  - netProcessor.accept
+    - 接收一个来自客户端的新连接
+  - netProcessor.main_accept
+    - 与 accept 功能基本相同，只是它要求调用者传入一个已经完成 bind 操作的 listen fd
+  - netProcessor.connect_re
+    - 发起一个到服务器的新连接，发出TCP SYN之后就立即回调状态机（此时连接可能未能成功建立）
+  - netProcessor.connect_s
+    - 发起一个到服务器的新连接，但是只在成功建立连接后才回调状态机（通过CheckConnect子状态机实现）
 
-上层状态机通过它，可以执行一些基于网络I/O的操作。
+netProcessor 还负责在 ET_NET 线程组，为每一个线程创建 NetHandler 等状态机来处理 NetVC 的读写。
 
-## 定义
+## 基类 NetProcessor
+
+NetProcessor 继承自基类 Processor，是 IOCoreNet 对外提供的一个 API 集合。
+
+基类 NetProcessor 只是定义 API，具体实现是通过 UnixNetProcessor 继承类来完成。
+
+### 定义
 
 ```
 /**
@@ -19,6 +33,7 @@ class NetProcessor : public Processor
 {
 public:
   /** Options for @c accept.
+    为 accept 方法定义 Options
    */
   struct AcceptOptions {
     typedef AcceptOptions self; ///< Self reference type.
@@ -121,6 +136,7 @@ public:
   */
   virtual Action *main_accept(Continuation *cont, SOCKET listen_socket_in, AcceptOptions const &opt = DEFAULT_ACCEPT_OPTIONS);
 
+  // Connect 方法使用的 Options 在 I_NetVConnection.h 中定义了
   /**
     Open a NetVConnection for connection oriented I/O. Connects
     through sockserver if netprocessor is configured to use socks
@@ -158,10 +174,13 @@ public:
   Action *connect_s(Continuation *cont, sockaddr const *addr, int timeout = NET_CONNECT_TIMEOUT, NetVCOptions *opts = NULL);
 
   /**
+    在 EventSystem 启动后，由 main() 函数调用 netProcessor.start() 来为每一个 EThread 安装 NetHandler 等状态机。
+    之后才可以使用 netProcessor 提供的其它 API 实现具体的网络I/O操作。
     Starts the Netprocessor. This has to be called before doing any
     other net call.
     @param number_of_net_threads is not used. The net processor
       uses the Event Processor threads for its activity.
+      该参数用来指定ET_NET的数量，但是ET_NET的数量总是与EThread的数量相同。
   */
   virtual int start(int number_of_net_threads, size_t stacksize) = 0;
 
@@ -190,9 +209,12 @@ public:
   // appropriate defaults)
 
   /* shared by regular netprocessor and ssl netprocessor */
+  // connect方法支持通过socks服务器发起到目的IP的连接
+  // 该静态变量用来保存全局使用的Socks配置信息
   static socks_conf_struct *socks_conf_stuff;
 
   /// Default options instance.
+  // 该静态变量用来保存缺省的 AcceptOptions
   static AcceptOptions const DEFAULT_ACCEPT_OPTIONS;
 
 private:
@@ -221,7 +243,69 @@ private:
 extern inkcoreapi NetProcessor &netProcessor;
 ```
 
-# 参考资料
+### 参考资料
 
-[I_NetProcessor.h](http://github.com/opensource/trafficserver/tree/master/iocore/net/I_NetProcessor.h)
-[UnixNetProcessor.cc](https://github.com/apache/trafficserver/tree/master/iocore/net/UnixNetProcessor.cc)
+- [I_NetProcessor.h](https://github.com/apache/trafficserver/tree/master/iocore/net/I_NetProcessor.h)
+
+## 继承类 UnixNetProcessor
+
+UnixNetProcessor 是 NetProcessor 在 类Unix 系统上的具体实现，而 NetProcessor 只是向外部用户提供接口的定义。
+
+### 定义
+
+```
+struct UnixNetProcessor : public NetProcessor {
+public:
+  // 内部方法用来实现 accept 方法
+  virtual Action *accept_internal(Continuation *cont, int fd, AcceptOptions const &opt);
+
+  // 内部方法：用来实现 connect_re 方法
+  Action *connect_re_internal(Continuation *cont, sockaddr const *target, NetVCOptions *options = NULL);
+  // 内部方法：用来发起一个连接
+  Action *connect(Continuation *cont, UnixNetVConnection **vc, sockaddr const *target, NetVCOptions *opt = NULL);
+
+  // Virtual function allows etype to be upgraded to ET_SSL for SSLNetProcessor.  Does
+  // nothing for NetProcessor
+  // 内部方法：这个是用来提供 SSL 支持的，在SSLNetProcessor里会重写这个方法
+  virtual void upgradeEtype(EventType & /* etype ATS_UNUSED */){};
+
+  // 内部方法：创建 NetAccept 对象
+  // 实际上应该是创建 UnixNetAccept 对象，然后返回基类 NetAccept 类型
+  // 由于对Windows版本的支持被砍掉了，所以不存在 NTNetAccept 对象
+  virtual NetAccept *createNetAccept();
+  // 创建 UnixNetVConnection 对象，但是返回时采用基类的类型
+  virtual NetVConnection *allocate_vc(EThread *t);
+
+  // 创建 ET_NET 线程组，并对每一个 ET_NET 线程组
+  // 为所有的EThread创建一个NetHandler状态机以及与NetHandler配合的周边组件
+  virtual int start(int number_of_net_threads, size_t stacksize);
+
+  // 此成员应该在某处被填充，当达到连接限制时，会向客户端发送填充的信息
+  // 但是目前的代码里看不到有填充信息的操作，猜测应该是在 start() 里读取某个配置项。
+  char *throttle_error_message;
+  // 目前这个成员也没有在使用了
+  // 在 branch 2.0.x 的代码里，UnixNetProcessor 还有一个 NetAccept 的原子队列：
+  //     ASLL(NetAccept, link) accepts_on_thread
+  // 感觉会在一个 NetAccept 运行时，处理这个队列上的所有 NetAccept 对象
+  // 猜测：在较早的版本里，存在ET_ACCEPT，有兴趣的可以看一下 2.0.x 的代码
+  // 这个应该就是保存了专门用来处理 NetAccept 队列的那个超级 NetAccept 状态机的 Event。
+  Event *accept_thread_event;
+
+  // offsets for per thread data structures
+  // 记录netHandler和pollCont对象在线程堆栈里的偏移量
+  off_t netHandler_offset;
+  off_t pollCont_offset;
+
+  // we probably wont need these members
+  // 下面这两个变量只在 start() 函数中使用，实际上可以从类成员里去除了。
+  // 当前 ET_NET 线程组里线程的数量
+  int n_netthreads;
+  // 指向 eventProcessor 里 ET_NET 线程组对象的指针数组
+  EThread **netthreads;
+};
+```
+
+### 参考资料
+
+- [P_UnixNetProcessor.h](https://github.com/apache/trafficserver/tree/master/iocore/net/P_UnixNetProcessor.h)
+- [UnixNetProcessor.cc](https://github.com/apache/trafficserver/tree/master/iocore/net/UnixNetProcessor.cc)
