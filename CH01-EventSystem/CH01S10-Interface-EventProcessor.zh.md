@@ -60,6 +60,19 @@ EventProcessor负责启动EThread，进行每一个EThread的初始化。
    - 如果间隔时间为负数，则表示此回调为随时执行，只要有机会，EventProcessor就会进行调度。
       - 目前此种类型的调度只有epoll_wait一种
 
+与 Event，EThread 事件调度方法的对比：
+
+```
+                                              event
+EventProcessor::schedule_*(cont, etype)  ---------------->  EThread[etype][RoundRobin]->QUEUE
+
+                                              event
+              EThread::schedule_*(cont)  ---------------->  this->QUEUE
+
+                                              (self)
+                    Event::schedule_*()  ---------------->  this->ethread->QUEUE
+```
+
 ## 定义
 
 ```
