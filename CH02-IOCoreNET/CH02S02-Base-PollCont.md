@@ -66,7 +66,7 @@ source: iocore/net/P_UnixNet.h
 struct PollCont : public Continuation {
   // 指向此PollCont的上层状态机NetHandler
   // 可以理解为 Event 中的 Continuation 成员
-  //     由于一个 PollCont 中的所有 EventIO 的上岑状态机都是同一个 NetHandler
+  //     由于一个 PollCont 中的所有 EventIO 的上层状态机都是同一个 NetHandler
   //     因此，把这个 NetHandler 的对象直接放在了 PollCont 中
   NetHandler *net_handler;
   // Poll描述符封装，主要描述符，用来保存 epoll fd 等
