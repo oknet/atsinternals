@@ -15,6 +15,22 @@
 
 netProcessor 还负责在 ET_NET 线程组，为每一个线程创建 NetHandler 等状态机来处理 NetVC 的读写。
 
+现在我们已经基本对网络子系统的各个部分进行了介绍，下面我们将 Net Sub-System 与 EventSystem 进行对比，可以发现：
+
+- 把 NetHandler 看作是 EventSystem 的 EThread
+  - NetHandler 管理多个保存 NetVC 的队列
+  - EThread 管理多个保存 Event 的队列
+- 把 NetVConnection 看作是 EventSystem 的 Event
+  - NetHandler 遍历 NetVC 的队列，回调与 NetVC 关联状态机
+  - EThread 遍历 Event 的队列，回调与 Event 关联的状态机
+- 把 NetProcessor 看作是 EventSystem 的 EventProcessor
+  - NetProcessor 提供了创建 NetVC 对象的功能（EventProcessor 提供了创建 Event 对象的功能）
+  - NetProcessor 提供了创建并初始化 NetHandler 对象的功能（EventProcessor 提供了创建 EThread 对象的功能）
+- 对于调度功能，与 EventSystem 的 schedule_\*() 方法的对比
+  - NetProcessor 提供了 accept 和 connect 就是把新的 NetVC 放入 NetHandler 的队列
+  - NetVConnection 提供了 reenable(), do_io() 等方法把 NetVC 放入 NetHandler 的队列
+  - NetHandler 提供了 ::read_disable(), ::write_disable(), class EventIO 等方法和类，实现对其队列的操作
+
 ## 基类 NetProcessor
 
 NetProcessor 继承自基类 Processor，是 IOCoreNet 对外提供的一个 API 集合。
