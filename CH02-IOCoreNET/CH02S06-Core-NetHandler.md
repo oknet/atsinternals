@@ -39,7 +39,7 @@
 
 其中 (read|write)_enable_list 两个队列是原子队列，可以不加锁直接操作，其它六个队列都需要加锁才能操作
 
-UnixNetVConnection 与 SSLNetVConnection 都可能在上述几个队列中流转，：
+UnixNetVConnection 与 SSLNetVConnection 都可能在上述几个队列中流转：
 
 ![NetVC Routing Map](https://cdn.rawgit.com/oknet/atsinternals/master/CH02-IOCoreNET/CH02-IOCoreNet-002.svg)
 
