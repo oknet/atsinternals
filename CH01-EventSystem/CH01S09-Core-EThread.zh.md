@@ -995,6 +995,11 @@ void
 ProtectedQueue::enqueue(Event *e, bool fast_signal)
 {
   ink_assert(!e->in_the_prot_queue && !e->in_the_priority_queue);
+  // doEThread 为任务发起方所在线程，runEThread 为任务执行方所在线程，通过 Event 对象传递将任务描述（状态机）
+  // 通常由 doEThread 创建一个Event对象，但是该对象的成员 ethread 成员为 NULL，
+  // 然后，再通过eventProcessor.schedule_*()为该 Event 分配一个runEThread，然后调用此方法。
+  // 由于 doEThread 可能跟 RunEThread 在同一的线程池中，因此 doEThread 可能与 runEThread 相同。
+  // 所以，这里需要考虑 e->ethread 可能会等于 doEThread 的情况，而 doEThread 则为 this_ethread()。
   EThread *e_ethread = e->ethread;
   e->in_the_prot_queue = 1;
   // ink_atimiclist_push 执行原子操作将e压入到al的头部，返回值为压入之前的头部
@@ -1009,15 +1014,17 @@ ProtectedQueue::enqueue(Event *e, bool fast_signal)
     EThread *inserting_thread = this_ethread();
     // queue e->ethread in the list of threads to be signalled
     // inserting_thread == 0 means it is not a regular EThread
-    // 如果发起插入操作的EThread就是将要处理该event的EThread，简单说就是从线程内部插入
+    // 如果 doEThread 与 runEThread 为同一的 EThread 那么这里不需要进行特殊处理，
+    //     此时，发起插入操作的 EThread 就是将要处理该 Event 的 EThread，这叫做内部插入。
+    // 如果 doEThread 与 runEThread 不同，才需要进行下面的处理流程，
+    //     此时，发起插入操作的 EThread 不是将要处理该 Event 的 EThread，简单说就是从线程外部插入
+    //     这个event是由当前EThread(inserting_thread / doEThread)创建，要插入到另外一个EThread（e_ethread / runEThread）
+    //     调用本方法的方式必定是通过e_ethread->ExternalEventQueue.enqueue()的方式
     if (inserting_thread != e_ethread) {
-      // 如果发起插入操作的EThread不是将要处理该event的EThread，简单说就是从线程外部插入
-      //   这个event是由当前EThread(inserting_thread)创建，要插入到另外一个EThread（e_ethread）
-      //   调用本方法的方式必定是通过e_ethread->ExternalEventQueue.enqueue()的方式
+      // 如果发起插入操作的ethread不是REGULAR类型。
+      // 例如：DEDICATED类型（该类型的ethreads_to_be_signalled为NULL）
       if (!inserting_thread || !inserting_thread->ethreads_to_be_signalled) {
-        // 如果发起插入操作的ethread不是REGULAR类型，例如DEDICATED类型
-        //   或者是REGULAR类型，但是它的ethreads_to_be_signalled为空（就是不支持signal队列）
-        // 以上两种情况都需要以阻塞方式，向添加了新Event的ProtectQueue发出通知。
+        // 由于doEThread没有ethreads_to_be_signalled，无法实现延迟通知机制，只能采用阻塞方式向runEThread发出通知。
         // 发出通知后，阻塞在ProtectedQueue::dequeue_timed里的ink_cond_timedwait会立即返回。
         // 下面的signal就是直接通知e->ethread持有的xxxQueue
         signal();
@@ -1025,10 +1032,11 @@ ProtectedQueue::enqueue(Event *e, bool fast_signal)
           // 如果需要立即触发signal，那么尝试通知产生此Event的EThread
           if (e_ethread->signal_hook)
             // 调用产生event的EThread的signal_hook方法，实现异步通知
+            // 目前在 NetHandler 里通过signal_hook可以让 epoll_wait 的阻塞等待中断并返回
             e_ethread->signal_hook(e_ethread);
         }
       } else {
-        // 如果当前EThread是REGULAR类型，而且ethreads_to_be_signalled不为空（就是支持signal的队列化）
+      // 如果当前EThread是REGULAR类型，而且ethreads_to_be_signalled不为空（就是支持signal的队列化）
 #ifdef EAGER_SIGNALLING
         // 此处宏定义开关的含义：更及时的发送signal。（这样做好不好？见后面的分析）
         // 由于已经把event插入队列中，因此就要向持有此event的队列发送信号
@@ -1104,6 +1112,17 @@ ProtectedQueue::enqueue(Event *e, bool fast_signal)
    - 尝试获得锁，如果获得锁，就跟signal是一样的，然后返回1，表示成功执行signal操作
    - 如果没有获得锁，就返回0
 
+如果try_signal拿到了锁，成功发送了通知，则表示：
+
+- 当前没有处于epoll_wait()等特殊阻塞场景，
+- 不需要通过signal_hook()来向特殊组件发送通知。
+
+相反，则表示：
+
+- 目标EThread当前没有处于 cond_wait() 等待中
+- 目标EThread当前正在执行Event标记的任务，此时可能会有特殊组件产生的阻塞
+- 需要通过signal_hook()来打断特殊组件的阻塞
+
 相关代码如下：
 
 ```
@@ -1160,8 +1179,7 @@ flush_signals(EThread *thr)
   for (i = 0; i < n; i++) {
     if (thr->ethreads_to_be_signalled[i]) {
       thr->ethreads_to_be_signalled[i]->EventQueueExternal.signal();
-      // signel通知完成后，还要调用signal_hook
-      // 为什么try_signal()就不需要调用signal_hook呢？
+      // 这里感觉调用反了？应该是先调用signal_hook()，再调用signal()？
       if (thr->ethreads_to_be_signalled[i]->signal_hook)
         thr->ethreads_to_be_signalled[i]->signal_hook(thr->ethreads_to_be_signalled[i]);
       thr->ethreads_to_be_signalled[i] = 0;
