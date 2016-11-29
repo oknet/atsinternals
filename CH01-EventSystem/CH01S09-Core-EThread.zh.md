@@ -1175,12 +1175,24 @@ flush_signals(EThread *thr)
     }
   }
 #endif
-  // 然后再使用signal，以阻塞方式完成剩余的signal操作。
+  // 然后再使用signal()，以阻塞方式完成剩余的signal操作。
+  // 如果一个EThread的Negative Queue为空，那么在没有事件需要执行的时候，
+  //     需要通过ProtectedQueue::timed_wait()让EThread挂起一段时间，
+  //     在此期间，如果需要该EThread立即处理一个Event，就可以通过signal()唤醒它
+  // 如果一个EThread的Negative Queue不为空，那么就存在需要随时执行的 Negative Event
+  //     此时，该EThread永远都不需要挂起，因为它一有机会就需要不断的执行 Negative Event 指定的任务
+  // 所以，
+  //     对于存在 Negative Event 的 EThread 通常只需要调用 signal_hook() 就可以了，
+  //     对于不存在 Negative Event 的 EThread 则需要同时考虑“在状态机中存在阻塞”或者“EThread被挂起”的情况。
+  // 例如：
+  //     NetHandler 是一个由 Negative Event 驱动的状态机，它调用 epoll_wait 时会存在一个阻塞的情况，
+  //     因此，NetHandler 注册了signal_hook 函数来实现中止 epoll_wait 的阻塞并返回到EventSystem的功能
   for (i = 0; i < n; i++) {
     if (thr->ethreads_to_be_signalled[i]) {
       thr->ethreads_to_be_signalled[i]->EventQueueExternal.signal();
-      // 这里感觉调用反了？应该是先调用signal_hook()，再调用signal()？
-      if (thr->ethreads_to_be_signalled[i]->signal_hook)
+      // 感觉这里应该是一个二选一的操作，如果signal_hook存在，就调用signal_hook()，否则只需要调用signal()
+      // 调用 signal() 之后又调用 signal_hook() 有点多余
+      if (thr->ethreads_to_be_signalled[i]->signal_hook)
         thr->ethreads_to_be_signalled[i]->signal_hook(thr->ethreads_to_be_signalled[i]);
       thr->ethreads_to_be_signalled[i] = 0;
     }   
@@ -1215,11 +1227,17 @@ flush_signals(EThread *thr)
 
 解释一下：
 
-  - 如果立即发起通知，就要从当前线程切换到目标线程来执行通知操作
-    - 这个通知操作是向目标线程所在的线程组中的所有线程发送通知（最多情况）
-    - 然后再回到当前线程继续运行，这样就导致了两次上下文切换。
-  - 目标线程在每一个EThread::execute()的循环中，都会触发一次发送通知的操作
-  - 如果可以等到目标线程自己触发通知操作，那么就不存在两次上下文切换了
+  - 如果需要为特定 Event 立即发起通知，则会立即唤醒目标线程
+    - 目标线程被唤醒后 CPU 需要加载它休眠之前的寄存器状态，由此导致上下文切入
+    - 处理完该指定 Event 之后，目标线程再次进入修庙，由此导致上下问切出
+    - 如果每处理一个 Event 都要切入、切出一次，那么上下文切换次数会非常的惊人
+  - 如果采用延迟通知，
+    - 在每一个EThread::execute()的循环中，
+      - 将需要通知的目标线程保存在当前线程的一个列表内
+      - 循环结束时，遍历该列表，一次性通知所有需要唤醒的线程
+    - 此时，在一个目标线程里可能存在多个 Event 需要运行
+    - 同样的一次上下文切入操作，则可以处理多个 Event 之后再切出
+    - 这样就减少了上下文切换的次数
 
 ## 参考资料
 
