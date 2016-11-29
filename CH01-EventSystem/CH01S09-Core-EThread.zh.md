@@ -112,7 +112,7 @@ Thread::set_specific()
   - 由于 EThread 继承自 Thread，因此
     - 在 EThread 中调用 this_thread() 返回的是 EThread 对象
     - 但是返回值的类型仍然是 Thread *
-    - 为了提供争取的返回值类型，在 EThread 中又定义了 this_ethread() 方法
+    - 为了提供正确的返回值类型，在 EThread 中又定义了 this_ethread() 方法
 
 ```
   // 下面是 I_Thread.h 中的一段注释
@@ -136,7 +136,7 @@ Thread::set_specific()
   
   任何时候，只要你调用 this_thread() 你就可以得到一个指向运行当前代码的 Thread 实例的指针。
 
-  // 这句注释没有在代码中体现，可能由于代码的删减，现在已经没有了 -------------
+  // 这句注释描述的机制没有在代码中体现，可能由于代码的删减，现在已经没有了 ---------
   Additionally, the EThread class (derived from Thread)
   maintains its own independent key.
   另外，EThread 类 (继承自 Thread 类) 维护了一个独立属于它自己的 thread_key.
@@ -144,7 +144,7 @@ Thread::set_specific()
   
   所有 EventSystem 中创建的线程都使用这个(同一个) thread_key 注册。
   
-  // 这句注释没有在代码中体现，可能由于代码的删减，现在已经没有了 -------------
+  // 这句注释描述的机制没有在代码中体现，可能由于代码的删减，现在已经没有了 ---------
   If you happen to call 
   this_ethread() from inside a thread which is not an EThread, you will
   get a NULL value (since that thread will not be  registered with the
