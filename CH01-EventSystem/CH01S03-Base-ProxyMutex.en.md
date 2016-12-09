@@ -122,15 +122,12 @@ new_ProxyMutex()
 
 ## How to use ProxyMutex
 
-
-在一个class里定义ProxyMutex类型时，通常定义为一个Ptr指针：
 Declare a ProxyMutex member with Ptr template in a class.
 
 ```
 Ptr<ProxyMutex> mutex_var_name;
 ```
 
-在分配这个class的实例之后，如果必须要为它指定一个mutex，可以通过以下方法：
 After allocating a object of the class, specify a mutex for the object by the following method:
 
 ```
@@ -160,14 +157,11 @@ These macros will be introduced in CH01-Base-Lock Section.
 
 ## Ptr template and RefCountObj class
 
-RefCountObj是一个引用计数类，ProxyMutex继承自这个类，那么ProxyMutex的实例mutex就内置了一个计数器，初始值为0。
 RefCountObj is a base class to enable the Reference-Counted feature for its derived class.
 ProxyMutex inherits from it and there is a reference counter (the initial value is 0) inside of ProxyMutex.
 
-通过Ptr\<ProxyMutex\>声明的实例，由Ptr模版对ProxyMutex类再次封装，其实例内部有一个m_ptr指针，类型为ProxyMutex。
 Once an object is declared with Ptr<ProxyMutex>, a member m_ptr pointer is declared as ProxyMutex inside of it.
 
-同时Ptr模版的定义中，对赋值操作符“＝”进行了重载，来实现接受ProxyMutex类型的赋值，同时对==, != 比较操作也做了重载。
 And the Ptr template overload Set, Get, Equal("==") and Not Equal("!=") operator to apply these operators to "ProxyMutex *m_ptr" transparently.
 
 ### Set operator overload analysis
