@@ -68,6 +68,88 @@ struct socks_conf_struct {
 };
 ```
 
+## 配置 Socks
+
+ATS 中对于Socks功能的配置资料较少，现整理如下：
+
+- 首先，配置缺省的Socks Server，多个Socks Server之间通过分号分隔。
+
+```
+CONFIG proxy.config.socks.default_servers STRING "x.x.x.x:1080;x.x.x.x:1080"
+```
+
+- 然后，开启 ATS 的Socks Proxy功能，这样ATS就可以利用Socks Server来访问源服务器
+
+```
+CONFIG proxy.config.socks.socks_needed INT 1
+```
+
+- 如果希望 ATS 可以将Socks请求中的HTTP请求过滤出来，并对这些HTTP请求进行服务
+
+```
+CONFIG proxy.config.socks.accept_enabled INT 1
+```
+
+- 另外还有部分socks规则需要配置，可通过配置项指定默认的 socks.config 的文件名
+
+```
+CONFIG proxy.config.socks.socks_config_file STRING socks.config
+```
+
+- 在 socks.config 中主要对以下三个功能进行配置：
+  - 连接 Socks 5 代理服务器时需要的用户名及密码
+  - 不使用 Socks 代理服务器的目标IP （Socks 例外）
+  - 为不同的目标IP指定不同的Socks代理服务器（Socks规则）
+
+### 关于 accept_enabled
+
+在开启 accept_enabled 之后，ATS作为Socks Server的前置代理，要求客户端将ATS作为Socks Server，所有的Socks请求首先发给 ATS，ATS将目标端口为 80 的连接转入 HttpSessionAccept 来处理。
+如需修改缺省的HTTP端口（80）：
+
+```
+CONFIG proxy.config.socks.http_port INT 80
+```
+
+### 关于 socks_needed
+
+在开启 socks_needed 之后，ATS对外发起的所有请求，都会通过Socks Server代理。
+
+
+## 关于 socks.config
+
+设置 Socks 5 代理服务器需要的用户名和密码
+
+- 当配置多个 Socks 5 代理时，所有代理都将使用同一个用户名和密码
+- auth u <user_name> <pasword>
+
+设置 Socks 例外规则
+
+- 如果希望对特定的目标IP发起请求时，不通过Socks Server代理，而是由ATS直接对OS发起连接，
+- 可以在socks.config 中使用no_socks配置项指定该目标IP
+- 可以指定单一IP
+  - no_socks x1.x2.x3.x4
+- 可以指定IP范围
+  - no_socks x1.x2.x3.x4 - y1.y2.y3.y4
+- 可以通过逗号分隔多个规则
+  - no_socks 123.14.84.1 - 123.14.89.4, 109.32.15.2
+
+设置 Socks 规则
+
+- 如果希望对不同的目标IP应用不同的Socks Server代理服务器，
+- 可以在socks.config 中使用与 parent.config 中相类似的配置项
+- 但是在socks.config中仅支持 dest_ip 配置项
+- 及两个附属配置项 parent，round_robin
+- 例如：
+  - 对于目标IP地址范围：216.32.0.0-216.32.255.255
+  - 采用 socks1:4080 和 socks2:1080 这两个 socks server 提供代理
+  - 上述两个 socks server 采用 round robin 的 strict 模式（第一个socks代理请求通过socks1:4080，第二个则通过socks2:1080）
+
+```
+dest_ip=216.32.0.0-216.32.255.255 parent="socks1:4080; socks2:1080" round_robin=strict
+```
+
+如目标IP未包含在上述规则中，则使用 proxy.config.socks.default_servers 所指定的 Socks 代理服务器。
+
 ## 参考资料
 
 - [I_Socks.h](http://github.com/apache/trafficserver/tree/master/iocore/net/I_Socks.h)
