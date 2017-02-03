@@ -179,7 +179,7 @@ enum {
 其它信息：
 
   - Application Layer Protocol Negotiation 扩展编号为：16 (0x10)
-  - OpenSSL 1.0.2 版本开始支持 NPN 功能
+  - OpenSSL 1.0.2 版本开始支持 ALPN 功能
 
 ## NPN / ALPN 与 SSL 和上层协议之间的关系
 
