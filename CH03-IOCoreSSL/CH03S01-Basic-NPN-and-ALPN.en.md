@@ -28,48 +28,48 @@ The detailed flow for a full SSL handshake with NPN is as follows. Please refer 
 Client                                               Server
 
 ClientHello (NPN extension)   -------->
-                                                ServerHello
-                                                  (NPN extension &
-                                                   list of protocols)
-                                               Certificate*
-                                         ServerKeyExchange*
-                                        CertificateRequest*
-                             <--------      ServerHelloDone
+                                               ServerHello
+                                                 (NPN extension &
+                                                  list of protocols)
+                                              Certificate*
+                                        ServerKeyExchange*
+                                       CertificateRequest*
+                            <--------      ServerHelloDone
 Certificate*
 ClientKeyExchange
 CertificateVerify*
 [ChangeCipherSpec]
-NextProtocol
+EncryptedExtensions
 Finished                     -------->
-                                         [ChangeCipherSpec]
-                             <--------             Finished
+                                        [ChangeCipherSpec]
+                            <--------             Finished
 Application Data             <------->     Application Data
 ```
 
-An abbreviated handshake with NextProtocol has the following flow:
+An abbreviated handshake with `EncryptedExtensions` has the following flow:
 
 ```
 Client                                                Server
 
 ClientHello (NPN extension)    -------->
-                                                ServerHello
-                                                  (NPN extension &
-                                                   list of protocols)
-                                         [ChangeCipherSpec]
-                              <--------            Finished
+                                               ServerHello
+                                                 (NPN extension &
+                                                  list of protocols)
+                                        [ChangeCipherSpec]
+                             <--------            Finished
 [ChangeCipherSpec]
-NextProtocol
+EncryptedExtensions
 Finished                      -------->
 Application Data              <------->    Application Data
 ```
 
-The NextProtocol message has the following format:
+The `EncryptedExtension` message has the following format:
 
 ```
 struct {
   opaque selected_protocol<0..255>;
   opaque padding<0..255>;
-} NextProtocol;
+} NextProtocolNegotiationEncryptedExtension;
 ```
 
 This structure has a length of an integer multiple of 32. selected_protocol is a string indicating the protocol selected, which could be one in the following list:
@@ -83,10 +83,7 @@ This structure has a length of an integer multiple of 32. selected_protocol is a
 
 In SSL handshake, TLS NPN sends a NextProtocol message, after the client sends ChangeCipherSpec and before it sends Finished.
 
-However, it needs to be noticed that NPN extension sets properties of connections instead of the session:
-
-  - when session resumption
-  - and session renegotiation happen, NPN extension needs to be renegotiated.
+Unlike many other TLS extensions, this extension does not establish properties of the session, only of the connection. When session resumption or session tickets [RFC5077](https://tools.ietf.org/html/rfc5077) are used, the previous contents of this extension are irrelevant and only the values in the new handshake messages are considered.
 
 Other information:
 
@@ -166,17 +163,14 @@ enum {
    } AlertDescription;
 ```
 
-However, it needs to be noticed that ALPN extension sets properties of connections instead of the session:
-
-  - when session resumption
-  - and session renegotiation happen, NPN extension needs to be renegotiated.
+Unlike many other TLS extensions, this extension does not establish properties of the session, only of the connection. When session resumption or session tickets [RFC5077](https://tools.ietf.org/html/rfc5077) are used, the previous contents of this extension are irrelevant and only the values in the new handshake messages are considered.
 
 Other information:
 
   - Application Layer Protocol Negotiation extension number is 16 (0x10)
   - OpenSSL supports ALPN starting with 1.0.2
 
-## Relationship between NPN/ALPN and protocols from other layers
+## Relationship between SSL with NPN/ALPN and protocols from other layers
 
 ```
  SPDY <------- HTTP/1.x
