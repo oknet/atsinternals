@@ -22,7 +22,7 @@ TLS-NPN is short for Transport Layer Security - Next Protocol Negotiation (inste
 
 ## TLS-NPN extension
 
-The detailed flow for a full SSL handshake with NPN is as follows. Please refer to [RFC 5246 Section 7.3](https://tools.ietf.org/html/rfc5246#section-7.3)
+A full handshake with `EncryptedExtensions` has the following flow (contrast with [RFC 5246 Section 7.3](https://tools.ietf.org/html/rfc5246#section-7.3))
 
 ```
 Client                                               Server
@@ -63,7 +63,7 @@ Finished                      -------->
 Application Data              <------->    Application Data
 ```
 
-The `EncryptedExtension` message has the following format:
+One of extensions in the `EncryptedExtensions` message is `next_protocol_negotiation`(TBD) of which the `extension_data` has the following format:
 
 ```
 struct {
