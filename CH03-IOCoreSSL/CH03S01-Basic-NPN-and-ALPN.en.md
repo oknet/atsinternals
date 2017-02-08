@@ -39,7 +39,7 @@ Certificate*
 ClientKeyExchange
 CertificateVerify*
 [ChangeCipherSpec]
-EncryptedExtensions
+EncryptedExtensions(NPN extension is included)
 Finished                     -------->
                                         [ChangeCipherSpec]
                             <--------             Finished
@@ -58,7 +58,7 @@ ClientHello (NPN extension)    -------->
                                         [ChangeCipherSpec]
                              <--------            Finished
 [ChangeCipherSpec]
-EncryptedExtensions
+EncryptedExtensions(NPN extension is included)
 Finished                      -------->
 Application Data              <------->    Application Data
 ```
