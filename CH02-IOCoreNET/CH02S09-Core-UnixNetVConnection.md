@@ -1724,7 +1724,7 @@ UnixNetVConnection::connectUp(EThread *t, int fd)
   if (fd == NO_FD) {
     res = con.open(options);
     if (res != 0) {
-      goto fail;
+      goto fail;
     }
   } else {
     // 通常，来自TS API的调用，底层的socket fd已经创建好了
@@ -1750,6 +1750,7 @@ UnixNetVConnection::connectUp(EThread *t, int fd)
     lerrno = errno;
     Debug("iocore_net", "connectUp : Failed to add to epoll list\n");
     action_.continuation->handleEvent(NET_EVENT_OPEN_FAILED, (void *)0); // 0 == res
+    // con.close() 由 Connection 类的析构函数调用来关闭 fd
     free(t);
     return CONNECT_FAILURE;
   }
@@ -1761,6 +1762,7 @@ UnixNetVConnection::connectUp(EThread *t, int fd)
   if (fd == NO_FD) {
     res = con.connect(&server_addr.sa, options);
     if (res != 0) {
+      // con.close() 由 Connection 类的析构函数调用来关闭 fd
       goto fail;
     }
   }
