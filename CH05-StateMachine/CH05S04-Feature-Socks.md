@@ -112,10 +112,26 @@ CONFIG proxy.config.socks.http_port INT 80
 
 ### 关于 socks_needed
 
-在开启 socks_needed 之后，ATS对外发起的所有请求，都会通过Socks Server代理。
+在开启 socks_needed 之后，ATS对外发起的请求，将可能会通过Socks Server代理
 
+- 如果在 socks.config 中指定了 no_socks
+  - 对于指定的目标IP不会通过 socks代理服务器建立连接
+- 如果在 socks.config 中指定了 socks 规则
+  - 匹配规则的连接，使用 socks 规则指定的 socks代理服务器 建立连接
+  - 如果 socks 规则为空，或未匹配任何一条规则，则查看 default_servers
+- 如果在 records.config 中配置了 default_servers
+  - 所有对外发起的请求首先匹配 socks 规则，未匹配中规则的都会通过 default_servers 建立连接
 
-## 关于 socks.config
+两种典型的应用场景如下：
+
+1. 所有对外发起的连接都通过指定的Socks代理服务器，只有特定的目标IP地址不通过Socks代理服务器
+  - 配置 records.config 的 default_servers 为指定的 Socks代理服务器
+  - 配置 socks.config 的 no_socks 排除特定的目标IP
+2. 只有特定目标IP地址才通过Socks代理服务器
+  - 配置 records.config 的 default_servers 为空
+  - 配置 socks.config 的  socks规则，设置特定目标IP通过指定的Socks代理服务器
+
+## 配置 socks.config
 
 设置 Socks 5 代理服务器需要的用户名和密码
 
