@@ -125,11 +125,11 @@ CONFIG proxy.config.socks.http_port INT 80
 两种典型的应用场景如下：
 
 1. 所有对外发起的连接都通过指定的Socks代理服务器，只有特定的目标IP地址不通过Socks代理服务器
-    - 配置 records.config 的 default_servers 为指定的 Socks代理服务器
-    - 配置 socks.config 的 no_socks 排除特定的目标IP
+   - 配置 records.config 的 default_servers 为指定的 Socks代理服务器
+   - 配置 socks.config 的 no_socks 排除特定的目标IP
 2. 只有特定目标IP地址才通过Socks代理服务器
-    - 配置 records.config 的 default_servers 为空
-    - 配置 socks.config 的  socks规则，设置特定目标IP通过指定的Socks代理服务器
+   - 配置 records.config 的 default_servers 为空
+   - 配置 socks.config 的 socks规则，设置特定目标IP通过指定的Socks代理服务器
 
 ## 配置 socks.config
 
