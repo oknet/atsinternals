@@ -330,7 +330,6 @@ template <class T> inline Ptr<T> &Ptr<T>::operator=(const Ptr<T> &src)
 
 ## Reference
 
-- [I_Lock.h]
-(http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Lock.h)
-- [Ptr.h]
-(http://github.com/apache/trafficserver/tree/master/lib/ts/Ptr.h)
+- [I_Lock.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Lock.h)
+- [Ptr.h](http://github.com/apache/trafficserver/tree/master/lib/ts/Ptr.h)
+
