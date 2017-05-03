@@ -1,20 +1,12 @@
 # 核心部件：Action & Event
 
-在介绍Event之前，首先看一下Action，由于在写这段内容的时候，我对Action的理解也不是十分透彻。
+在介绍Event之前，首先看一下Action:
 
-因此，下面的内容来自对Action类注释的翻译，翻译的不好，见谅；等我对Action理解透彻了再回来用我自己的语言重构这一个部分。
-
-Action是将要被某个Processor执行的操作，Action类是对该操作的抽象表示。
-
-在异步处理环境中，用于表示一个可撤销的Continuation，是Continuation类与Event类之间的桥梁。
-
-对一个Action对象的引用可以让你在该Action完成前取消正在进行的异步操作。
-
-- 这意味着，对于该操作指定的延续将不会被回调。
-
-对于由Event System中的Processor，还有整个IO核心库公开的方法/函数来说Action或其派生类是典型的返回类型。
-
-Action的取消者必须是该任务将要回调的状态机，同时在取消的过程中需要持有状态机的锁。
+- 当一个 状态机 通过某个 Processor方法 发起一个异步操作时, Processor 将返回一个 Action 类的指针。
+- 通过一个指向 Action 对象的指针, 状态机 可以取消正在进行中的异步操作。
+- 在取消之后, 发起该操作的 状态机 将不会接收到来自该异步操作的回调。
+- 对于Event System中的Processor，还有整个IO核心库公开的方法/函数来说Action或其派生类是一种常见的返回类型。
+- Action的取消者必须是该操作将要回调的 状态机，同时在取消的过程中需要持有 状态机 的锁。
 
 ## 定义／成员
 
@@ -26,19 +18,27 @@ class Action
 public:
     Continuation * continuation;
     Ptr<ProxyMutex> mutex;
+    // 防止编译器缓存该变量的值, 在 64bits 平台, 对该值的 读取 或 设置 是原子的
     volatile int cancelled;
 
+    // 可由继承类重写, 实现继承类中对应的处理
+    // 作为 Action 对外部提供的唯一接口
     virtual void cancel(Continuation * c = NULL) {
     if (!cancelled)
         cancelled = true;
     }
 
+    // 此方法总是直接对 Action 基类设置取消操作, 跳过继承类的取消流程
+    // 在 ATS 代码内, 此方法为 Event 对象专用
     void cancel_action(Continuation * c = NULL) {
     if (!cancelled)
         cancelled = true;
     }
 
     // 重载赋值（＝）操作
+    // 用于初始化 Action
+    //   acont 为操作完成时回调的状态机
+    //   mutex 为上述状态机的锁, 采用 Ptr<> 自动指针管理
     Continuation *operator =(Continuation * acont)
     {
         continuation = acont;
@@ -59,29 +59,36 @@ public:
 };
 ```
 
-## Processor 实现者:
+## Processor 方法实现者:
 
-你必须确保，在操作被取消之后，不会有事件发送给状态机。
+在实现一个 Processor 的方法时, 必须确保:
+
+- 在操作被取消之后，不会有事件发送给状态机。
 
 ## 返回一个Action:
 
-Processor的函数是异步的，必须返回Action，这样才能在任务完成前呼叫状态机来取消任务。
-由于某些Processor的函数是可重入的，他们可以在创建Action的调用返回之前回调状态机。
-为了处理这种情况，特殊值代替Action被返回，以指示状态机该动作已经完成。
-   - ACTION_RESULT_DONE 该Processor已经完成了任务，并内嵌回调了状态机
+Processor 方法通常是异步执行的，因此必须返回Action，这样状态机才能在任务完成前随时取消该任务。
+   - 此时, 状态机总是先获得 Action,
+   - 然后才会收到该任务的回调,
+   - 在收到回调之前, 随时可以通过 Action 取消该任务。
+
+由于某些Processor的方法是可以同步执行的(可重入的)，因此可能会出现先回调状态机, 再向状态机返回Action的情况。
+此时返回Action是毫无意义的, 为了处理这种情况，返回特殊的几个值来代替Action对象，以指示状态机该动作已经完成。
+   - ACTION_RESULT_DONE 该Processor已经完成了任务，并内嵌(同步)回调了状态机
    - ACTION_RESULT_INLINE 当前未使用
    - ACTION_RESULT_IO_ERROR 当前未使用
 
 也许会出现这样一种更复杂的问题：
    - 当结果为ACTION_RESULT_DONE
-   - 同时，状态机在可重入的回调中释放了自身
+   - 同时，状态机在同步回调中释放了自身
  
 因此，状态机的实现者必须：
-   - 对没有在可重入回调中释放自身的状态机实现一个策略
-   - 另外, 在创建异步任务时立即检查返回值
-      - 如果该值为ACTION_RESULT_DONE，那么就不能对任何状态变量进行读写。
+   - 同步回调时, 不要释放自身(不容易判断出回调的类型是同步还是异步)
+或者,
+   - 立即检查 Processor 方法返回的 Action
+   - 如果该值为ACTION_RESULT_DONE，那么就不能对状态机的任何状态变量进行读或写。
 
-无论使用哪种方法，都要对返回值进行检查，同时进行相应的处理。
+无论使用哪种方式，都要对返回值进行检查(是否为ACTION_RESULT_DONE)，同时进行相应的处理。
 
 
 ## 分配/释放策略:
@@ -89,21 +96,34 @@ Processor的函数是异步的，必须返回Action，这样才能在任务完�
 Action的分配和释放遵循以下策略：
 
 - Action由执行它的Processor进行分配。
+  - 通常 Processor 方法会创建一个Task状态机来异步执行某个特定任务
+  - 而 Action 对象则是该Task状态机的一个成员对象
 - 在Action完成或者被取消后，Processor有责任和义务来释放它。
-- 当返回的Action已经完成，或者已经取消，状态机就不可以再访问该Action。
+  - 当 Task状态机 需要回调 状态机 时, 
+    - 通过 Action 获得 mutex 并对其上锁
+    - 然后检查 Action 的成员 cancelled
+    - 如已经 cancelled, 则销毁 Task状态机
+    - 否则回调 Action.continuation
+- 当返回的Action已经完成，或者状态机对一个Action执行了取消操作,
+  - 状态机就不可以再访问该Action。
 
 
 ## 参考资料
+
 [I_Action.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Action.h)
 
 
 # 核心部件：Event
 
-Event类定义了一种EventProcessor返回的Action类型，它作为调度一个操作的结果由EventProcessor返回。
+Event类继承自Action类, 它是EventProcessor返回的专用Action类型，它作为调度操作的结果由EventProcessor返回。
 
 不同于Action的异步操作，Event是不可重入的。
 
-除了能够取消事件（因为它是一个动作），你也可以在收到它之后重新进行调度。
+  - EventProcessor 总是返回 Event 对象给状态机,
+  - 然后, 状态机才会收到回调。
+  - 不会像 Action类 的返回者, 可能存在同步回调 状态机 的情形。
+
+除了能够取消事件（因为它是一个动作），你也可以在收到它的回调之后重新对它进行调度。
 
 ## 定义／成员
 
@@ -123,7 +143,8 @@ public:
     // volatile int cancelled;
     // virtual void cancel(Continuation * c = NULL);  
 
-    // 处理此Event的ethread指针，在ethread处理此Event之前填充（就是在schedule时）
+    // 处理此Event的ethread指针，在ethread处理此Event之前填充（就是在schedule时）。
+    // 当一个 Event 由一个 EThread 管理后, 就无法在转交给其它 EThread 管理。
     EThread *ethread;
 
     // 状态及标志位
@@ -140,7 +161,7 @@ public:
     ink_hrtime timeout_at; 
     ink_hrtime period;
 
-    // ???
+    // 在回调Cont->handler时作为数据(Data)传递
     void *cookie;
 
     // 构造函数
@@ -190,6 +211,7 @@ Event::Event()
 {
 }
 
+// Event 的内存分配不对空间进行bzero()操作, 因此在 Event::init() 方法中会初始化所有必要的值
 #define EVENT_ALLOC(_a, _t) THREAD_ALLOC(_a, _t)
 #define EVENT_FREE(_p, _a, _t) \
   _p->mutex = NULL;            \
@@ -290,6 +312,9 @@ ATS中的事件(Event)，被设计为以下四种类型：
 
 PS：但是在EThread::execute()中没有对Cont->handleEvent的返回值进行判断。
 
+EVENT_DONE 通常表示该 Event 已经成功完成了回调操作, 该Event接下来应该被释放。(参照: ACTION_RESULT_DONE)
+EVENT_CONT 通常表示该 Event 没有完成回调操作, 还需要保留以进行下一次回调的尝试。
+
 ## 使用
 
 ### 创建一个Event实例，有两种方式
@@ -325,9 +350,16 @@ PS：但是在EThread::execute()中没有对Cont->handleEvent的返回值进行�
    - EVENT_FREE(e, eventAllocator, t);
    - 根据e->globally_allocated来判断
 
+### 重新调度Event
+
+状态机在收到来自 EThread 的回调后, void \*data 指向触发此次回调的 Event 对象。
+简单的进行类型转换后, 可以调用 e->schedule_\*() 将此 Event 重新放入当前线程。
+在重新调度后, Event 的类型将会被 schedule_\*() 方法重新设置。
+
 
 ## 参考资料
 
 - [I_Event.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Event.h)
 - [P_UnixEvent.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/P_UnixEvent.h)
 - [UnixEvent.cc](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/UnixEvent.cc)
+
