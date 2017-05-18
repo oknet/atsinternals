@@ -8,13 +8,13 @@ It is a reference counted object that provides mutually exclusive access to a re
 
 Since the Event System is multithreaded by design, the ProxyMutex is required to protect data structures and state information that could otherwise be affected by the action of concurrent threads.
 
-A ProxyMutex object has an ink_mutex member (defined in ink_mutex.h) which is a wrapper around the platform dependent mutex type. 
+A ProxyMutex object has an ink\_mutex member (defined in ink\_mutex.h) which is a wrapper around the platform dependent mutex type.
 
 This member allows the ProxyMutex to provide the functionallity required by the users of the class without the burden of platform specific function calls.
 
 The ProxyMutex also has a reference to the current EThread holding the lock as a back pointer for verifying that it is released correctly.
 
-## Definition / Method / Member
+## Definition / Methods / Members
 
 ProxyMutex class is a wrapper around the platform dependent mutex type.
 
@@ -83,6 +83,9 @@ public:
     ink_mutex_init(&the_mutex, name);
   }
 };
+
+// The ClassAllocator for ProxyMutexes
+extern inkcoreapi ClassAllocator<ProxyMutex> mutexAllocator;
 ```
 
 ## Function: new_ProxyMutex()
@@ -140,12 +143,12 @@ classObj->mutex_var_name = Cont->mutex;
 Just simply set mutex to NULL to destroy a ProxyMutex object.
 Ptr will automatically determine whether to release the memory space taken by the mutex.
 
-DO NOT call mutex.free() to release a Ptr<ProxyMutex> mutex object.
-In ATS, almost all ProxyMutex are defined with Ptr<ProxyMutex>. It will be destroyed automatically by Ptr template.
-
 ```
 classObj->mutex_var_name = NULL;
 ```
+
+DO NOT call mutex.free() to release a Ptr<ProxyMutex> mutex object.
+In ATS, almost all ProxyMutex are defined with Ptr<ProxyMutex>. It will be destroyed automatically by Ptr template.
 
 
 ## Acquiring/Releasing locks
@@ -154,15 +157,19 @@ Included with the ProxyMutex class, there are several macros that allow you to l
 
 These macros will be introduced in CH01-Base-Lock Section.
 
+## Reference
 
-## Ptr template and RefCountObj class
+- [I_Lock.h](http://github.com/apache/trafficserver/tree/6.0.x/iocore/eventsystem/I_Lock.h)
+
+
+# Base: Ptr template and RefCountObj class
 
 RefCountObj is a base class to enable the Reference-Counted feature for its derived class.
 ProxyMutex inherits from it and there is a reference counter (the initial value is 0) inside of ProxyMutex.
 
 Once an object is declared with Ptr<ProxyMutex>, a member m_ptr pointer is declared as ProxyMutex inside of it.
 
-And the Ptr template overload Set, Get, Equal("==") and Not Equal("!=") operator to apply these operators to "ProxyMutex *m_ptr" transparently.
+And the Ptr template overload Get & Set ```=```, Equal ```==``` and Not Equal ```!=``` operator to apply these operators to "ProxyMutex *m_ptr" transparently.
 
 ### Set operator overload analysis
 
@@ -187,19 +194,19 @@ A slightly more complex example:
 First，we create two ProxyMutex instants and one Ptr<ProxyMutex> instant
 
 - Ptr\<ProxyMutex\> PtrMutex;
-- ProxyMutex *p=new_ProxyMutex();
-- ProxyMutex *m=new_ProxyMutex();
+- ProxyMutex *p = new_ProxyMutex();
+- ProxyMutex *m = new_ProxyMutex();
 
 Set "p" to PtrMutex (PtrMutex = p):
 
-- PtrMutex.m_ptr=p
+- PtrMutex.m_ptr = p
 - Increase refcount for PtrMutex.m_ptr which means the refcount of p is 1.
 - return with PtrMutex
 
 Then, Set "m" to PtrMutex (PtrMutex = m):
 
 - Save m_ptr to temp_ptr which means save p to temp_ptr
-- PtrMutex.m_ptr=m
+- PtrMutex.m_ptr = m
 - Increase refcount for PtrMutex.m_ptr which means the refcount of m is 1.
 - Decrease refcount for temp_ptr which means the refcount of p is reduced by 1 and is 0 now.
 - If the refcount of temp_ptr is 0, call temp_ptr->free(). It is destroy & free p.
@@ -208,7 +215,7 @@ Then, Set "m" to PtrMutex (PtrMutex = m):
 At last, Set NULL to PtrMutex (PtrMutex = NULL):
 
 - Save m_ptr to temp_ptr which means save m to temp_ptr
-- PtrMutex.m_ptr=NULL, we do not change the refcount of m_ptr due to the m_ptr is NULL
+- PtrMutex.m_ptr = NULL, we do not change the refcount of m_ptr due to the m_ptr is NULL
 - Decrease refcount for temp_ptr which means the refcount of m is reduced by 1 and is 0 now.
 - If the refcount of temp_ptr is 0, call temp_ptr->free(). It is destroy & free m.
 - return with PtrMutex
@@ -218,7 +225,7 @@ If it is PtrMutex1=PtrMutex2 ?
 - It will be transformed to "PtrMutex1 ＝ PtrMutex2.m_ptr"
 - Then referring to the above flow
 
-### Definition of RefCountObj
+## Definition of RefCountObj
 
 RefCountObj is atomic version for reference counting, the non-atomic version is named NonAtomicRefCountObj.
 
@@ -253,7 +260,7 @@ public:
 };
 ```
 
-### Definition of Ptr template
+## Definition of Ptr template
 
 The Ptr template also has a non-atomic version that is named NonAtomicPtr.
 
@@ -327,9 +334,9 @@ template <class T> inline Ptr<T> &Ptr<T>::operator=(const Ptr<T> &src)
 }
 ```
 
+Tips：An object is declared with Ptr\<XXX\>, the class XXX has to inherits from the class RefCountObj.
 
 ## Reference
 
-- [I_Lock.h](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/I_Lock.h)
-- [Ptr.h](http://github.com/apache/trafficserver/tree/master/lib/ts/Ptr.h)
+- [Ptr.h](http://github.com/apache/trafficserver/tree/6.0.x/lib/ts/Ptr.h)
 
