@@ -16,16 +16,16 @@
   - 需要在数据解密之前就知道是哪种类型的协议数据被加密了
   - 于是 TLS-NPN 就诞生了
 
-TLS-NPN 扩展实现了在SSL握手过程中：
-
-  - 由Server告知Client它可以在SSL会话解密后识别哪些协议，
-  - 然后Client再告知Server它的这次通信会把哪种协议加密后传送给Server。
+## TLS-NPN 扩展
 
 TLS-NPN 全称是Transport Layer Security - Next Protocol Negotiation，它是 Google 为了支持 SPDY 协议作为一个应用层协议使用，而为TLS定义的一个扩展。
 
 TLS-NPN 可以简写为 NPN （不是电子元件三极管，哈哈～）
 
-## TLS-NPN 扩展
+TLS-NPN 扩展实现了在SSL握手过程中：
+
+  - 由Server告知Client它可以在SSL会话解密后识别哪些协议，
+  - 然后Client再告知Server它的这次通信会把哪种协议加密后传送给Server。
 
 以下有关支持 NPN 扩展的 SSL 握手的详细流程请参考：[RFC 5246 Section 7.3](https://tools.ietf.org/html/rfc5246#section-7.3) 
 
@@ -35,7 +35,8 @@ TLS-NPN 可以简写为 NPN （不是电子元件三极管，哈哈～）
 Client                                                 Server
 
 ClientHello (带有NP扩展标志)  -------->
-                                                  ServerHello (带有NP扩展标志 & 支持的协议列表)
+                                    ServerHello (带有NP扩展标志
+                                               & 支持的协议列表)
                                                  Certificate*
                                            ServerKeyExchange*
                                           CertificateRequest*
@@ -54,16 +55,17 @@ Application Data              <------->      Application Data
 然后是 SSL Abbreviated HandShake 过程，如何附带 NPN 扩展
 
 ```
-Client                                                Server
+Client                                                 Server
 
 ClientHello (带有NP扩展标志)  -------->
-                                                 ServerHello (带有NP扩展标志 & 支持的协议列表)
-                                          [ChangeCipherSpec]
-                              <--------             Finished
+                                   ServerHello (带有NP扩展标志
+                                              & 支持的协议列表)
+                                           [ChangeCipherSpec]
+                              <--------              Finished
 [ChangeCipherSpec]
 EncryptedExtensions（包含NP信息）
 Finished                      -------->
-Application Data              <------->     Application Data
+Application Data              <------->      Application Data
 ```
 
 上面提到的 NP 全称是 Next Protocol，NP信息是一个结构体：
@@ -84,10 +86,11 @@ struct {
   - spdy/3
   - spdy/3.1
 
-这个NPN扩展就是在SSL会话握手过程中，
+实现NPN扩展需要在SSL会话握手过程里插入`EncryptedExtensions`：
 
-  - 客户端发送 ChangeCipherSpec 之后 Finished 之前，增加了一个发送 EncryptedExtensions 信息的部分
-  - EncryptedExtensions 则包含了NextProtocol结构体
+  - 如果客户端收到的 `ServerHello` 中包含了一个NP信息，那么客户端也要回应一个NP信息
+  - 客户端发送 `ChangeCipherSpec` 和 `Finished` 之间，增加了一个发送 `EncryptedExtensions` 信息的部分
+  - 在 `EncryptedExtensions` 中包含了一系列各式各样的扩展信息，客户端可以把NP信息插入其中
 
 但是需要注意的是，NP扩展，只针对连接，而不是会话：
 
@@ -108,6 +111,13 @@ ALPN 的全称为 Application Layer Protocol Negotiation，被设计为 NPN 的�
 
 由于 NPN 需要在 Finished 之前插入一个流程，实现的不够完美，因此 ALPN 的实现，完全在 ClientHello 和 ServerHello 中进行。
 
+TLS-ALPN 扩展实现了在SSL握手过程中：
+
+  - 由Client告知Server它可以通过哪些协议把数据传递给Server
+  - 然后Server再从这些协议中选择一个它可以支持的协议告诉Client
+
+可以看到 NPN 是服务器端提供列表，客户端来选择，而 ALPN 是客户端提供列表，由服务器端来选择。
+
 以下有关支持 ALPN 扩展的 SSL 握手的详细流程请参考：[RFC 7301 Section 3.1](https://tools.ietf.org/html/rfc7301#section-3.1) 
 
 首先是 SSL Full HandShake 过程，如何附带 ALPN 扩展：
@@ -116,7 +126,8 @@ ALPN 的全称为 Application Layer Protocol Negotiation，被设计为 NPN 的�
 Client                                                                     Server
 
 ClientHello (带有ALPN扩展标志 & 支持的协议列表)   -------->
-                                                                      ServerHello (带有ALPN扩展标志 & 选中的协议)
+                                                      ServerHello (带有ALPN扩展标志
+                                                                       & 选中的协议)
                                                                      Certificate*
                                                                ServerKeyExchange*
                                                               CertificateRequest*
@@ -137,7 +148,8 @@ Application Data                                  <------->      Application Dat
 Client                                                                     Server
 
 ClientHello (带有ALPN扩展标志 & 支持的协议列表)   -------->
-                                                                      ServerHello (带有ALPN扩展标志 & 选中的协议)
+                                                      ServerHello (带有ALPN扩展标志
+                                                                       & 选中的协议)
                                                                [ChangeCipherSpec]
                                                   <--------              Finished
 [ChangeCipherSpec]
@@ -160,9 +172,9 @@ Application Data                                  <------->      Application Dat
    } ProtocolNameList;
 ```
 
-服务端ServerHello包含的选中协议，跟上面的格式一样，但是只能含有一项。
+服务端ServerHello中同样包含一个协议列表，跟上面的格式一样，但是只能含有一项。
 
-如果客户端发送的协议列表，服务端都不支持，ServerHello 中泽包含：
+如果客户端发送的协议列表，服务端都不支持，ServerHello 中则包含：
 
 ```
 enum {
