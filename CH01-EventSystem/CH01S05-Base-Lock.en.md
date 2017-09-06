@@ -1,6 +1,6 @@
 # Basic: Lock
 
-The following analysis base on ATS 6.0 which may be different from the previous versions cause there is reconstruction of I_Lock.h in 2014.
+The following analysis base on ATS 6.0 which may be different from the previous versions because there is reconstruction of I_Lock.h in 2014.
 
 To ensure the access of sharing resources with multi-thread, ATS defines several methods to get a lock: 
 
