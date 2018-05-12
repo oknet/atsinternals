@@ -533,12 +533,14 @@ public:
     return data->block_size();
   }
 
-  // 减少正在使用的数据区域，_start -= len
+  // 自 IOBufferBlock 缓冲区的头部消费一定字节的数据，_start += len
+  // 应用程序自 IOBufferBlock 缓冲区的头部将数据消费后，调用此方法来标记这部分缓冲区的内存空间可以被回收
   void consume(int64_t len);
 
-  // 增加正在使用的数据区域，_end＋＝len
-  // 但是，首先要用end()获取当前的数据区域的结尾，然后拷贝数据到结尾后，再调用此方法
-  // 注意，不能超过 _buf_end，就是 len <= write_avail()
+  // 向 IOBufferBlock 缓冲区的尾部追加一定字节的数据，_end＋＝len
+  // 应用程序将数据追加到 IOBufferBlock 缓冲区的尾部后，调用此方法来来标记缓冲区中实际可读取数据的存量
+  // 首先，要用end()获取当前的数据区域的结尾，然后拷贝数据到结尾后，再调用此方法
+  // 注意，拷贝数据的长度 len <= write_avail()
   void fill(int64_t len);
 
   // 重置正在使用的数据区域，_start＝_end＝buf()，_buf_end＝buf()＋block_size()
