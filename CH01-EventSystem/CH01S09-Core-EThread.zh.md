@@ -1230,6 +1230,49 @@ flush_signals(EThread *thr)
 }
 ```
 
+对 `flush_signals()` 的有效性进行分析：
+
+- 在 `flush_signals()` 方法中，通过对 `ethreads_to_be_signalled` 指针数组进行遍历，获得需要被唤醒的目标线程，
+   - 该数组的最大长度为 4096 个，也就是可以创建的最大线程数量，
+   - 成员 `n_ethreads_to_be_signalled` 则保存了需要进行唤醒的线程数量。
+- 在遍历流程中，逐个调用目标线程的 `EventQueueExternal.signal()` 方法即可对目标线程实施唤醒操作，
+   - 该方法中，使用互斥变量 `lock` 对条件变量 `might_have_data` 进行保护，
+   - 在每一次唤醒目标线程时都需要进行一次互斥锁的阻塞式上锁，然后唤醒，最后再解锁，
+   - 因此，在线程较多时，可能在上锁这一步发生很短时间的阻塞。
+- 在两次 `flush_signals()` 方法被调用的区间，各种状态机可能会向不同线程内调度事件，而且有可能向同一个线程多次调度事件。
+   - 这取决于状态机发起的事件调度的次数，
+   - 以及目标线程的外部队列是否为空队列，只有从空队列变为非空队列的事件调度操作，才需要唤醒目标线程，
+   - 因此，在大多数情况下需要唤醒的线程数量是比较少的。
+- 事件是批量插入到目标线程，再由 `flush_signals()` 方法批量唤醒这些线程进行处理，
+   - 这意味着事件的处理可能没有那么的及时，
+   - 如果每插入一个事件到目标线程，就立即对目标线程进行唤醒，那么可以让事件得到及时的处理，但是也将导致目标线程每个循环能够处理的事件数量变少。
+   - 可以通过激活宏定义 EAGER_SIGNALLING，让事件处理更及时。
+- 在向目标线程调度事件时，并不能确定目标线程当前所处的状态，目标线程有可能：
+   - 处于互斥条件锁的阻塞等待状态（有效唤醒操作），
+   - 处于内部队列的遍历过程中（无效唤醒操作），
+   - 处于隐性队列的遍历过程中（无效唤醒操作），等
+   - 因此，每一次对目标线程的唤醒，可能会是无效的。
+
+
+对 `flush_signals()` 的性能进行分析：
+
+- 为什么在 `ProtectedQueue::enqueue()` 方法里，需要将 `ethreads_to_be_signalled` 指针数组转换为直接映射表呢？
+   - 采用直接映射表的好处是具有 O(1) 复杂度的快速插表效率，同时避免对同一个线程多次唤醒
+   - 但是，在 `flush_signals()` 方法中，不得不对整个映射表进行遍历。
+- 基于上面的分析，`flush_signals()` 方法每次需要唤醒的线程数量并不多，
+   - 当待唤醒线程数量较少时，可以把 `ethreads_to_be_signalled` 指针数组看做是一个队列，
+   - 以 `n_ethreads_to_be_signalled` 作为尾指针，在队尾进行插入，
+   - 这样在 `flush_signals()` 里最多只需要遍历 `n_ethreads_to_be_signalled` 个元素。
+- 是否需要去重？
+   - 上述在队尾插入待唤醒线程的算法中，会导致待唤醒线程重复出现在队列里，
+   - 如果在插入之前，先对整个队列进行遍历，可以解决线程重复的问题，
+   - 但是，这样就需要在每次插入前完全遍历整个队列。
+   - 目前的代码实现，选择了避免遍历队列不去重的方式，具体孰优孰劣，我也说不准。
+- 无效唤醒操作的代价？
+   - 通过上述分析，可以发现在唤醒线程时，会存在很多无效的唤醒操作
+   - 唤醒操作包含三个步骤：上锁、唤醒、解锁
+   - 如何评估上述操作在线程循环里占用的时间片的多少？
+
 ## 关于 EAGER_SIGNALLING
 
 在 [ProtectedQueue.cc](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/ProtectedQueue.cc) 中对此进行了描述：
@@ -1266,6 +1309,7 @@ flush_signals(EThread *thr)
     - 同样的一次上下文切入操作，则可以处理多个 Event 之后再切出
     - 这样就减少了上下文切换的次数
 
+
 ## 参考资料
 
 ![EventQueue - EThread - Signals](https://cdn.rawgit.com/oknet/atsinternals/master/CH01-EventSystem/CH01-EventSystem-001.svg)
@@ -1275,3 +1319,4 @@ flush_signals(EThread *thr)
 - [ProtectedQueue.cc](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/ProtectedQueue.cc)
 - [EventProcessor](CH01S10-Interface-EventProcessor.zh.md)
 - [Event](CH01S08-Core-Event.zh.md)
+
