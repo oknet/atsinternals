@@ -231,10 +231,23 @@ Thread::start(const char *name, size_t stacksize, ThreadFunction f, void *a)
 }
 ```
 
-  - 在 Main.cc 里有一段很奇特的地方也调用了 set_specific
-    - 但是之后就没看到任何使用 main_thread 的地方了
-    - 从注释上看，这里是为了对 win_9xMe 的系统运行 ATS 提供的支持
-    - 针对 start_HttpProxyServer() 的调用做的优化
+**BUG**: 6.0.x 的 `ink_thread_create()` 存在线程安全问题，在 `Thread::start()` 方法中：
+
+- 我们可以看到 `ink_thread_create()` 方法返回了 `ink_thread` 类型的值，该值用于初始化 `Thread::tid` 成员变量，
+- 但是在 `ink_thread_create()` 方法返回之前，新线程已经创建完成并开始运行，
+- 如果在新线程内访问 `Thread::tid` 成员变量，那么有可能读到了未经过初始化的数值。
+- 首次修复 [PR#2195](https://github.com/apache/trafficserver/pull/2195)
+   - 该修复通过在 `spawn_thread_internal()` 方法内增加一个互斥锁，让线程延迟运行
+   - 但是 `ink_thread_create()` 方法仍然存在线程安全问题
+- 改进修复 [PR#2791](https://github.com/apache/trafficserver/pull/2791)
+   - 该修复透传参数给 `pthread_create()`，彻底解决了问题
+
+
+在 Main.cc 里有一段很奇特的地方也调用了 set_specific
+
+- 但是之后就没看到任何使用 main_thread 的地方了
+- 从注释上看，这里是为了对 win_9xMe 的系统运行 ATS 提供的支持
+- 针对 start_HttpProxyServer() 的调用做的优化
 
 ```
 // source: proxy/Main.cc
