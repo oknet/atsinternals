@@ -243,11 +243,11 @@ Thread::start(const char *name, size_t stacksize, ThreadFunction f, void *a)
    - 该修复透传参数给 `pthread_create()`，彻底解决了问题
 
 
-在 Main.cc 里有一段很奇特的地方也调用了 set_specific
+在 Main.cc 里有一段很奇特的地方也调用了 `set_specific()` 方法
 
-- 但是之后就没看到任何使用 main_thread 的地方了
+- 但是之后就没看到任何使用 `main_thread` 变量的地方了
 - 从注释上看，这里是为了对 win_9xMe 的系统运行 ATS 提供的支持
-- 针对 start_HttpProxyServer() 的调用做的优化
+- 针对 `start_HttpProxyServer()` 的调用做的优化
 
 ```
 // source: proxy/Main.cc
@@ -255,18 +255,18 @@ Thread::start(const char *name, size_t stacksize, ThreadFunction f, void *a)
   // without this this_ethread() is failing when
   // start_HttpProxyServer is called from main thread
   Thread *main_thread = new EThread;
-  main_thread->set_specific();   
+  main_thread->set_specific();
 ```
 
 ## main() 是如何成为 [ET_NET 0] 的？
 
-在 Main.cc 的最后执行了 this_ethread()->execute()
+在 Main.cc 的最后执行了 `this_ethread()->execute()`
 
-  - 原本 execute() 是在 spawn_thread_internal() 中被调用的
-  - 而spawn_thread_internal()是线程创建之后才会调用的第一个函数
-  - 但是为了节省一个线程的空间，ATS直接在main()中调用了 this_ethread()->execute() 开始执行
-  - 但是在 spawn_thread_internal() 中需要调用 set_specific() 的过程去了那里？
-  - 如果不调用 set_specific() 那么 this_ethread() 又怎么能返回 EThread 对象呢？
+  - 原本 `execute()` 是在 `spawn_thread_internal()` 中被调用的
+  - 而 `spawn_thread_internal()` 是线程创建之后才会调用的第一个函数
+  - 但是为了节省一个线程的空间，ATS 直接在 `main()` 中调用了 `this_ethread()->execute()` 开始执行
+  - 但是在 `spawn_thread_internal()` 中需要调用 `set_specific()` 的过程去了那里？
+  - 如果不调用 `set_specific()` 那么 `this_ethread()` 又怎么能返回 EThread 对象呢？
 
 ```
 // source: iocore/eventsystem/UnixEventProcessor.cc
@@ -299,20 +299,20 @@ EventProcessor::start(int n_event_threads, size_t stacksize)
 }
 ```
 
-上面的代码，可以看出在 EventProcessor::start() 方法中对 all_ethreads[0] 做了特殊的处理
+上面的代码，可以看出在 `EventProcessor::start()` 方法中对 `all_ethreads[0]` 做了特殊的处理
 
-  - 为 all_ethreads[0] 调用 set_specific
-  - 不启动 all_ethreads[0]
+  - 为 `all_ethreads[0]` 调用 `ink_thread_setspecific()`
+  - 不调用 `all_ethreads[0]->start()`
 
-所以，在 main() 最后的那句 this_ethread()->execute() 就是启动了 [ET_NET 0] 的执行。
+所以，在 `main()` 最后的那句 `this_ethread()->execute()` 就是启动了 `[ET_NET 0]` 线程的事件循环。
 
 重新回顾一下这个流程：
 
-  - 在 main() 的一开始首先调用了 eventProcessor.start()
-    - 启动了 [ET_NET 1] ~ [ET_NET n] 的所有线程
-    - 初始化 [ET_NET 0] 的数据，但不启动该线程
-  - 然后 main() 执行其它的启动流程
-  - 最后 main() 调用 this_ethread()->execute() 完成了 [ET_NET 0] 的启动
+  - 在 `main()` 的一开始首先调用了 `eventProcessor.start()`
+    - 初始化 `[ET_NET 0]` ~ `[ET_NET n]` 的数据
+    - 启动了 `[ET_NET 1]` ~ `[ET_NET n]` 的所有线程，跳过了 `[ET_NET 0]` 线程的启动
+  - 然后 `main()` 执行其它的启动流程
+  - 最后 `main()` 调用 `this_ethread()->execute()` 完成了 `[ET_NET 0]` 的启动
 
 ## 参考资料
 
@@ -321,13 +321,11 @@ EventProcessor::start(int n_event_threads, size_t stacksize)
 
 # 核心部件：EThread
 
-EThread 是 Thread 的具体实现。
+EThread 是 Thread 的具体实现:
 
-在ATS中，只有EThread类基于Thread类实现。
-
-EThread类是由Event System创建和管理的线程类型。
-
-它是Event System调度事件的接口之一（另外两个是Event和EventProcessor类）。
+- 在ATS中，只有EThread类基于Thread类实现,
+- EThread类是由Event System创建和管理的线程类型,
+- 它是Event System调度事件的接口之一（另外两个是Event和EventProcessor类）。
 
 ## EThread的类型
 
@@ -381,23 +379,25 @@ ATS可以创建两种类型的EThread线程：
 EThread提供了8个调度函数（其实是9个，但是有一个 _signal 除了IOCore内部使用，其它地方都用不到）。
 
 以下方法把Event放入当前EThread线程的外部队列
-- schedule_imm
-- schedule_imm_signal
-  - 专为网络模块设计
-  - 一个线程可能一直阻塞在epoll_wait上，通过引入一个pipe或者eventfd，当调度一个线程执行某个event时，异步通知该线程从epoll_wait解放出来。
-- schedule_at
-- schedule_in
-- schedule_every
 
-上述5个方法最后都会调用schedule()的公共部分
+- schedule\_imm
+- schedule\_imm\_signal
+  - 专为网络模块设计
+  - 一个线程可能一直阻塞在 `epoll_wait()` 上，通过引入一个 pipe 或者 eventfd，当调度一个线程执行某个 event 时，异步通知该线程从 `epoll_wait()` 解放出来。
+- schedule\_at
+- schedule\_in
+- schedule\_every
+
+上述5个方法最后都会调用 `schedule()` 的公共部分
 
 以下方法功能与上面的相同，只是它们直接把Event放入内部队列
-- schedule_imm_local
-- schedule_at_local
-- schedule_in_local
-- schedule_every_local
 
-上述4个方法最后都会调用schedule_local()的公共部分
+- schedule\_imm\_local
+- schedule\_at\_local
+- schedule\_in\_local
+- schedule\_every\_local
+
+上述4个方法最后都会调用 `schedule_local()` 的公共部分
 
 ## 定义
 
@@ -488,7 +488,8 @@ public:
   // 专门用于DEDICATED类型的EThread
   Event *oneevent; // For dedicated event thread
 
-  // ???
+  // 用来保存 HttpServerSession 对象的会话池
+  // 后面会有单独的章节来描述
   ServerSessionPool *server_session_pool;
 };
 
@@ -611,9 +612,9 @@ EThread::process_event(Event *e, int calling_code)
 EThread::execute() 由switch语句分成多个部分：
 
 - 第一部分是 REGULAR 类型的处理
-  - 它由一个无限循环内的代码，持续扫描/遍历多个队列，并回调Event内部Cont的handler
+  - 它由一个无限循环内的代码，持续扫描/遍历多个队列，并回调 Event 内部 Cont->handler()
 - 第二部分是 DEDICATED 类型的处理
-  - 直接回调oneevent内部的Cont的handler，其实是一个简化版的process_event(oneevent, EVENT_IMMEDIATE)
+  - 直接回调 oneevent 内部的 Cont->handler()，其实是一个简化版的 `process_event(oneevent, EVENT_IMMEDIATE)`
 
 下面是对execute()代码的注释和分析：
 
@@ -771,7 +772,7 @@ EThread::execute()
         // execute poll events
         // 执行隐性队列里的polling事件，每次取一个事件，通过process_event呼叫状态机，目前：
         // 对于TCP，状态机是NetHandler::mainNetEvent
-        // 对于UDP，状态机时PollCont::pollEvent
+        // 对于UDP，状态机是PollCont::pollEvent
         while ((e = NegativeQueue.dequeue()))
           process_event(e, EVENT_POLL);
         // 再次判断外部队列是否为空，如果外部队列不为空，那么就一次性取出所有事件丢入外部本地队列
@@ -828,20 +829,22 @@ EThread::execute()
 
 - 外部本地队列
 - 内部队列
-- if 隐性队列有Event
-  - 判断之前的schedule_*_signal调用，异步触发signal
-  - if 外部队列有Event --> 为了避免下面的操作出现阻塞
+- if 隐性队列非空
+  - 判断之前的 `schedule_*` 调用，异步触发 signal
+  - if 外部队列非空
     - 外部队列导入外部本地队列
-  - 外部本地队列
-  - 隐性队列
-  - if 外部队列有Event --> 为了避免下面的操作出现阻塞
+  - 遍历外部本地队列
+  - 遍历隐性队列
+  - if 外部队列非空
     - 外部队列导入外部本地队列
 - else
-  - 计算出内部队列最早需要处理的Event时间距离现在的时间差，作为sleep time
-  - 判断是否超出最长sleep time，如超出，则使用最长sleep time值
-  - 判断之前的schedule_*_signal调用，异步触发signal
-  - 外部队列导入本地队列，如果外部队列没有Event，则最长等待sleep time指定的时间
-  - 等待期间，可以使用schedule_*_signal来中断此等待
+  - 计算出内部队列最早到期的 Event 的时间距离现在的时间差，作为 sleep time
+  - 判断是否超出最长 sleep time，如超出，则使用最长 sleep time 值
+  - 判断之前的 `schedule_*` 调用，异步触发 signal
+  - if 外部队列为空
+    - 则最长等待 sleep time 指定的时间
+    - 等待期间，可以使用 `schedule_*` 来中断此等待
+  - 外部队列导入外部本地队列
 
 //end for(;;)
 
@@ -923,23 +926,23 @@ o#########>  event route
 
 - 外部队列为Free Lock队列，保证多个线程读写队列无须加锁，而且不会出现冲突
 - 本地队列是外部队列的子队列，是一个普通的List结构赋予了Que的操作方法，如：pop，push，insert等
-- 通常新Event直接加入外部队列，部分内部方法schedule_*_local()可以直接将Event加入外部队列的本地队列
+- 通常新Event直接加入外部队列，部分内部方法 `schedule_*_local()` 可以直接将Event加入外部队列的本地队列
 - 但是Free Lock的操作仍然是有代价的，因此每个循环中，会一次性把外部队列的Event全部取出，放入外部队列的本地队列
 - 接下来只需要对外部队列的本地队列进行遍历，判断Event的类型
   - 立即执行(通常为NetAccept Event)
-     * 由schedule_imm()添加，timeout_at=0，period=0
-     * 调用handler，然后Free(Event)
+     * 由 `schedule_imm()` 添加，timeout\_at=0，period=0
+     * 调用 handler，然后 Free(Event)
   - 定时执行(通常为Timeout Check)
-     * 由schedule_at/in()添加，timeout_at>0，period=0
-     * 简单理解at和in的不同：at是绝对时间，in是相对时间
-     * 时间到达时，调用handler
+     * 由 `schedule_at/in()` 添加，timeout\_at>0，period=0
+     * 简单理解 at 和 in 的不同：at 是绝对时间，in 是相对时间
+     * 时间到达时，调用 handler
      * 然后检查是否需要 "定期执行（可能为资源回收、缓冲区刷新等Event）"
-     * 由schedule_every()添加，timeout_at=period>0
+     * 由 `schedule_every()` 添加，timeout\_at=period>0
      * 如果需要定期执行则将Event放入外部队列的本地队列，否则Free(Event)
   - 随时执行(目前只有NetHandler Event)
-     * 由schedule_every()添加，timeout_at=period<0
-     * 在每个循环周期都会调用handler，然后再将Event放入外部队列的本地队列
-     * handler对于TCP事件为NetHandler::mainNetEvent()
+     * 由 `schedule_every()` 添加，timeout\_at=period<0
+     * 在每个循环周期都会调用 handler，然后再将 Event 放入外部队列的本地队列
+     * handler 对于TCP事件为 `NetHandler::mainNetEvent()`
 
 内部队列
 
@@ -950,7 +953,7 @@ o#########>  event route
   - 其中子队列0（<5ms）保存了所有需要在5ms以内需要执行的Event
   - 在一个独立遍历内部队列的过程之前会首选对内部队列进行重新排序和整理
   - 然后再遍历内部队列的子队列0，并执行Event内的handler
-  - 执行完成后，由process_event重新放回外部本地队列，等待下一次循环。
+  - 执行完成后，由 `process_event()` 重新放回外部本地队列，等待下一次循环。
 
 隐性队列(负事件队列／负队列)
 
@@ -961,52 +964,52 @@ o#########>  event route
 - 通常放入此队列的都是Polling操作，如：
   - NetHandler::mainNetEvent
   - PollCont::pollEvent
-- 上面两个handler都会调用epoll_wait，然后驱动netProcessor来完成网络数据的接收和发送
+- 上面两个handler都会调用epoll_wait，然后驱动 网络任务处理器 来完成网络数据的接收和发送
 
 ## signal_hook 介绍
 
-在epoll_wait调用时，会有一个阻塞的超时等待时间，前面我们介绍Event System的时候，特别强调必须是完全无阻塞的。
+在 `epoll_wait()` 调用时，会有一个阻塞的超时等待时间，前面我们介绍Event System的时候，特别强调必须是完全无阻塞的。
 
-但是epoll_wait中的阻塞又是一个可能会出现的情况，那么ATS是如何处理Event System中这种特殊的阻塞情况呢？
+但是 `epoll_wait()` 中的阻塞又是一个可能会出现的情况，那么ATS是如何处理Event System中这种特殊的阻塞情况呢？
 
 答案是```受控阻塞```:
 
-- 阻塞的时间设置上限，由epoll_wait的超时参数决定
-- 通过signal让epoll_wait在超时到达之前返回
+- 阻塞的时间设置上限，由 `epoll_wait()` 的超时参数决定
+- 通过 signal 让 `epoll_wait()` 在超时到达之前返回
 
-通过man epoll_wait可以很容易得知：
+通过 man epoll_wait 可以很容易得知：
 
-- epoll_wait的timeout设置是以千分之一秒（ms／毫秒）为单位设置的
-- 当此值大于0时有效，则epoll_wait不会立即返回
-   - 而是等待timeout指定的时间，以等待可能的事件产生
-   - 但是也可能没有等待到timeout的时间，而提前返回：
-      - 出现了新的事件 
+- `epoll_wait()` 的 timeout 设置是以千分之一秒（ms／毫秒）为单位设置的
+- 当此值大于 0 时有效，则 `epoll_wait()` 不会立即返回
+   - 而是等待 timeout 指定的时间，以等待可能的事件产生
+   - 但是也可能没有等待到 timeout 的时间，而提前返回：
+      - 出现了新的事件
       - 被系统中断打断
 
 系统中断是不可控的，但是新的事件呢？
 
-- ATS通过eventfd()系统调用创建了一个evfd，并将这个fd封装到ep里，然后添加到了epoll fd里，关注evfd的READ事件。
-- 如果让evfd变成可读，就会触发新事件，那么只需要提供一个方法让evfd可读，就可以产生新事件，这样epoll_wait就可以立即返回
+- ATS通过 `eventfd()` 系统调用创建了一个 `evfd`，并将这个 `evfd` 封装到ep里，然后添加到了 `epoll fd` 里，关注`evfd 的 `READ` 事件。
+- 只需要提供一个方法让 `evfd` 可读，就可以产生新事件，这样 `epoll_wait()` 就可以立即返回
 
-ATS通过将evfd添加到fd集合中实现了这个受控阻塞，这就是受控阻塞的原理。
+ATS通过将 `evfd` 添加到fd集合中实现了这个受控阻塞，这就是受控阻塞的原理。
 
-为了让这个设计更具有通用性，于是增加了signal_hook用于向evfd里写数据，这个signal_hook在iocore/net/UnixNet.cc里的initialize_thread_for_net中被初始化为net_signal_hook_function()，并且在初始化ep的时候，指定类型（ep->type）为EVENTIO_ASYNC_SIGNAL。
+为了让这个设计更具有通用性，于是增加了 `signal_hook()` 用于向 `evfd` 里写数据，这个 `signal_hook()` 在 `iocore/net/UnixNet.cc` 里的 `initialize_thread_for_net()` 中被初始化为 `net_signal_hook_function()`，并且在初始化ep的时候，指定类型（ep->type）为 `EVENTIO_ASYNC_SIGNAL`。
 
-在NetHandler::mainNetEvent中可以看到专门对EVENTIO_ASYNC_SIGNAL类型的EventIO进行了处理，就是调用net_signal_hook_callback()来读取其中的数据，由于这里只是为了让epoll_wait从timeout wait状态中提前返回，所以读取到的数据没什么用。
+在 `NetHandler::mainNetEvent` 中可以看到专门对 `EVENTIO_ASYNC_SIGNAL` 类型的 EventIO 进行了处理，就是调用 `net_signal_hook_callback()` 来读取其中的数据，由于这里只是为了让 `epoll_wait()` 从 timeout wait 状态中提前返回，所以读取到的数据没什么用。
 
-就这样，ATS把epoll_wait的超时等待变成了可控等待。
+就这样，ATS把 `epoll_wait()` 的超时等待变成了可控等待。
 
 因此，evfd，signal_hook 和 ep，这三个成员是一体的，是专门用来支持网络IO的受控阻塞。
 
-实际上这个超时等待的默认值为10ms，也就是百分之一秒，ATS连这么短的时间都要打断去立即处理一个Event，可见ATS是为了达到实时处理的目的，真正实现schedule_imm_signal()的EVENT_IMMEDIATE的意义！
+实际上这个超时等待的默认值为10ms，也就是百分之一秒，ATS连这么短的时间都要打断去立即处理一个Event，可见ATS是为了达到实时处理的目的，真正实现 `schedule_imm_signal()` 的 EVENT_IMMEDIATE 的意义！
 
-除了schedule_imm_signal()会调用到signal_hook，还有在UnixNetVConnection::reenable的时候也会调用到。
+除了 `schedule_imm_signal()` 会调用到 `signal_hook()`，还有 `UnixNetVConnection::reenable()` 也会调用到。
 
 ## Signal的异步通知
 
-为什么会有 schedule_imm_signal 这样一个特殊的方法？
+为什么会有 `schedule_imm_signal()` 这样一个特殊的方法？
 
-在schedule_*()中会通过```EventQueueExternal.enqueue(e, fast_signal＝true)```把event放入外部队列。
+在 `schedule_*()` 中会通过 `EventQueueExternal.enqueue(e, fast_signal＝true)` 把 event 放入外部队列。
 
 ```
 TS_INLINE Event *
@@ -1027,7 +1030,7 @@ EventProcessor::schedule(Event *e, EventType etype, bool fast_signal)
 }
 ```
 
-在阅读enqueue()方法的代码时，请一定看一下上面的schedule()方法，同时找一个大脑最清醒的时刻，否则很容易晕...
+在阅读下面的 `ProtectedQueue::enqueue()` 方法的代码时，请一定先看一下上面的 `schedule()` 方法，同时找一个大脑最清醒的时刻，否则很容易晕...
 
 EventQueueExternal 是一个 ProtectedQueue，那么它的enqueue方法如下：
 
@@ -1144,26 +1147,18 @@ ProtectedQueue::enqueue(Event *e, bool fast_signal)
 }
 ```
 
-再来看signal和try_signal
+再来看 `signal()` 和 `try_signal()`
 
-- signal
+- `signal()`
    - 首先以阻塞方式获得锁
    - 然后触发cond_signal
    - 最后释放锁
-- try_signal是signal的非阻塞版本
-   - 尝试获得锁，如果获得锁，就跟signal是一样的，然后返回1，表示成功执行signal操作
-   - 如果没有获得锁，就返回0
-
-如果try_signal拿到了锁，成功发送了通知，则表示：
-
-- 当前没有处于epoll_wait()等特殊阻塞场景，
-- 不需要通过signal_hook()来向特殊组件发送通知。
-
-相反，则表示：
-
-- 目标EThread当前没有处于 cond_wait() 等待中
-- 目标EThread当前正在执行Event标记的任务，此时可能会有特殊组件产生的阻塞
-- 需要通过signal_hook()来打断特殊组件的阻塞
+- `try_signal()` 是 `signal()` 的非阻塞版本
+   - 尝试获得锁，如果获得锁，就跟 `signal()` 是一样的，然后返回 1，表示成功执行 signal 操作
+   - 如果没有获得锁，就返回 0
+- 注意
+   - 调用目标线程的 `signal()` 和 `try_signal()` 并且成功返回，并不意味着目标线程一定处于 cond_wait 状态
+   - 这就如同十字路口的信号灯变绿了，可能并没有车辆通过，因为车辆在等前面的红灯变绿。
 
 相关代码如下：
 
@@ -1192,7 +1187,40 @@ ProtectedQueue::try_signal()
 }
 ```
 
-当通知被放入signal队列中时，会在EThread::execute()的REGULAR模式中进行判断，如果发现signal队列有元素，就会调用flush_signals(this)进行通知，相关代码如下：
+当调用 `ProtectedQueue::dequeue_timed()` 传入的最后一个参数为 `true` 时，就有可能让事件循环进入到 cond\_wait 的状态，等待 `signal()` 或 `try_signal()` 的唤醒。
+
+在进入到 cond\_wait 状态之前，有一个对外部队列是否为空的判断 `if (INK_ATOMICLIST_EMPTY(al))`，为什么这个判断要在上锁之后进行，不能放在上锁之前呢？
+
+- 上锁操作是一个阻塞操作，可能会立即上锁，也可能会阻塞一段时间，
+- 如果先对原子队列进行非空的判定，然后再进行阻塞上锁操作，
+- 如果没有立即上锁，而是阻塞了一段时间，
+- 那么，原子队里的状态会发生改变
+- 此时就会发现，明明原子队列非空，结果却进入到了 cond\_wait 的状态
+
+如果上锁之后，才发现外部队列是空的，此时上锁操作就相当于无效的，那么能否避免这种无效的操作呢？
+
+- 可以做一个简单的修改：`if (sleep && INK_ATOMICLIST_EMPTY(al)) {`
+- 参考：[PR#4715](https://github.com/apache/trafficserver/pull/4715)
+
+相关代码如下：
+
+```
+void
+ProtectedQueue::dequeue_timed(ink_hrtime cur_time, ink_hrtime timeout, bool sleep)
+{
+  (void)cur_time;
+  Event *e;
+  if (sleep) {
+    ink_mutex_acquire(&lock);
+    if (INK_ATOMICLIST_EMPTY(al)) {
+      timespec ts = ink_hrtime_to_timespec(timeout);
+      ink_cond_timedwait(&might_have_data, &lock, &ts);
+    }
+    ink_mutex_release(&lock);
+  }
+```
+
+当通知被放入signal队列中时，会在 `EThread::execute()` 的 REGULAR 模式中进行判断，如果发现signal队列有元素，就会调用 `flush_signals(this)` 进行通知，相关代码如下：
 
 ```
 void
@@ -1306,7 +1334,7 @@ flush_signals(EThread *thr)
   - 保护队列被设计为：
     - 当前线程已经完成了一定量的工作时，才通知线程
     - 采用延迟通知的方式，可以阻止/减少过度的上下文切换
-  - 但是可以定义宏 EAGER_SIGNALLING 来关闭上述行为，让通知立即发出
+  - 但是可以定义宏 `EAGER_SIGNALLING` 来关闭上述行为，让通知立即发出
 
 解释一下：
 
@@ -1315,7 +1343,7 @@ flush_signals(EThread *thr)
     - 处理完该指定 Event 之后，目标线程再次进入修庙，由此导致上下问切出
     - 如果每处理一个 Event 都要切入、切出一次，那么上下文切换次数会非常的惊人
   - 如果采用延迟通知，
-    - 在每一个EThread::execute()的循环中，
+    - 在每一个 `EThread::execute()` 的循环中，
       - 将需要通知的目标线程保存在当前线程的一个列表内
       - 循环结束时，遍历该列表，一次性通知所有需要唤醒的线程
     - 此时，在一个目标线程里可能存在多个 Event 需要运行
