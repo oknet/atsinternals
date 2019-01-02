@@ -370,12 +370,12 @@ PluginVC::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
   return &read_state.vio;
 }
 ```
+在设置 need_read_process 之后，EventSystem将会回调 PluginVC::main_handler()，然后调用 process_read_side(false) 实现了：
 
-在设置 need_read_process 之后，EventSystem将会回调 PluginVC::main_handler()，然后调用 process_read_side(false)。
+- 将 PluginVCCore缓冲区 内的数据读取到 状态机的读缓冲区，
+- 然后再通知另外一端继续向 PluginVCCore缓冲区 写入数据的流程。
 
-- 实现从一个PluginVC接收数据，然后放入另外一端的数据缓冲区
-- 由于 process_read_side() 包含两种情况的处理，非常的复杂。
-- 因此，我会在代码里进行标记，未标记的部分则是两种情况都需要的公共代码
+由于 process_read_side() 包含两种情况的处理，非常的复杂，因此，我会在代码里进行标记，未标记的部分则是两种情况都需要的公共代码。
 
 ```
 // void PluginVC::process_read_side()
@@ -383,6 +383,12 @@ PluginVC::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
 //   This function may only be called while holding
 //      this->mutex & while it is ok to callback the
 //      read side continuation
+//
+// 在调用该函数之前需要满足以下条件：
+//
+//   - 已经对 PluginVC::mutex 上锁
+//   - 已经对 PluginVC::read_state.vio.mutex 上锁
+//     - 满足回调 PluginVC::read_state.vio._cont 的条件。
 //
 //   Does read side processing
 //
@@ -564,6 +570,10 @@ PluginVC::process_read_side(bool other_side_call)
     if (!other_side_call) {
       // 来自本地 PluginVC::main_handler
       // 通过对端的 process_write_side(true) 完成数据填充
+      /* 此处并不满足调用 process_write_side 的要求，可参考 PR #4746 进行改进：
+       *
+       *   - https://github.com/apache/trafficserver/pull/4746
+       */
       other_side->process_write_side(true);
     } else {
       // 来自对端 PluginVC::main_handler
@@ -590,6 +600,65 @@ PluginVC::do_io_write() 前面的代码与 NetVC::do_io_write() 相似
 最后是返回 VIO
 
 ```
+VIO *
+PluginVC::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *abuffer, bool owner)
+{
+  ink_assert(!closed);
+  ink_assert(magic == PLUGIN_VC_MAGIC_ALIVE);
+
+  // 设置 VIO
+  if (abuffer) {
+    ink_assert(!owner);
+    write_state.vio.buffer.reader_for(abuffer);
+  } else {
+    write_state.vio.buffer.clear();
+  }
+
+  // BUG：buffer.clear() 之后，可能会继续设置nbytes > 0
+  // Note: we set vio.op last because process_write_side looks at it to
+  //  tell if the VConnection is active.
+  write_state.vio.mutex = c ? c->mutex : this->mutex;
+  write_state.vio._cont = c;
+  write_state.vio.nbytes = nbytes;
+  write_state.vio.ndone = 0;
+  write_state.vio.vc_server = (VConnection *)this;
+  write_state.vio.op = VIO::WRITE;
+
+  Debug("pvc", "[%u] %s: do_io_write for %" PRId64 " bytes", core_obj->id, PVC_TYPE, nbytes);
+
+  // Since reentrant callbacks are not allowed on from do_io
+  //   functions schedule ourselves get on a different stack
+  // BUG：buffer.clear() 之后，need_read_process 应该被设置为 false
+  need_write_process = true;
+  setup_event_cb(0, &sm_lock_retry_event);
+
+  return &write_state.vio;
+}
+
+```
+
+在设置 need_write_process 之后，EventSystem将会回调 PluginVC::main_handler()，然后调用 process_write_side(false) 实现了：
+
+- 将 状态机的写缓冲区 内的数据写入到 PluginVCCore缓冲区，
+- 然后再通知另外一端继续从 PluginVCCore缓冲区 读取数据的流程。
+
+由于 process_write_side() 包含两种情况的处理，非常的复杂，因此，我会在代码里进行标记，未标记的部分则是两种情况都需要的公共代码。
+
+```
+// void PluginVC::process_write_side(bool cb_ok)
+//
+//   This function may only be called while holding
+//      this->mutex & while it is ok to callback the
+//      write side continuation
+//
+// 在调用该函数之前需要满足以下条件：
+//
+//   - 已经对 PluginVC::mutex 上锁
+//   - 已经对 PluginVC::write_state.vio.mutex 上锁
+//     - 满足回调 PluginVC::write_state.vio._cont 的条件。
+//
+//   Does write side processing
+//
 void
 PluginVC::process_write_side(bool other_side_call)
 {
@@ -735,6 +804,10 @@ PluginVC::process_write_side(bool other_side_call)
     if (!other_side_call) {
       // 来自本地 PluginVC::main_handler
       // 通过对端的 process_read_side(true) 完成数据读取
+      /* 此处并不满足调用 process_read_side 的要求，可参考 PR #4746 进行改进：
+       *
+       *   - https://github.com/apache/trafficserver/pull/4746
+       */
       other_side->process_read_side(true);
     } else {
       // 来自对端 PluginVC::main_handler
@@ -752,3 +825,4 @@ PluginVC::process_write_side(bool other_side_call)
 - [Plugin.h](http://github.com/apache/trafficserver/tree/master/proxy/Plugin.h)
 - [PluginVC.h](http://github.com/apache/trafficserver/tree/master/proxy/PluginVC.h)
 - [PluginVC.cc](http://github.com/apache/trafficserver/tree/master/proxy/PluginVC.cc)
+- [Pull Request #4746](https://github.com/apache/trafficserver/pull/4746)
