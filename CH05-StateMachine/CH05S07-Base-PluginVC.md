@@ -2,30 +2,39 @@
 
 PluginVC 是伪装成 NetVC，用来实现在两个“延续”(Continuation)之间进行双向数据传输的状态机。
 
-PluginVC 是以 PluginVCCore 作为核心，其内包含两个 PluginVC 成员，一个是 active\_vc，一个是 passive\_vc。
+PluginVC 是以 PluginVCCore 作为核心，其内包含两个 PluginVC 成员，一个是 `active_vc`，一个是 `passive_vc`。
 
-- PluginVCCore 就像是一个缩小版的 IOCore Net Subsystem，它只负责管理 active\_vc 和 passive\_vc。
+- PluginVCCore 就像是一个缩小版的 IOCore Net Subsystem，它只负责管理 `active_vc` 和 `passive_vc`。
 - 每一个 PluginVC 通过 4 个 Event 的不间断回调，实现了数据的双向传输
-   - sm_lock_retry_event （对 vio.mutex 上锁后可以读写）
-   - core_lock_retry_event （对 PluginVC::mutex 上锁后可以读写）
-   - active_event (被 PluginVC 回调时可以读写）
-   - inactive_event (被 PluginVC 回调时可以读写）
-   - 除了 inactive_event 是周期性事件，其它三个都是立即事件
+   - `sm_lock_retry_event` （对 vio.mutex 上锁后可以读写）
+   - `core_lock_retry_event` （对 PluginVC::mutex 上锁后可以读写）
+   - `active_event` (被 PluginVC 回调时可以读写）
+   - `inactive_event` (被 PluginVC 回调时可以读写）
+   - 除了 `inactive_event` 是周期性事件，其它三个都是立即事件
 - 每一个 PluginVC 可以分别在不同的线程被回调，可用于实现跨线程的数据传输
+
+下面以两个 API 调用勾勒出 PluginVC 能够实现的主要功能：
 
 在 TSHttpConnectWithPluginId() 的实现中，
 
-- 通过 PluginVCCore::connect() 与 HttpSM 建立连接，passive\_vc 被 HttpSM 作为 ClientVC
-- 在调用返回后，Plugin 获得 active\_vc，并且 passive\_vc 被设置 internal request 标志
-- 其调用者将作为 Http Client，需要向 active\_vc 中写入一个合法的 HTTP 请求
-- 然后 PluginVCCore 负责把数据传输到 passive\_vc 一侧，并且向 HttpSM 发送 READ\_READY 事件
+- 通过 `PluginVCCore::connect()` 与 HttpSM 建立连接，`passive_vc` 被 HttpSM 作为 ClientVC
+- 在调用返回后，Plugin 获得 `active_vc`，并且 `passive_vc` 被设置 internal request 标志
+- Plugin 作为 Http Client，向 `active_vc` 中写入一个合法的 HTTP 请求
+- PluginVCCore 负责把请求传输到 `passive_vc` 一侧，并且向 HttpSM 发送 `READ_READY` 事件
+- HttpSM 将会从 `passive_vc` 接收到该请求，然后写入一个合法的 HTTP 响应，
+- PluginVCCore 负责把响应传输到 `active_vc` 一侧，并且向 Plugin 发送 `READ_READY` 事件
+- 最后 Plugin 从 `active_vc` 读取到 HttpSM 发来的响应
 
 在 TSHttpTxnServerIntercept() 的实现中，
 
-- HttpSM 会通过 PluginVCCore::connect\_re() 获得成员 active\_vc，并将其作为 ServerVC
-- 在 PluginVCCore::connect\_re() 被调用后，Plugin 会收到 TS\_EVENT\_NET\_ACCEPT 时间，并获得 passive\_vc
-- 其调用者将作为 Http Origin Server，将会从 passive\_vc 一侧读取到 HttpSM 发送给 OS 的请求
-- 然后将一个合法的 HTTP 响应写入 passive\_vc，PluginVCCore 将负责把数据传输到 active\_vc 一侧
+- HttpSM 会通过 `PluginVCCore::connect_re()` 获得成员 `active_vc`，并将其作为 ServerVC
+- 在 `PluginVCCore::connect_re()` 被调用后，Plugin 会收到 `TS_EVENT_NET_ACCEPT` 事件，并获得 `passive_vc`
+- HttpSM 向 `active_vc` 写入一个 HTTP 请求，
+- PluginVCCore 将负责把数据传输到 `passive_vc` 一侧，并且向 Plugin 发送 `READ_READY` 事件
+- Plugin 作为 Http Origin Server，从 `passive_vc` 接收到 HttpSM 发送给 OS 的请求，然后写入一个合法的 HTTP 响应
+- PluginVCCore 将负责把数据传输到 `active_vc` 一侧，并且向 HttpSM 发送 `READ_READY` 事件
+- 最后 HttpSM 从 `active_vc` 读取到 Plugin 发来的响应
+
 
 ```
 +-------------+                      +--------------+                      +-------------------+
@@ -1192,12 +1201,8 @@ PluginVCCore::destroy()
 }
 ```
 
-
-
-
 ## 参考资料
 
-- TSHttpConnectWithPluginId
 - [Plugin.h](http://github.com/apache/trafficserver/tree/6.0.x/proxy/Plugin.h)
 - [PluginVC.h](http://github.com/apache/trafficserver/tree/6.0.x/proxy/PluginVC.h)
 - [PluginVC.cc](http://github.com/apache/trafficserver/tree/6.0.x/proxy/PluginVC.cc)
