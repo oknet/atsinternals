@@ -387,11 +387,6 @@ PluginVC::setup_event_cb(ink_hrtime in, Event **e_ptr)
        * 参考：
        *   - [Pull Request #1334](https://github.com/apache/trafficserver/pull/1334)
        *   - [TS-3235](https://issues.apache.org/jira/browse/TS-3235)
-       *
-       * 后续：
-       *   - [Pull Request #4074](https://github.com/apache/trafficserver/pull/4074)
-       *   - 这里没有清晰解释 Oath 生产环境遇到的问题，
-       *   - 个人认为：单纯就代码的改动来看，可读性更好，但是没有实质性的变化。
        */
       call_event->cancel();
     }
@@ -420,6 +415,102 @@ PluginVC::setup_event_cb(ink_hrtime in, Event **e_ptr)
     }
   }
 
+```
+
+后续：
+
+- 在 Pull Request #1334 之后，在 Oath 的生产环境仍然遇到 `inactive_event` 导致的 crash 问题
+- 通过 [Pull Request #4074](https://github.com/apache/trafficserver/pull/4074) 进行了修复
+- 在 PR #4047 里并没有清晰解释 Oath 所遇到的问题
+
+下面是 Pull Request #1334 修复后的代码注释：
+
+```
+  if (call_event == active_event) {
+    // Active Timeout 是一个定时事件，只要该事件回调，就说明已经达到了计时器设定的超时时间
+    process_timeout(&active_event, VC_EVENT_ACTIVE_TIMEOUT);
+  } else if (call_event == inactive_event) {
+    // 由于状态机会频繁修改超时时间，这就导致会频繁的创建和释放 Event 对象，
+    // 为了避免频繁创建和修改 Event 对象，在 TS-1427 (c8392efb7c) 里对此进行了改进，
+    // Inactive Timeout 检测由周期性事件，每秒触发一次回调，然后对超时时间进行检测。
+    if (inactive_timeout_at && inactive_timeout_at < Thread::get_hrtime()) {
+      process_timeout(&inactive_event, VC_EVENT_INACTIVITY_TIMEOUT);
+      /* BUG: 在成功回调状态机之后，call_event 可能没有被取消
+       * 在 process_timeout 里会首先把 inactive_timeout 设置为 NULL，然后再回调状态机。
+       * 如果状态机重新调用了 `set_inactivity_timeout()` 就会创建新的周期性事件，并赋值给 inactive_timeout。
+       * 此时，下面根据 inactive_event 是否为 NULL 的判断就会失效，导致旧的周期性事件没有被取消。
+       * 参考：
+       *   - [Pull Request #4074](https://github.com/apache/trafficserver/pull/4074)
+       */
+      if (nullptr == inactive_event) {
+        call_event->cancel();
+      }
+    }
+  } else {
+```
+
+### PluginVC Timeout 处理
+
+`PluginVC::process_timeout()` 用来处理 `active_event` 和 `inactive_event` 两个事件，完成向状态机回调超时事件的功能。其设计思路是：
+
+- 先尝试向 `read_state.vio._cont` 回调超时事件
+- 如果条件不符，则尝试向 `write_state.vio._cont` 回调超时事件
+- 回调之前先尝试对 `read/write_state.vio.mutex` 上锁
+- 上锁失败，
+  - 重新调度事件
+  - BUG1：`inactive_event` 是周期性事件，不应该重新调度
+  - BUG2：`inactive_event` 被重新调度后，返回到 `main_handler()` 又通过 `call_event->cancel()` 取消了
+  - 参考：[Pull Request #1334](https://github.com/apache/trafficserver/pull/1334)
+  - 我认为这里应该不会出现上锁失败，因为在调用 `process_timeout()` 之前，在 `main_handler()` 中已经完成了对 `read/write_state.vio.mutex` 的上锁操作。
+- 上锁成功，
+  - 先把 `active_event` 或 `inactive_event` 赋值为 NULL
+  - 然后回调 `read/write_state.vio._cont` 对应的状态机
+  - 如果传入的 `e` 是 `inactive_event`，在返回到 `main_handler()` 时要通过 `call_event->cancel()` 取消周期性事件
+  - 注意：由于状态机可能会重设超时，因此在取消时不可使用 `inactive_event->cancel()`
+- BUG?
+  - 如果 `read_state.vio._cont` 与 `write_state.vio._cont` 指向了不同的状态机，只有一个状态机能够接收到超时事件，
+  - 先对 `read_state` 或 `write_state` 进行检查，然后再上锁，这是不可靠的。
+
+```
+// void PluginVC::process_timeout(Event** e, int event_to_send, Event** our_eptr)
+//
+//   Handles sending timeout event to the VConnection.  e is the event we got
+//     which indicates the timeout.  event_to_send is the event to the
+//     vc user.  e is a pointer to either inactive_event,
+//     or active_event.  If we successfully send the timeout to vc user,
+//     we clear the pointer, otherwise we reschedule it.
+//
+//   Because the possibility of reentrant close from vc user, we don't want to
+//      touch any state after making the call back
+//
+void
+PluginVC::process_timeout(Event **e, int event_to_send)
+{
+  ink_assert(*e == inactive_event || *e == active_event);
+
+  if (read_state.vio.op == VIO::READ && !read_state.shutdown && read_state.vio.ntodo() > 0) {
+    MUTEX_TRY_LOCK(lock, read_state.vio.mutex, (*e)->ethread);
+    if (!lock.is_locked()) {
+      // 未区分 `active_event` 或 `inactive_event` 就直接重新调度
+      (*e)->schedule_in(PVC_LOCK_RETRY_TIME);
+      return;
+    }
+    *e = NULL;
+    read_state.vio._cont->handleEvent(event_to_send, &read_state.vio);
+  } else if (write_state.vio.op == VIO::WRITE && !write_state.shutdown && write_state.vio.ntodo() > 0) {
+    MUTEX_TRY_LOCK(lock, write_state.vio.mutex, (*e)->ethread);
+    if (!lock.is_locked()) {
+      // 未区分 `active_event` 或 `inactive_event` 就直接重新调度
+      (*e)->schedule_in(PVC_LOCK_RETRY_TIME);
+      return;
+    }
+    *e = NULL;
+    write_state.vio._cont->handleEvent(event_to_send, &write_state.vio);
+  } else {
+    // 如果不符合回调状态机的条件，就忽略此次超时事件
+    *e = NULL;
+  }
+}
 ```
 
 ### PluginVC Read I/O 流程分析
@@ -920,11 +1011,12 @@ PluginVC::process_write_side(bool other_side_call)
 }
 ```
 
-
 ## 参考资料
 
 - TSHttpConnectWithPluginId
-- [Plugin.h](http://github.com/apache/trafficserver/tree/master/proxy/Plugin.h)
-- [PluginVC.h](http://github.com/apache/trafficserver/tree/master/proxy/PluginVC.h)
-- [PluginVC.cc](http://github.com/apache/trafficserver/tree/master/proxy/PluginVC.cc)
+- [Plugin.h](http://github.com/apache/trafficserver/tree/6.0.x/proxy/Plugin.h)
+- [PluginVC.h](http://github.com/apache/trafficserver/tree/6.0.x/proxy/PluginVC.h)
+- [PluginVC.cc](http://github.com/apache/trafficserver/tree/6.0.x/proxy/PluginVC.cc)
+- [Pull Request #1334](https://github.com/apache/trafficserver/pull/1334)
+- [Pull Request #4074](https://github.com/apache/trafficserver/pull/4074)
 - [Pull Request #4746](https://github.com/apache/trafficserver/pull/4746)
