@@ -209,6 +209,8 @@ private:
 };
 ```
 
+## 方法
+
 ### 初始化及构造
 
 PluginVC 不会单独出现，它总是作为 PluginVCCore 的成员对象存在。
@@ -268,6 +270,8 @@ PluginVCCore::init()
 }
 ```
 
+### 设置回调事件 setup\_event\_cb
+
 由于在 PluginVC 中需要频繁的设置回调，因此创建了 setup_event_cb() 以简化代码逻辑。
 
 在函数的头部有一段说明，为了避免锁的问题，传递给 setup_event_cb 的Event指针，是两个不同的Event
@@ -321,17 +325,114 @@ PluginVC::setup_event_cb(ink_hrtime in, Event **e_ptr)
 }
 ```
 
+### 主回调处理 main_handler
+
+与 NetVC 由 NetHandler 驱动不同。PluginVC 是通过 Event 的直接回调来完成数据的传输以及对状态机的读、写，以及网络事件的回调。
+
+每一个 PluginVC 最多可由四个 Event 驱动，因此一个 PluginVCCore 管理下的两个 PluginVC 最多由八个 Event 驱动。这八个 Event 对象的指针分别使用三个不同的 Mutex 进行保护：
+
+- 当持有 Active PluginVC 的 vio.mutex 的锁
+  - 可以修改 Active PluginVC 的 `sm_lock_retry_event`
+  - 可以设置 Active PluginVC 一侧的 `need_read_process` / `need_write_process` 为 true
+- 当持有 Passive PluginVC 的 vio.mutex 的锁
+  - 可以修改 Passive PluginVC 的 `sm_lock_retry_event`
+  - 可以设置 Passive PluginVC 一侧的 `need_read_process` / `need_write_process` 为 true
+- 当持有 PluginVC 的 mutex 的锁
+  - 可以读写 PluginVC 所关联的 PluginVCCore 的所有成员
+  - 可以修改 两个 PluginVC 的 `core_lock_retry_event`
+- 同时持有 PluginVC 的 mutex 和 vio.mutex 的锁
+  - 可以设置 PluginVC 的 `need_read_process` / `need_write_process` 为 false
+  - 可以在 vio.buffer 与 PluginVCCore缓冲区 之间传递数据
+  - 可以修改 PluginVC 的 `active_event` / `inactive_event`（设置或重置超时）
+    - 状态机只有收到 PluginVC 的回调时，才可以设置 PluginVC 的超时
+
+`PluginVC::main_handler()` 的实现，分为以下几个部分：
+
+- 对 `read_state.vio.mutex` 和 `write_state.vio.mutex` 上锁
+- 检查 PluginVC 是否已经关闭，如已经关闭则通知 PluginVCCore 回收资源
+- 递增 重入计数器
+  - 如果在接下来的操作里，将 PluginVC 关闭了
+  - 重入计数器 可以避免在重入 `process_close()` 时将 PluginVC 的内存提前回收
+- 处理三类共四个 Event 的回调
+  - 处理 `active_event` 驱动的 active 超时控制
+  - 处理 `inactive_event` 驱动的 inactive 超时控制
+  - 处理 `sm/core_lock_retry_event` 驱动的 读、写 请求
+- 递减 重入计数器
+  - 只有当 重入计数器 为 0 的时候，才可以回收已经关闭的 PluginVC 对象占用的内存
+- 再次检查 PluginVC 是否已经关闭，如已经关闭则通知 PluginVCCore 回收资源
+
+上述流程中处理四个 Event 的回调时，通过 `if-else if-else` 的嵌套结构确保每次回调时仅处理其中一类 Event 对应的功能。
+
+- 每一类事件的处理都需要回调状态机，
+- 回调状态机之后，状态机都可能会重新执行 `do_io_read` / `do_io_write`，
+- 从而可能导致 `vio.mutex` 发生改变，
+- 因此每次回调状态机之后
+  - 需要检查 `vio.mutex` 是否发生改变（效率高，实现复杂）
+  - 或者直接返回事件系统，由事件系统隔离每一次回调（效率低，实现简单）
+- 但是这里没有对 读、写 处理进行隔离处理，因此这里可能存在一个 Bug？
+
+下面是代码注释：
+
+```
+  if (call_event == active_event) {
+    // Active Timeout 是一个定时事件，只要该事件回调，就说明已经达到了计时器设定的超时时间
+    process_timeout(&active_event, VC_EVENT_ACTIVE_TIMEOUT);
+  } else if (call_event == inactive_event) {
+    // 由于状态机会频繁修改超时时间，这就导致会频繁的创建和释放 Event 对象，
+    // 为了避免频繁创建和修改 Event 对象，在 TS-1427 (c8392efb7c) 里对此进行了改进，
+    // Inactive Timeout 检测由周期性事件，每秒触发一次回调，然后对超时时间进行检测。
+    if (inactive_timeout_at && inactive_timeout_at < Thread::get_hrtime()) {
+      process_timeout(&inactive_event, VC_EVENT_INACTIVITY_TIMEOUT);
+      /* BUG: inactive_event 被取消了，但是没有将 inactive_event 赋值为 NULL
+       * 参考：
+       *   - [Pull Request #1334](https://github.com/apache/trafficserver/pull/1334)
+       *   - [TS-3235](https://issues.apache.org/jira/browse/TS-3235)
+       *
+       * 后续：
+       *   - [Pull Request #4074](https://github.com/apache/trafficserver/pull/4074)
+       *   - 这里没有清晰解释 Oath 生产环境遇到的问题，
+       *   - 个人认为：单纯就代码的改动来看，可读性更好，但是没有实质性的变化。
+       */
+      call_event->cancel();
+    }
+  } else {
+    // 事件 sm_lock_retry_event 和 core_lock_retry_event 的回调，都是为了触发 PluginVC 的读写操作
+    // 唯一不同的是读写请求的发起方，也可以说发起读写请求时拿到了哪一把锁。
+    if (call_event == sm_lock_retry_event) {
+      sm_lock_retry_event = NULL;
+    } else {
+      ink_release_assert(call_event == core_lock_retry_event);
+      core_lock_retry_event = NULL;
+    }
+    // 响应 do_io_read 以及 reenable(read_state.vio)
+    if (need_read_process) {
+      process_read_side(false);
+    }
+    /* BUG? 在处理完读请求后，可能已经回调了状态机，那么在处理写请求之前，需要判断写操作的锁是否发生改变。
+     * 参考：
+     *   - UnixNetVConnection::mainEvent() 里处理超时回调的部分
+     *   - PluginVC::main_handler() 里对 wirte_side_mutex 上锁的处理过程
+     *     - `if (write_side_mutex.m_ptr != write_state.vio.mutex.m_ptr) {`
+     */
+    // 响应 do_io_write 以及 reenable(write_state.vio)
+    if (need_write_process && !closed) {
+      process_write_side(false);
+    }
+  }
+
+```
+
 ### PluginVC Read I/O 流程分析
 
-PluginVC::do_io_read() 前面的代码与 NetVC::do_io_read() 相似
+`PluginVC::do_io_read()` 前面的代码与 `NetVC::do_io_read()` 相似
 
 - 设置 MIOBuffer
 - 设置 VIO
 
 然后是设置
 
-- need_read_process = true 表示 main_handler 须要进行读操作处理
-- 通过 setup_event_cb() 安排对 PluginVC::main_handler 的回调
+- `need_read_process = true` 表示 `PluginVC::main_handler()` 须要进行读操作处理
+- 通过 `setup_event_cb()` 安排对 `PluginVC::main_handler()` 的回调
 
 最后是返回 VIO
 
@@ -370,12 +471,12 @@ PluginVC::do_io_read(Continuation *c, int64_t nbytes, MIOBuffer *buf)
   return &read_state.vio;
 }
 ```
-在设置 need_read_process 之后，EventSystem将会回调 PluginVC::main_handler()，然后调用 process_read_side(false) 实现了：
+在设置 `need_read_process` 之后，EventSystem将会回调 `PluginVC::main_handler()`，然后调用 `process_read_side(false)` 实现了：
 
 - 将 PluginVCCore缓冲区 内的数据读取到 状态机的读缓冲区，
 - 然后再通知另外一端继续向 PluginVCCore缓冲区 写入数据的流程。
 
-由于 process_read_side() 包含两种情况的处理，非常的复杂，因此，我会在代码里进行标记，未标记的部分则是两种情况都需要的公共代码。
+由于 `process_read_side()` 包含两种情况的处理，非常的复杂，因此，我会在代码里进行标记，未标记的部分则是两种情况都需要的公共代码。
 
 ```
 // void PluginVC::process_read_side()
@@ -587,15 +688,15 @@ PluginVC::process_read_side(bool other_side_call)
 
 ### PluginVC Write I/O 流程分析
 
-PluginVC::do_io_write() 前面的代码与 NetVC::do_io_write() 相似
+`PluginVC::do_io_write()` 前面的代码与 `NetVC::do_io_write()` 相似
 
 - 设置 MIOBuffer
 - 设置 VIO
 
 然后是设置
 
-- need_write_process = true 表示 main_handler 须要进行写操作处理
-- 通过 setup_event_cb() 安排对 PluginVC::main_handler 的回调
+- `need_write_process = true` 表示 `PluginVC::main_handler()` 须要进行写操作处理
+- 通过 `setup_event_cb()` 安排对 `PluginVC::main_handler()` 的回调
 
 最后是返回 VIO
 
@@ -637,12 +738,12 @@ PluginVC::do_io_write(Continuation *c, int64_t nbytes, IOBufferReader *abuffer, 
 
 ```
 
-在设置 need_write_process 之后，EventSystem将会回调 PluginVC::main_handler()，然后调用 process_write_side(false) 实现了：
+在设置 `need_write_process` 之后，EventSystem将会回调 `PluginVC::main_handler()`，然后调用 `process_write_side(false)` 实现了：
 
 - 将 状态机的写缓冲区 内的数据写入到 PluginVCCore缓冲区，
 - 然后再通知另外一端继续从 PluginVCCore缓冲区 读取数据的流程。
 
-由于 process_write_side() 包含两种情况的处理，非常的复杂，因此，我会在代码里进行标记，未标记的部分则是两种情况都需要的公共代码。
+由于 `process_write_side()` 包含两种情况的处理，非常的复杂，因此，我会在代码里进行标记，未标记的部分则是两种情况都需要的公共代码。
 
 ```
 // void PluginVC::process_write_side(bool cb_ok)
@@ -818,6 +919,7 @@ PluginVC::process_write_side(bool other_side_call)
   }
 }
 ```
+
 
 ## 参考资料
 
