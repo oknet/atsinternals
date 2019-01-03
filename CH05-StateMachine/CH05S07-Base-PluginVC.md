@@ -1011,6 +1011,190 @@ PluginVC::process_write_side(bool other_side_call)
 }
 ```
 
+### PluginVC Close 流程分析
+
+`PluginVC::do_io_close()` 将成员 `closed` 设置为 `true` 后即表示 PluginVC 已经关闭，当重入计数器 `reentrancy_count` 同时为 `0`，就可以通过 `PluginVC::process_close()` 对 PluginVC 内的资源进行回收，当两个 PluginVC 都完成资源回收后，最后由 PluginVCCore 完成内存释放。
+
+其流程与 `UnixNetVConnection::do_io_close()` 非常相似，都是根据重入计数器是否为 `0`，分别执行同步关闭或异步关闭流程。
+
+```
+void
+PluginVC::do_io_close(int /* flag ATS_UNUSED */)
+{
+  ink_assert(closed == false);
+  ink_assert(magic == PLUGIN_VC_MAGIC_ALIVE);
+
+  Debug("pvc", "[%u] %s: do_io_close", core_obj->id, PVC_TYPE);
+
+  // 可以把 closed = true 放在这里
+
+  if (reentrancy_count > 0) {
+    // Do nothing since dealloacting ourselves
+    //  now will lead to us running on a dead
+    //  PluginVC since we are being called
+    //  reentrantly
+    // 重入计数器不为 0，因此只能设置 PluginVC 为关闭状态，但是不能进一步释放 PluginVC 内的资源。
+    closed = true;
+    return;
+  }
+
+  // 对 PluginVC::mutex 进行上锁，实际上是同时锁定了 PluginVCCore 和 两个 PluginVC。
+  MUTEX_TRY_LOCK(lock, mutex, this_ethread());
+
+  if (!lock.is_locked()) {
+    // 上锁失败，通过 sm_lock_retry_event 进行调度，延迟调用 process_close() 释放资源
+    setup_event_cb(PVC_LOCK_RETRY_TIME, &sm_lock_retry_event);
+    closed = true;
+    return;
+  } else {
+    closed = true;
+  }
+
+  // 上锁成功，立即调用 process_close() 释放资源
+  process_close();
+}
+```
+
+以下是 `PluginVC::process_close()` 的代码注释：
+
+
+```
+// 这里可能是笔误？难道还有 process_write_close()?
+// void PluginVC::process_read_close()
+//
+//   This function may only be called while holding
+//      this->mutex
+//
+// 在调用该函数之前需要满足以下条件：
+//   - 已经对 PluginVC::mutex 上锁
+//
+//   Tries to close the and dealloc the the vc
+//
+void
+PluginVC::process_close()
+{
+  ink_assert(magic == PLUGIN_VC_MAGIC_ALIVE);
+
+  Debug("pvc", "[%u] %s: process_close", core_obj->id, PVC_TYPE);
+
+  // 将 PluginVC 标记为可被删除的状态，这样 PluginVCCore 就可以安全的释放 PluginVC 所占用的内存空间
+  if (!deletable) {
+    deletable = true;
+  }
+
+  // 取消四个事件
+  if (sm_lock_retry_event) {
+    sm_lock_retry_event->cancel();
+    sm_lock_retry_event = NULL;
+  }
+
+  if (core_lock_retry_event) {
+    core_lock_retry_event->cancel();
+    core_lock_retry_event = NULL;
+  }
+
+  if (active_event) {
+    active_event->cancel();
+    active_event = NULL;
+  }
+
+  if (inactive_event) {
+    inactive_event->cancel();
+    inactive_event = NULL;
+    inactive_timeout_at = 0;
+  }
+
+  // 如果另外一端的 PluginVC 没有关闭，那么要通知对端：
+  //   - 让对端将缓冲区内的数据尽快通过回调的方式传输给状态机
+  //   - 让对端知道本端已经关闭
+  // If the other side of the PluginVC is not closed
+  //  we need to force it process both living sides
+  //  of the connection in order that it recognizes
+  //  the close
+  if (!other_side->closed && core_obj->connected) {
+    other_side->need_write_process = true;
+    other_side->need_read_process = true;
+    other_side->setup_event_cb(0, &other_side->core_lock_retry_event);
+  }
+
+  // 调用 PluginVCCore::attempt_delete() 尝试回收 PluginVCCore 和 两个 PluginVC 的内存
+  core_obj->attempt_delete();
+}
+```
+
+以下是 `PluginVCCore::attempt_delete()` 的代码注释：
+
+```
+// void PluginVCCore::attempt_delete()
+//
+//  Mutex must be held when calling this function
+//
+// 在调用该函数之前需要满足以下条件：
+//   - 已经对 PluginVCCore::mutex 上锁
+//
+void
+PluginVCCore::attempt_delete()
+{
+  if (active_vc.deletable) {
+    if (passive_vc.deletable) {
+      // 当两个 PluginVC 都标记为可删除，那么就调用 destroy() 方法回收内存
+      destroy();
+    } else if (!connected) {
+      /* 当 active_vc 已经关闭，但是 passive_vc 未建立连接时，
+       * 回调 NET_EVENT_ACCEPT_FAILED。
+       *
+       * 这种特殊情况发生在 TSHttpTxnServerIntercept 或 TSHttpTxnIntercept 调用之后，
+       * 但是在发起到目标服务器的连接之前，HttpSM 就由于某种原因终止了，
+       * 因此没有来的及调用 PluginVCCore::connect_re()，导致 connected 为 false，
+       * 在 HttpSM 终止时会调用 PluginVCCore::kill_no_connect() 对 active_vc 执行 do_io_close() 操作。
+       */
+      state_send_accept_failed(EVENT_IMMEDIATE, NULL);
+    }
+  }
+}
+```
+
+以下是 `PluginVCCore::destroy()` 的代码注释：
+
+```
+void
+PluginVCCore::destroy()
+{
+  Debug("pvc", "[%u] Destroying PluginVCCore at %p", id, this);
+
+  // PluginVC 已经关闭，或者未与状态机建立连接时，都可以安全的回收资源
+  ink_assert(active_vc.closed == true || !connected);
+  active_vc.mutex = NULL;
+  active_vc.read_state.vio.buffer.clear();
+  active_vc.write_state.vio.buffer.clear();
+  active_vc.magic = PLUGIN_VC_MAGIC_DEAD;
+
+  ink_assert(passive_vc.closed == true || !connected);
+  passive_vc.mutex = NULL;
+  passive_vc.read_state.vio.buffer.clear();
+  passive_vc.write_state.vio.buffer.clear();
+  passive_vc.magic = PLUGIN_VC_MAGIC_DEAD;
+
+  // 回收 PluginVCCore 内用于双向通信的 MIOBuffer
+  if (p_to_a_buffer) {
+    free_MIOBuffer(p_to_a_buffer);
+    p_to_a_buffer = NULL;
+  }
+
+  if (a_to_p_buffer) {
+    free_MIOBuffer(a_to_p_buffer);
+    a_to_p_buffer = NULL;
+  }
+
+  // 最后清除 Mutex，然后释放 PluginVCCore 和 两个 PluginVC 所占用的内存空间
+  this->mutex = NULL;
+  delete this;
+}
+```
+
+
+
+
 ## 参考资料
 
 - TSHttpConnectWithPluginId
