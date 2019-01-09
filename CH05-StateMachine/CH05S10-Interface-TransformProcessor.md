@@ -175,5 +175,5 @@ TVC 是一个管道，数据流从一端流入，然后再从另外一端流出�
 
 ## 参考资料
 
-- [PluginVC.h](http://github.com/apache/trafficserver/tree/6.0.x/proxy/Transform.h)
-- [PluginVC.cc](http://github.com/apache/trafficserver/tree/6.0.x/proxy/Transform.cc)
+- [Transform.h](http://github.com/apache/trafficserver/tree/6.0.x/proxy/Transform.h)
+- [Transform.cc](http://github.com/apache/trafficserver/tree/6.0.x/proxy/Transform.cc)

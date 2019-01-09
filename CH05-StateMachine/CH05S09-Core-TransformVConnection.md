@@ -810,6 +810,7 @@ TVC 会进入到半关闭状态，是因为 TVC 管道中间的某一节向其�
 
 ## 参考资料
 
-- [PluginVC.h](http://github.com/apache/trafficserver/tree/6.0.x/proxy/TransformInternal.h)
-- [PluginVC.cc](http://github.com/apache/trafficserver/tree/6.0.x/proxy/Transform.cc)
+- [TransformInternal.h](http://github.com/apache/trafficserver/tree/6.0.x/proxy/TransformInternal.h)
+- [Transform.cc](http://github.com/apache/trafficserver/tree/6.0.x/proxy/Transform.cc)
 - [Pull Request #2907](https://github.com/apache/trafficserver/pull/2907)
+
