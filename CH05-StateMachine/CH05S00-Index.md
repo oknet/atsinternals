@@ -81,3 +81,20 @@
   - 其它任何操作都需要对 server_vc->mutex 上锁
 
 同样的，在收到ServerVC的回调时，操作ClientVC也要遵循以上原则。
+
+上述三个 Tunnel 类型，只有 OneWayTunnel 在 SocksProxy 功能里被使用到了，其它两个 Tunnel 类型没有看到在 ATS 里有组件在使用。
+
+接下来对 SocksProxy 的功能进行分析，详细说明了 OneWayTunnel 是如何在 SocksProxy 中进行使用的。
+
+在 ATS 中还有另外三个与 Tunnel 相近但是又复杂很多的组件：
+
+- PluginVC
+- TransformVC
+- HttpTunnel
+
+这里先介绍 PluginVC 和 TransformVC，由于 HttpTunnel 过于复杂，我把它安排在 Http状态机 分析的章节里。
+
+在进入到 Http状态机 之前，对于代理服务器，还有一个必备的功能，就是 DNS 解析。
+
+下一章，我将对 DNS 解析系统进行详细的分析。
+
