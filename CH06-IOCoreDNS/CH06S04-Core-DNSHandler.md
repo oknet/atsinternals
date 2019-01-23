@@ -935,6 +935,18 @@ Lerror:
 
 ### dns_result
 
+`dns_result()` 实现了以下多个功能：
+
+- 重试逻辑
+  - 当未得到解析结果时
+- DNS 子系统的统计功能
+  - 当解析结果出错时，`dns_fail_time_stat` 和 `dns_lookup_fail_stat`
+  - 当解析结果有效时，`dns_success_time_stat` 和 `dns_lookup_success_stat`
+- 回调所有与解析结果相关的 DNSEntry
+  - 回调时可能无法获得 DNSEntry 状态机的锁，通过重新调度 DNSEntry 稍后重试（PR #4841）
+- 释放 DNS Query ID
+  - 只有全部 DNSEntry 回调完成后才进行释放操作（PR #4841）
+
 通过 `dns_result()` 向 DNSEntry 的状态机回调解析结果：
 
 - 可能是有效的解析结果
@@ -942,9 +954,7 @@ Lerror:
   - 超时
   - 得到的响应有问题
 
-对于无结果的情况，需要根据错误的类型，选择是否可以重新尝试解析，部分错误是不可恢复的，重新尝试也不会得到正确结果，有些错误则可以通过重新尝试得到正确的解析结果。
-
-`dns_result()` 需要区分上述情况，
+对于无结果的情况，需要根据错误的类型，选择是否可以重新尝试解析，部分错误是不可恢复的，重新尝试也不会得到正确结果，有些错误则可以通过重新尝试得到正确的解析结果，`dns_result()` 需要区分上述情况。
 
 `dns_result()` 的调用路径有以下几种：
 
@@ -1159,6 +1169,9 @@ Lretry:
   // 参考：
   //   - [Pull Request #2574](https://github.com/apache/trafficserver/pull/2574)
   e->timeout = h->mutex->thread_holding->schedule_in(e, DNS_PERIOD);
+  // BUG：重新调用 dns_result() 函数继续回调剩余的 DNSEntry，但是会导致 DNS 统计数据出现错误
+  // 参考：
+  //   - [Pull Request #4841](https://github.com/apache/trafficserver/pull/4841)
 }
 ```
 
@@ -1169,3 +1182,4 @@ Lretry:
 - [P_DNSProcessor.h](http://github.com/apache/trafficserver/tree/6.0.x/iocore/dns/P_DNSProcessor.h)
 - [DNS.cc](http://github.com/apache/trafficserver/tree/6.0.x/iocore/dns/DNS.cc)
 - [Pull Request #2574](https://github.com/apache/trafficserver/pull/2574)
+- [Pull Request #4841](https://github.com/apache/trafficserver/pull/4841)
