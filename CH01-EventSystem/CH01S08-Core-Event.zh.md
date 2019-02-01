@@ -273,7 +273,7 @@ Event::schedule\_\*()
 
 - 如果事件(Event)已经存在于 EThread 的```内部队列```，则先从队列中删除
 - 然后直接向 EThread 的```本地队列```添加事件(Event)
-- 因此此方法只能向当前 EThread 事件池添加事件(Event)，不能垮线程添加
+- 因此此方法只能向当前 EThread 事件池添加事件(Event)，不能跨线程添加
 
 对于 Event::schedule\_\*() 的使用，在源代码中有相关注释，翻译如下：
 
