@@ -52,6 +52,18 @@ inkcoreapi extern Allocator ioBufAllocator[DEFAULT_BUFFER_SIZES];
   - MIOBuffer则可以向IOBufferBlock中写入数据（生产者）
   - 同时MIOBuffer也可以包含多个IOBufferReader的指针
     - 这样可以记录一个内存数据，多个消费者的信息和消费情况
+  - 字母 M 的含义就是“多”（Multiple）的意思，因此 MIOBuffer 是“一写多读”的缓冲区
+
+```
+#define MAX_MIOBUFFER_READERS 5
+class MIOBuffer
+{
+...
+  // 通过宏 MAX_MIOBUFFER_READERS 定义了一个 MIOBuffer 可以创建的 IOBufferReader 的数量
+  IOBufferReader readers[MAX_MIOBUFFER_READERS];
+...
+}
+```
 
 数据访问抽象层由MIOBufferAccessor实现
 
@@ -96,11 +108,24 @@ inkcoreapi extern Allocator ioBufAllocator[DEFAULT_BUFFER_SIZES];
 
 ## 自动指针与内存管理
 
-MIOBuffer里的成员```Ptr<IOBufferBlock> _writer;```，指向IOBufferBlock链表的第一个节点。
+MIOBuffer里的成员```Ptr<IOBufferBlock> _writer;```初始状态指向```NULL```，当首次向其写入数据时，会通过```MIOBuffer::append_block```追加一个IOBufferBlock节点，
 
-每次通过write方法向MIOBuffer里写入数据时，就会写入这个链表，当一个节点写满了，就会再增加一个节点。
+- ```_writer``` 总是指向上一次写过，或上一次追加的那个 IOBufferBlock 节点，
+- ```_writer->next``` 要么指向```NULL```，要么指向一个空白的IOBufferBlock节点，该空白的IOBufferBlock节点应该是不可读的。
 
-当我们通过IOBufferReader消费数据时，对于已经消费掉的节点，Ptr指针自动调用该节点的free()方法释放该节点所占用的空间。
+每次通过write方法向MIOBuffer里写入数据时，就会写入这个链表，当一个节点写满了，就会再增加一个节点，因此```_writer```总是指向这个链表的尾巴，而链表的头则由 IOBufferReader 持有。
+
+当 MIOBuffer 创建后，
+
+- 通常会调用```MIOBuffer::alloc_reader```创建至少一个IOBufferReader作为链表表头的持有者，
+- 一个 MIOBuffer 最多可以创建 5 个 IOBufferReader，
+- 由于 IOBufferReader 读取数据快慢不同，因此最慢的那个 IOBufferReader 到 ```_writer``` 之间的长度就是 MIOBuffer 数据链表的长度，
+- 可以通过```MIOBuffer::max_read_avail```获得该链表占用的大致内存空间，
+- 为了避免过慢的 IOBufferReader 导致链表的长度不受控制占用较多内存，会使用 ```water_mark``` 来控制链表的长度。
+
+如果最慢的那个 IOBufferReader 被销毁时，则第二慢的那个 IOBufferReader 成为链表表头的持有者，从老的表头到新的表头之间的 IOBufferBlock 则通过Ptr指针自动释放。
+
+当通过持有表头的 IOBufferReader 消费数据时，对于已经消费掉的节点，Ptr指针自动调用该节点的free()方法释放该节点所占用的空间。非表头 IOBufferReader 消费数据时，仅仅会减少各个节点的引用计数，并不会释放节点。
 
 这里的free()方法就是用IOBufferBlock::free()，定义如下：
 
@@ -713,7 +738,7 @@ public:
   bool low_water();
 
   // 当前可读取数据是否高于低限
-  // return read_avail() >= mbuf->water_mark;
+  // return read_avail() > mbuf->water_mark;
   bool high_water();
 
   // 在 IOBufferBlock 链表上执行 memchr 的操作，但是在ATS中好像没有使用到这个方法
