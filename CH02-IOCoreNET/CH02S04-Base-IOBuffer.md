@@ -72,19 +72,34 @@ class MIOBuffer
     - 一个指向MIOBuffer的指针
 
 ```
-      IOBufferReader  -----[entry.read]------+ 
-        ||     ||                            V
-      block   mbuf                   MIOBufferAccessor
-        ||     ||                            |
-        ||  MIOBuffer <----[mbuf.write]------+
-        ||     ||
-        ||  _writer
-        ||     ||
-      IOBufferBlock ===> IOBufferBlock ===> IOBufferBlock ===> NULL
-           ||                 ||                 ||
-         _data              _data              _data
-           ||                 ||                 ||
-      IOBufferData       IOBufferData       IOBufferData
+      IOBufferReader -------[entry.read]------+
+       ||       ||                            |
+       ||       ||                            V
+     block     mbuf                   MIOBufferAccessor
+       ||       ||                            |
+       ||       VV                            |
+       ||    MIOBuffer <----[mbuf.write]------+
+       ||       ||
+       ||       ||
+       ||    _writer
+       ||       ||
+       VV       VV
+      IOBufferBlock === data ==> IOBufferData
+           ||                         ||
+           ||                         ||
+          next                      _data ===> {Memory Block}
+           ||
+           VV
+      IOBufferBlock === data ==> IOBufferData
+           ||                         ||
+           ||                         ||
+          next                      _data ===> {Memory Block}
+           ||
+           VV
+      IOBufferBlock === data ==> IOBufferData
+           ||                         ||
+           ||                         ||
+          next ===> NULL            _data ===> {Memory Block}
 
 || or = means member reference
 |  or - means method path
