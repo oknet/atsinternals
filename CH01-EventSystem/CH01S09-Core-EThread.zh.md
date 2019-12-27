@@ -1,6 +1,12 @@
 # 核心部件：Thread & EThread
 
-EThread继承自Thread，首先看一下Thread的定义：
+Thread 类定义了一个接口，它要求必须实现 `start()` 和 `execute()` 两个方法，同时还实现了基于线程的面向对象的快速内存分配，它是 ATS 最底层的一个重要设计。
+
+通过以 Thread 类作为基类，ATS 实现了事件处理线程 `EThread`，通过调用 `this_thread()` 或 `this_ethread()` 开发者可以知道程序当前运行的线程是否为 `Thread` 或 `EThread`，亦或是开发者自己定义的线程。
+
+`EThread` 就是通过定义一个 `Thread` 类的继承类，实现了 `start()` 和 `execute()` 这两个方法，但是对于外部调用者只需要调用这两个方法就可以启动 `EThread` 线程。
+
+首先看一下 `Thread` 的定义：
 
 ## 定义
 
@@ -1397,6 +1403,31 @@ flush_signals(EThread *thr)
 
 具体实现可以参考：[Pull Request #4721](https://github.com/apache/trafficserver/pull/4721)，由于该补丁基于 9.0.x 分支，如果要应用到 6.0.x 分支的话，可以参考上面的流程。
 
+## 实现第二个 Thread 继承类
+
+基于目前的代码，是不支持我们实现第二个 Thread 继承类的，在 `I_Thread.h` 有一段注释与目前的代码表现不一致：
+
+```
+  Additionally, the EThread class (derived from Thread) maintains its own independent key.
+```
+
+在代码里，我们可以看到 `Thread` 与 `EThread` 共享了同一个 `thread_key`，如果我们继续定义第二个 `Thread` 继承类，如：`XThread`，那么也将与 `Thread` 和 `EThread` 共享同一个 `thread_key`，那么 `this_ethread()` 就有可能返回一个 `XThread` 类型的指针。这样就无法区分出当前线程是 `EThread` 还是 `XThread` 了，如果你想在 `this_ethread()` 中使用 `dynamic_cast` 的话，可以查看：[Pull Request #6281](https://github.com/apache/trafficserver/pull/6281)。
+
+通过对代码的修改进行溯源，我们发现代码与注释不一致的情况在首次代码提交到 ASF 就存在了，因此我们只能有两个选择：
+
+1. 修改注释，说明不允许有第二个 `Thread` 继承类的出现
+2. 修改代码，使得代码符合注释中的设计思路
+
+通过对注释的分析，我认为任何 `Thread` 继承类都应该维护两个 `thread_key`，
+
+- 从 `Thread` 继承了一个（这是一个静态变量）
+- 自己维护一个独立的 `thread_key`
+- 定义自己的 `set_specific()` 方法，同时使用两个 `pthread_key` 进行注册
+- 定义自己的 `this_?thread()` 方法，如 `EThread` 有 `this_ethread()`，`XThread` 有 `this_xthread()` 等，该方法总是通过自己维护的 `thread_key` 获取线程对象
+- 确保 `this_thread()` 可以返回线程对象
+
+如果你需要实现 `XThread` 那么可以参考：[Pull Request #6288](https://github.com/apache/trafficserver/pull/6288)。
+
 ## 参考资料
 
 ![EventQueue - EThread - Signals](https://cdn.rawgit.com/oknet/atsinternals/master/CH01-EventSystem/CH01-EventSystem-001.svg)
@@ -1408,4 +1439,6 @@ flush_signals(EThread *thr)
 - [Event](CH01S08-Core-Event.zh.md)
 - [Pull Request #4715](https://github.com/apache/trafficserver/pull/4715)
 - [Pull Request #4721](https://github.com/apache/trafficserver/pull/4721)
+- [Pull Request #6281](https://github.com/apache/trafficserver/pull/6281)
+- [Pull Request #6288](https://github.com/apache/trafficserver/pull/6288)
 
