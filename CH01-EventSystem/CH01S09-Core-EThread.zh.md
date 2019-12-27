@@ -1291,7 +1291,8 @@ flush_signals(EThread *thr)
 - 在向目标线程调度事件时，并不能确定目标线程当前所处的状态，目标线程有可能：
    - 处于互斥条件锁的阻塞等待状态（有效唤醒操作），
    - 处于内部队列的遍历过程中（无效唤醒操作），
-   - 处于隐性队列的遍历过程中（无效唤醒操作），等
+   - 处于隐性队列的遍历过程中（无效唤醒操作），
+      - 处于隐性事件中某些操作导致的阻塞状态（有效唤醒操作），
    - 因此，每一次对目标线程的唤醒，可能会是无效的。
 
 
@@ -1350,6 +1351,51 @@ flush_signals(EThread *thr)
     - 同样的一次上下文切入操作，则可以处理多个 Event 之后再切出
     - 这样就减少了上下文切换的次数
 
+## 对 flush_signals 的进一步优化
+
+在向目标线程调度事件时，目标线程有可能处于：
+
+   - 互斥条件锁的阻塞等待状态（有效唤醒操作），
+   - 内部队列的遍历过程中（无效唤醒操作），
+   - 隐性队列的遍历过程中（无效唤醒操作），
+   - 隐性事件中某些操作导致的阻塞状态（有效唤醒操作）
+
+因此，每一次对目标线程的唤醒，可能会是无效的，而每一次的唤醒操作包含“上锁 - 唤醒 - 解锁”三个步骤，对 CPU 性能的影响也是非常大的，这样才有了 `flush_signals()` 方法实现的批量唤醒功能，但是这么做也有一个缺陷，它导致线程的唤醒操作存在一个延迟，由此导致事件不能被及时的处理，为了能够及时的处理事件，又设计了 `EAGER_SIGNALLING` 这个宏定义，在及时性与有效性之间进行切换。
+
+那么能否实现鱼与熊掌兼得的设计呢？
+
+我们知道，当使用互斥锁 `mutex` 与条件变量 `cond` 时需要先对 `mutex` 上锁，然后才可以操作 `cond`，而执行 `cond_wait` 操作的本质是：
+
+- 释放 `mutex` 的锁
+- 进入阻塞等待状态
+- 被 `cond` 唤醒
+- 对 `mutex` 重新上锁
+
+而对 `try_signal()` 和 `signal()` 进行分析后发现，
+
+- 其总是先对 `mutex` 上锁，然后调用 `cond_wait`，
+- 而 `cond_wait` 的第一步操作是立即释放 `mutex` 的锁；
+- 被 `cond` 唤醒后，`cond_wait` 立即对 `mutex` 重新上锁，
+- 然后返回到 `try_signal()` 和 `signal()` 之后，又立即对 `mutex` 进行解锁。
+
+我们看到这个流程有两处非常不合理的地方：刚刚上锁，又立即解锁；在这个过程里，`mutex` 处于锁定状态的时间总是转瞬即逝。
+
+在 `EThread::execute()` 的事件处理循环里，在 `cond_wait` 进入到阻塞等待状态时，`mutex` 总是处于解锁状态，那么是否可以在其它的时间段里，总是保持 `mutex` 是上锁的，这样就可以通过 `pthread_mutex_trylock()` 测试目标线程的 `mutex` 处于哪种状态：
+
+- 如果能够成功对目标线程的 `mutex` 上锁，那么就说明目标线程处于 `cond_wait` 的阻塞等待状态，那么这时候调用 `cond_signal` 方法就不会是无用功。
+- 如果不能够成功上锁，那么就说明目标线程处于运行状态，正在处理各个队列里的事件，此时目标线程并未进入睡眠状态，也就不需要被唤醒。
+
+因此，只需要做出以下改动就可以满足上面的设计：
+
+- 在 `EThread::execute()` 进入 `for(;;)` 循环之前对 `mutex` 上锁，从 `for(;;)` 循环退出之后对 `mutex` 解锁
+- 修改 `ProtectedQueue::enqueue()`，总是通过 `try_signal()` 发送信号给目标线程
+- 删除所有与 `ethreads_to_be_signalled` 和 `flush_signals()` 相关的代码
+   - `I_EThread.h` 中 `ethreads_to_be_signalled` 相关的两个成员变量，
+   - `I_ProtectedQueue.h` 中对 `flush_signals()` 的声明，
+   - ProtectedQueue.cc 中对 `EAGER_SIGNALLING` 和 `ethreads_to_be_signalled` 的处理，以及 `flush_signals()` 函数的实现，
+   - UnixEThread.cc 中与 `ethreads_to_be_signalled` 和 `flush_signals()` 相关的部分，
+
+具体实现可以参考：[Pull Request #4721](https://github.com/apache/trafficserver/pull/4721)，由于该补丁基于 9.0.x 分支，如果要应用到 6.0.x 分支的话，可以参考上面的流程。
 
 ## 参考资料
 
@@ -1360,4 +1406,6 @@ flush_signals(EThread *thr)
 - [ProtectedQueue.cc](http://github.com/apache/trafficserver/tree/master/iocore/eventsystem/ProtectedQueue.cc)
 - [EventProcessor](CH01S10-Interface-EventProcessor.zh.md)
 - [Event](CH01S08-Core-Event.zh.md)
+- [Pull Request #4715](https://github.com/apache/trafficserver/pull/4715)
+- [Pull Request #4721](https://github.com/apache/trafficserver/pull/4721)
 
