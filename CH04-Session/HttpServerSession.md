@@ -293,10 +293,13 @@ HttpSM 会先处理 OServer 的回应头，然后会建立 HttpTunnel 传输返�
 
   - 如果已经收到了 EOS 事件，
     - 那么就调用 HttpServerSession::do_io_close 关闭。
-  - 如果不允许 OServer 的连接复用，
+  - 如果客户端会话是支持 Keep Alive 的，并且由于某些原因要求将服务端会话与客户端会话绑定，
     - 那么就调用 HttpClientSession::attach_server_session 把 HttpServerSession 附到 HttpClientSession 上。
-  - 如果允许连接复用，
-    - 设置 keep alive 超时时间，然后调用 HttpServerSession::release 与 HttpSM 脱离
+    - 这样来自客户端的下一个请求仍然会复用上一个请求使用的服务端会话，例如：服务端开启了认证功能时就需要这样做。
+  - 否则，
+    - 设置 keep alive 超时时间，然后调用 HttpServerSession::release 与 HttpSM 脱离。
+    - 此时会尝试将服务端会话放入会话池保存起来，如果有其它客户端会话请求同一个目标服务器，则会复用会话池里的连接。
+    - 注意：只有符合条件的服务端会话才会放入会话池，具体可查看 HttpServerSession::release 方法的分析。
 
 ```
 // 关闭并释放 HttpServerSession
