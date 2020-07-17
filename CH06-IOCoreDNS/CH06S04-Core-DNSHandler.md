@@ -336,11 +336,11 @@ DNSHandler::mainEvent(int event, Event *e)
 
 - 只需要确认哪些 Name Server 是无法提供服务的，这样剩余的 Name Server 参与到轮询中
 
-对于哪些处于即将无法提供服务状态的 Name Server，
+如果 Name Server 处于即将无法提供服务的状态，
 
 - 需要向其发送一个测试请求，判断其是否可以恢复正常，或成为无法提供服务的 Name Server
 
-对于已经处于无法提供服务的 Name Server，
+如果 Name Server 已经处于无法提供服务的状态，
 
 - 需要定期（每隔 5 秒）向其发送一个测试请求，判断其是否可以恢复正常
 
@@ -361,7 +361,7 @@ DNSHandler::mainEvent(int event, Event *e)
 
 ### write_dns
 
-全局变量 `dns_max_dns_in_flight` 控制了在途 DNS 解析请求的最大数量，默认值为 2048 个，可通过 `proxy.config.dns.max_dns_in_flight` 进行设置。
+全局变量 `dns_max_dns_in_flight` 控制了在途 DNS 解析请求的最大数量（相当于最大并发 DNS 请求数），默认值为 2048 个，可通过 `proxy.config.dns.max_dns_in_flight` 进行设置。
 
 `write_dns()` 遍历 `DNSHandler::entries` 表格每一行第一个 DNSEntry 对象，如果该 DNSEntry 还未发送 DNS 请求，则构建一个 DNS 请求，并发送出去。当该在途 DNS 解析请求达到最大值 `dns_max_dns_in_flight` 时，则停止对该表格的遍历。`write_dns()` 除了被 DNSEntry 同步调用，更多的是被 DNSHandler 周期性的调用。
 
@@ -1174,6 +1174,15 @@ Lretry:
   //   - [Pull Request #4841](https://github.com/apache/trafficserver/pull/4841)
 }
 ```
+
+## 关于 DNSHandler::entries
+
+之前我提出了两个关于 entries 表的问题：
+
+- 是否可以使用哈希检索替代遍历检索？
+- 是否可以拆分为两个表，一个保存新请求，一个保存在途请求和重试请求？
+
+
 
 # 参考资料
 

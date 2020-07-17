@@ -190,7 +190,8 @@ DNSProcessor::getby(const char *x, int len, int type, Continuation *cont, Option
   e->retries = dns_retries;
   // 调用 DNSEntry::init 完成初始化
   e->init(x, len, type, cont, opt);
-  // 对 DNSHandler 上锁，此时 e->mutex 指向 DNSHandler::mutex
+  // 对 DNSHandler 上锁，此时 e->mutex 指向 DNSHandler::mutex，而 DNSHandler 与 ET_DNS[0] 共享同一个 mutex，
+  // 因此，这里相当于是判断当前线程是否为 ET_DNS[0]。还需要注意 ET_DNS[0] 还可能等于 ET_NET[0] 或 ET_CALL[0]。
   MUTEX_TRY_LOCK(lock, e->mutex, this_ethread());
   // 成员 thread 指向 ET_DNS[0]
   // 在上锁失败后，将 DNSEntry 重新调度到 ET_DNS[0] 这样就一定可以拿到 e->mutex 的锁

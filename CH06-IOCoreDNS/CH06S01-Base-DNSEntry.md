@@ -67,7 +67,7 @@ struct DNSEntry : public Continuation {
   // 同时也用来保存延迟重试的 Event
   Event *timeout;
   // 保存解析结果
-  // 这里采用了智能指针 Ptr<> 来定义，用于在多个 DNSEntry 共享同一个解析结果时，对解析结果自动进行释放
+  // 这里采用了智能指针 Ptr<> 来定义，用于在多个 DNSEntry 共享同一个解析结果时，自动释放解析结果
   Ptr<HostEnt> result_ent;
   // 由哪个 DNSHandler 负责此次 DNS 查询的任务
   // 用于在全局 DNSHandler 与 SplitDNS 创建的 DNSHandler 之间进行选择
@@ -165,7 +165,7 @@ DNSEntry::init(const char *x, int len, int qtype_arg, Continuation *acont, DNSPr
       qname_len = ink_strlcpy(qname, x, MAXDNAME);
       orig_qname_len = qname_len;
     }
-  // 如果如果解析请求是希望获得对应 IP 地址的 PTR 记录
+  // 如果解析请求是希望获得对应 IP 地址的 PTR 记录
   // 通过 make_ipv4/ipv6_ptr 转换为 arpa 格式字符串
   } else { // T_PTR
     IpAddr const *ip = reinterpret_cast<IpAddr const *>(x);
@@ -212,6 +212,8 @@ get_entry(DNSHandler *h, char *qname, int qtype)
   return NULL;
 }
 ```
+
+另外还有 `get_dns()` 方法，可以按照 Query ID 在表格里进行检索，将在 DNSHandler 章节中介绍。
 
 ### DNSEntry::mainEvent
 
