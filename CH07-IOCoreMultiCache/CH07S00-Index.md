@@ -12,3 +12,13 @@
 
 MultiCache 在 HostDB 中用于对域名解析结果进行持久化缓存，并提供了并发查询解析结果的能力。
 
+在本章中，将逐个对以下组件进行分析：
+
+- Store & Span
+- MultiCacheHeader
+- MultiCacheBase
+- MultiCacheHeapGC
+- MultiCacheSync
+- MultiCacheBlock
+- MultiCache
+
