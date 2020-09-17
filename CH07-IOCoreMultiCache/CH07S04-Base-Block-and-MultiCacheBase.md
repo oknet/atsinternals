@@ -35,7 +35,9 @@ struct MultiCacheBlock {
   {
     return NULL;
   }
-  // 表示该 Entry 被命中的次数
+  // 以下两个成员未在 MultiCacheBlock 中定义，但是我把它们写在这里，
+  // 因为在 P_MultiCache.h 中定义的多个函数都直接访问了这两个成员。
+  // 表示该 Entry 被应用查询且命中的次数，当 MultiCache 数据库空间不足时，会将命中次数较低的 Entry 清空，以用来存储新数据元素
   int hits;
   // 表示该 Entry 已经备份到下一级，例如从 Level 0 备份到 Level 1，从 Level 1 备份到 Level 2
   bool backed;
