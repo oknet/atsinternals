@@ -2,7 +2,7 @@
 
 域名解析结果可能返回多个 IP，而且不同的域名返回的 IP 地址有多有少，因此需要将其按照不定长数据存储到 MultiCache 数据库的 HEAP 区。同时支持应用层在使用多个 IP 时，可采用轮询的方式，以平衡负载、规避出现问题的 IP。
 
-为了便于该数据的存储和访问，ATS 定义了 HostDBRoundRobin 数据结构，其内可包含多个 HostDBInfo 结构，同时也定义了必要的信息表示其在 HEAP 区占用的空间大小、包含了多少个 HostDBInfo 等。其数据结构如下：
+为了便于该数据的存储和访问，ATS 定义了 HostDBRoundRobin 数据结构，其内可包含多个 (inner) HostDBInfo 结构，同时也定义了必要的信息表示其在 HEAP 区占用的空间大小、包含了多少个 (inner) HostDBInfo 等。为了描述方便，我们这里把存储在 MultiCacheBlock 中的 HostDBInfo 对象称为 (root) HostDBInfo，存储在 HostDBRoundRobin 中的 HostDBInfo 对象称为 (inner) HostDBInfo。其数据结构如下：
 
 ```
      \  bits
@@ -16,15 +16,15 @@ Bytes \  0        8        16       24     31
         +--------+--------+--------+--------+
   12)   |          timed_rr_ctime           |    (15
         +--------+--------+--------+--------+
-  16)   |         HostDBInfo info[0]        |
+  16)   |    (inner) HostDBInfo info[0]     |
         |                ...                |
         |                                   |    (80
         +--------+--------+--------+--------+
-  81)   |         HostDBInfo info[1]        |
+  81)   |    (inner) HostDBInfo info[1]     |
         |                ...                |
         |                                   |    (143
         +--------+--------+--------+--------+
- 144)   |         HostDBInfo info[...]      |
+ 144)   |    (inner) HostDBInfo info[...]   |
         |                ...                |
         |                                   |    (m = size(count, 0)
         +--------+--------+--------+--------+
@@ -38,43 +38,44 @@ Bytes \  0        8        16       24     31
 
 ```
 
-可以看到，HostDBRoundRobin 实际上分为头部（16 字节）与 HostDBInfo 数组区和 SRV 主机名区域三个部分，由于 HEAP 的设计要求：
+可以看到，HostDBRoundRobin 实际上分为头部（16 字节）与 (inner) HostDBInfo 数组区和 SRV 主机名区域三个部分，由于 HEAP 的设计要求：
 
 - MultiCacheBlock 内只能有一个 int 类型成员来表示数据在 HEAP 区的位置，
-   - 对于 HostDBRoundRobin 是成员 HostDBInfo::app.rr.offset。
+   - 对于 HostDBRoundRobin 是 (root) HostDBInfo::app.rr.offset。
 - HEAP 区的固有数据长度可以保存在 MultiCacheBlock 内，因为 HEAP 区的数据长度一经申请就不会发生改变了，
    - 对于 HostDBRoundRobin 是 rrcount 和 length，在 HEAP 区创建之后，该数据就不再更改了。
+   - 但是目前的代码选择把这两个值放在 HostDBRoundRobin 结构里，主要是为了代码编写的方便。
 - HEAP 区的动态数据长度不能保存在 MultiCacheBlock 内，因为无法确保 HEAP 区与数据区的磁盘同步是完全对应的，
-   - 对于 HostDBRoundRobin 是 good，该值应该与 HostDBInfo 数组的变动一起保存在 HEAP 区。
+   - 对于 HostDBRoundRobin 是 good，该值应该与 (inner) HostDBInfo 数组的变动一起保存在 HEAP 区。
 
-因此，个人认为 HostDBRoundRobin 的头部除了 good 成员之外，其它的 4 个成员应该可以定义为 RRInfo 的成员放入 `HostDBInfo::data` 内。但是 64 位程序存在 8 字节对齐的问题，因此 good 如果留在 HostDBRoundRobin 内，仍然会占用 8 个字节，所以只能把  timed_rr_ctime 成员提取出来作为 RRInfo 的成员，另外可以考虑把 HostDBInfo::app.rr.offset 作为 RRInfo 的成员，最终可以为每个 `HostDBRoundRobin` 节省 8 字节的空间，减少 HEAP 区的空间使用。
+因此，个人认为 HostDBRoundRobin 的头部除了 good 成员之外，其它的 4 个成员应该可以定义为 RRInfo 的成员放入 (root) `HostDBInfo::data` 内。但是 64 位程序存在 8 字节对齐的问题，因此 good 如果留在 HostDBRoundRobin 内，仍然会占用 8 个字节，所以只能把  timed_rr_ctime 成员提取出来作为 RRInfo 的成员，另外可以考虑把 HostDBInfo::app.rr.offset 作为 RRInfo 的成员，最终可以为每个 `HostDBRoundRobin` 节省 8 字节的空间，减少 HEAP 区的空间使用。
 
 ## 定义
 
 ```
 struct HostDBRoundRobin {
   /** Total number (to compute space used). */
-  // 有多少个 HostDBInfo 对象
+  // 有多少个 (inner) HostDBInfo 对象
   short rrcount;
 
   /** Number which have not failed a connect. */
   // 处于 alive 状态的 IP 有多少个
   short good;
 
-  // 表示当前轮询的次数，通过对 good 取模，来访问第 n 个 HostDBInfo 对象
+  // 表示当前轮询的次数，通过对 good 取模，来访问第 n 个 (inner) HostDBInfo 对象
   unsigned short current;
   // 表示在 HEAP 区占用的空间大小，以字节为单位
   unsigned short length;
-  // 当基于固定的时间间隔轮询 HostDBInfo 对象时，用于记录上一次发生轮询切换的时间
+  // 当基于固定的时间间隔轮询 (inner) HostDBInfo 对象时，用于记录上一次发生轮询切换的时间
   ink_time_t timed_rr_ctime;
 
-  // 用于保存多个 HostDBInfo 的数组
+  // 用于保存多个 (inner) HostDBInfo 的数组
   HostDBInfo info[];
 
   // Return the allocation size of a HostDBRoundRobin struct suitable for storing
   // "count" HostDBInfo records.
   // 返回需要在 HEAP 区申请的内存空间的大小，8 字节对齐。参数：
-  //  - count：表示保存多少个 HostDBInfo 对象
+  //  - count：表示保存多少个 (inner) HostDBInfo 对象
   //  - srv_len：表示在最后为 SRV 记录的 hostname 预留多少空间
   // 返回需要在 HEAP 申请的字节数。
   static unsigned
@@ -87,23 +88,23 @@ struct HostDBRoundRobin {
   /** Find the index of @a addr in member @a info.
       @return The index if found, -1 if not found.
   */
-  // 在 HostDBInfo 数组中查找指定的 IP 地址，返回其数组下标。未找到返回 -1
+  // 在 (inner) HostDBInfo 数组中查找指定的 IP 地址，返回其数组下标。未找到返回 -1
   // 被 find_ip 和 select_next 方法调用
   int index_of(sockaddr const *addr);
-  // 在 HostDBInfo 数组中查找指定的 IP 地址，返回 HostDBInfo 对象，未找到返回 NULL
+  // 在 (inner) HostDBInfo 数组中查找指定的 IP 地址，返回 (inner) HostDBInfo 对象，未找到返回 NULL
   HostDBInfo *find_ip(sockaddr const *addr);
   // Find the srv target
-  // 在 HostDBInfo 数组中根据主机名查找指定的 SRV 记录，返回 HostDBInfo 对象，未找到返回 NULL
+  // 在 (inner) HostDBInfo 数组中根据主机名查找指定的 SRV 记录，返回 (inner) HostDBInfo 对象，未找到返回 NULL
   HostDBInfo *find_target(const char *target);
   /** Select the next entry after @a addr.
       @note If @a addr isn't an address in the round robin nothing is updated.
       @return The selected entry or @c NULL if @a addr wasn't present.
    */
-  // 在 HostDBInfo 数组中查找指定 IP 地址的下一个 HostDBInfo 对象，如果没有可用的 HostDBInfo 对象，返回 NULL
+  // 在 (inner) HostDBInfo 数组中查找指定 IP 地址的下一个 HostDBInfo 对象，如果没有可用的 HostDBInfo 对象，返回 NULL
   HostDBInfo *select_next(sockaddr const *addr);
-  // 通过轮询算法选择一个 HostDBInfo 对象，用于域名解析
+  // 通过轮询算法选择一个 (inner) HostDBInfo 对象，用于域名解析
   HostDBInfo *select_best_http(sockaddr const *client_ip, ink_time_t now, int32_t fail_window);
-  // 通过轮询算法选择一个 HostDBInfo 对象，用于 SRV 记录
+  // 通过轮询算法选择一个 (inner) HostDBInfo 对象，用于 SRV 记录
   HostDBInfo *select_best_srv(char *target, InkRand *rand, ink_time_t now, int32_t fail_window);
   // 构造函数，完成各成员的初始化
   HostDBRoundRobin() : rrcount(0), good(0), current(0), length(0), timed_rr_ctime(0) {}
@@ -114,7 +115,7 @@ struct HostDBRoundRobin {
 
 ### HostDBInfo *HostDBRoundRobin::select\_best\_http(client ip, now, fail window)
 
-该方法用于从域名解析类型的 HostDBRoundRobin 对象中，以轮询算法选择一个 HostDBInfo 对象。参数：
+该方法用于从域名解析类型的 HostDBRoundRobin 对象中，以轮询算法选择一个 (inner) HostDBInfo 对象。参数：
 
 - `sockaddr const *client_ip`：客户端 IP 地址
 - `ink_time_t now`：当前时间
@@ -122,7 +123,7 @@ struct HostDBRoundRobin {
 
 返回：
 
-- 找到的 HostDBInfo 对象，
+- 找到的 (inner) HostDBInfo 对象，
 - 返回 NULL 表示 HostDBRoundRobin 对象无效。
 
 ```
@@ -234,7 +235,7 @@ HostDBRoundRobin::select_best_http(sockaddr const *client_ip, ink_time_t now, in
 
 ### HostDBInfo *HostDBRoundRobin::select\_best\_srv(target, rand, now, fail window)
 
-该方法用于从 SRV 解析类型的 HostDBRoundRobin 对象中，以轮询算法选择一个 HostDBInfo 对象。参数：
+该方法用于从 SRV 解析类型的 HostDBRoundRobin 对象中，以轮询算法选择一个 (inner) HostDBInfo 对象。参数：
 
 - `char *target`：用于返回 SRV 主机名
 - `InkRand *rand`：随机数
@@ -243,7 +244,7 @@ HostDBRoundRobin::select_best_http(sockaddr const *client_ip, ink_time_t now, in
 
 返回：
 
-- 找到的 HostDBInfo 对象，
+- 找到的 (inner) HostDBInfo 对象，
 - 返回 NULL 表示 HostDBRoundRobin 对象无效。
 
 ```
@@ -378,13 +379,13 @@ _sip._tcp.example.com.   86400 IN    SRV 10      0      5060 backupbox2.example.
 通过对 `HostDBRoundRobin::info[]` 数组的遍历，产生了 `infos[]` 数组的内容，由于优先级为 1 的 SRV 记录不可用，因此可用的 SRV 记录中，最高优先级为 3，而优先级为 3 的 SRV 记录中也有两个记录不可用，因此最终生成的 `infos[]` 数组只有 5 个 SRV 记录。下面分别产生两个随机数，模拟两次调用的结果，说明 SRV 记录的优先级与权重选取过程：
 
 ```
-    weight = 4 + 3 + 4 + 2 + 6 + 10 + 6 = 35
-        x1 = RAND() % weight = 7354728 % 35 = 3
-        x2 = RAND() % weight =  912357 % 35 = 12
+    weight = 4 + 3 + 4 + 2 + 6 = 19
+        x1 = RAND() % weight = 7354728 % 19 = 18
+        x2 = RAND() % weight =  912357 % 19 = 15
         
-                             x1          x2
-                             |           |
-                             V           V
+                                             x2 x1
+                                             |  |
+                                             V  V
 +---------+--------------+----+---+----+--+------+
 |         |  Array Index |  0 | 1 |  2 | 3|   4  |
 |         +--------------+----+---+----+--+------+
