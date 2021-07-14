@@ -422,7 +422,7 @@ struct HostDBInfo {
   }
   
   // 判断当前 HostDBInfo 的状态是否为不可用状态
-  // 如果是 SRV 记录，data.srv.srv_offset 应该大于 0，否则就是无效记录
+  // 如果是 SRV 记录，data.srv.srv_offset 应该大于 0，表示在 HostDBRoundRobin 内存储了多少条 SRV 记录，否则就是无效记录
   // 如果是 PTR 记录，data.hostname_offset 应该不为 0，表示指向 HEAP 区的地址，否则就是无效记录
   // 否则 data.ip 应该是有效的 IP 地址，否则就是无效记录
   bool

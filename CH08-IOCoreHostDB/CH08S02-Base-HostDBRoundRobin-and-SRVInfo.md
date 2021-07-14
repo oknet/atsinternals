@@ -422,6 +422,14 @@ DNS 客户端尝试解析域名 `_service._proto.name.` 的 SRV 记录，DNS 服
 
 除了 target 信息，其它都是保存在 `HostDBRoundRobin::info[]` 数组中一个 HostDBInfo 对象里，而 target 信息的内容则保存在 `HostDBRoundRobin::info[]` 数组的后部，这些信息一次性写入不会修改。
 
+注意：`srv_offset` 在不同场景表示的含义不同：
+
+- 在独立 `HostDBInfo` 对象中，
+   - `data.srv.srv_offset` 表示 SRV 记录的数量，最大为 16，
+- 在 `HostDBRoundRobin::info[]` 数组中的 `HostDBInfo` 对象中，
+   - `data.srv.srv_offset` 表示 SRV target 相对 HostDBRoundRobin 对象基址的偏移地址，
+   - 只有该数组中的对象 `HostDBInfo` 才可以调用 `rr->info[x].srvname(rr)` 方法。
+
 ## 定义
 
 ```
