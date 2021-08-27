@@ -322,6 +322,8 @@ HostDBRoundRobin::select_best_srv(char *target, InkRand *rand, ink_time_t now, i
     // 产生一个随机数，确认落入哪个权重位置
     uint32_t xx = rand->random() % weight;
     // 从优先级最高的那一组 SRV 记录里，查找权重值的位置
+    // 这里的进入条件应该是 "i < len - 1"， 逻辑上来说，在跳出 for 循环后，i 的最大值可能为 len，
+    // 最后有可能会读取 infos[len]，因此在 clang-analyzer 分析时，会提示这里数组越界。
     for (i = 0; i < len && xx >= infos[i]->data.srv.srv_weight; ++i)
       xx -= infos[i]->data.srv.srv_weight;
 
