@@ -2,7 +2,7 @@
 
 IOBuffer是ATS中基本的内存分配和管理系统，就像我们经常使用的malloc()。
 
-在宏定义 DEFAULT_BUFFER_SIZES 中，ATS定义了有多少种尺寸的buf。buf的尺寸由以下宏来定义：
+在宏定义 `DEFAULT_BUFFER_SIZES` 中，ATS定义了有多少种尺寸的buf。buf的尺寸由以下宏来定义：
 
 ```
 #define BUFFER_SIZE_INDEX_128 0
@@ -28,9 +28,9 @@ IOBuffer是ATS中基本的内存分配和管理系统，就像我们经常使用
 #define DEFAULT_BUFFER_BASE_SIZE 128
 #define BUFFER_SIZE_FOR_INDEX(_i) (DEFAULT_BUFFER_BASE_SIZE * (1 << (_i)))
 ```
-可以看到计算公式为: 128*2^idx ，通过宏BUFFER_SIZE_FOR_INDEX(_i)计算出索引值对应的字节数。
+可以看到计算公式为: `128*2^idx`，通过宏 `BUFFER_SIZE_FOR_INDEX(_i)` 计算出索引值对应的字节数。
 
-在ATS中，每种长度的buf都有它专用的内存池和分配器，通过一个全局数组ioBufAllocator[]来定义，DEFAULT_BUFFER_SIZES是这个数组的成员数量。
+在ATS中，每种长度的buf都有它专用的内存池和分配器，通过一个全局数组 `ioBufAllocator[]` 来定义，`DEFAULT_BUFFER_SIZES` 是这个数组的成员数量。
 
 ```
 #define MAX_BUFFER_SIZE_INDEX 14
@@ -72,37 +72,52 @@ class MIOBuffer
     - 一个指向MIOBuffer的指针
 
 ```
-      IOBufferReader -------[entry.read]------+
-       ||       ||                            |
-       ||       ||                            V
-     block     mbuf                   MIOBufferAccessor
-       ||       ||                            |
-       ||       VV                            |
-       ||    MIOBuffer <----[mbuf.write]------+
-       ||       ||
-       ||       ||
-       ||    _writer
-       ||       ||
-       VV       VV
-      IOBufferBlock === data ==> IOBufferData
-           ||                         ||
-           ||                         ||
-          next                      _data ===> {Memory Block}
-           ||
-           VV
-      IOBufferBlock === data ==> IOBufferData
-           ||                         ||
-           ||                         ||
-          next                      _data ===> {Memory Block}
-           ||
-           VV
-      IOBufferBlock === data ==> IOBufferData
-           ||                         ||
-           ||                         ||
-          next ===> NULL            _data ===> {Memory Block}
+0         1         2         3         4         5         6         7
+01234567890123456789012345678901234567890123456789012345678901234567890123456789
 
-|| or = means member reference
-|  or - means method path
+                      (Read)
+   .--- mbuf --- MIOBufferAccessor                           {Memory Block 1}
+  /   (to MIOBuffer)    |                                           ^
+ |                      |                                           |
+ |                      |                                         _data
+ |                    entry                                         |
+ |                    (read)                                        |
+ |                      |                                      IOBufferData
+ |                      |                                           ^
+ |                      V   [0]                                     |
+ | .--- mbuf --- IOBufferReader --- block ---> IOBufferBlock ----- data
+ |/              (Slower Reader)                    |
+ |                                                  |
+ |                    (Read)                       next
+ | .--- mbuf --- MIOBufferAccessor                  |        {Memory Block m}
+ |/   (to MIOBuffer)    |                           V               ^
+ |                      |                           .               |
+ |                      |                           .             _data
+ |                    entry                         .               |
+ |                    (read)                       next             |
+ |                      |                           |          IOBufferData
+ |                      |                           |               ^
+ |                      V   [1]                     V               |
+ | .--- mbuf --- IOBufferReader --- block ---> IOBufferBlock ----- data
+ |/              (Faster Reader)                    |
+ |                                                  |
+ |                 (WriteOnly)                      |
+ | .--- mbuf --- MIOBufferAccessor                 next      {Memory Block n}
+ |/   (write)           |                           |               ^
+ |                      |                           |               |
+ |                    entry                         |             _data
+ |                      |                           |               |
+ |                      V                           |               |
+ |                     NULL                         |          IOBufferData
+ |                                                  |               ^
+  \                                                 V               |
+   `--------------> MIOBuffer --- _writer ---> IOBufferBlock ----- data
+                                                    |
+                                                    |
+                                                   next
+                                                    |
+                                                    V
+                                                   NULL
 ```
 
 总结一下：
