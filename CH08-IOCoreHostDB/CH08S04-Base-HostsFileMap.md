@@ -15,6 +15,7 @@ HostDB 的数据最初只有 DNS 解析结果这一个来源，后来由增加�
 ## 定义
 
 ```
+Source: P_HostDBProcessor.h
 // 用于 std::map 的自定义比较方法
 // 其中 ptr_len_casecmp() 在 lib/ts/ink_string.h 中定义，是 strcasecmp 的改版，
 // 其区别在于输入的字符串可以不是 \0 结尾，而是根据给定的字符串长度判断结尾。
@@ -55,8 +56,13 @@ CmpMD5(INK_MD5 const &lhs, INK_MD5 const &rhs)
 {
   return lhs[0] < rhs[0] || (lhs[0] == rhs[0] && lhs[1] < rhs[1]);
 }
+```
 
+### 解析 Hosts 文件内的一行
 
+Hosts 文件的每一行是由空格分隔的多个片段，每一行最少有两个片段，其中第一个片段一定是 IP 地址，其后的每一个片段都是域名或主机名。因此当一行内存在 N 个片段时，将会产生 N-1 个域名解析记录，也就对应了 N-1 个 HostDBInfo 的对象。
+
+```
 // 解析 /etc/hosts 文件内的一行内容，由 ParseHostFile 调用
 void
 ParseHostLine(RefCountedHostsFileMap *map, char *l)
@@ -85,13 +91,22 @@ ParseHostLine(RefCountedHostsFileMap *map, char *l)
         item.round_robin_elt = false;
         item.reverse_dns = false;
         item.is_srv = false;
-        // 将 IP 地址保存进去，但是这里没有设置 HostDBInfo 的 MD5 信息
+        // 将 IP 地址保存进去，但是这里没有设置 HostDBInfo 的 MD5 信息，
+        // 因为 MD5 信息仅用于在 HostDB 中进行检索时使用。
         ats_ip_set(item.ip(), ip);
       }
     }
   }
 }
+```
 
+### 按行解析 Hosts 文件
+
+Hosts 文件是一个文本文件，除去行首的空格后，第一个字符如果是 `#`，则表示该行为注释行，无任何实际用途。因此在解析 Hosts 文件时，要将这类注释信息剔除。
+
+为了避免存在多个同时加载、解析 Hosts 文件的操作，使用 HostDBFileUpdateActive 标明当前是否处于加载 Hosts 文件的进程中。
+
+```
 // 解析 /etc/hosts 文件
 void
 ParseHostFile(char const *path)
@@ -162,9 +177,11 @@ ParseHostFile(char const *path)
           }
 
           // 记录这次加载 /etc/hosts 文件的时间戳
-          // BUG：hostdb_current_interval 在 HostDB 启动时通过当前时间直接计算得来，
-          // 然后通过每秒回调状态机 HostDBContinuation::backgroundEvent 实现每秒递增 1 的操作，
-          // 但是如果在 EventLoop 中出现延迟和卡顿时，无法达成每秒一次的回调操作，因此该值可能会比真实的时间戳要慢
+          // BUG: 由于当前 (HOST_DB_TIMEOUT_INTERVAL / HRTIME_SECOND) 的值为 1，可以暂时忽略。
+          // 在 backgroundEvent 中，hostdb_hostfile_update_timestamp 被强制转换为 time_t 类型，并与 info.st_mtime 进行比较，
+          // 但是这里却是将时间分片的编号保存到了 hostdb_hostfile_update_timestamp。
+          // 修复方法 1：hostdb_hostfile_update_timestamp = info.st_mtime;
+          // 修复方法 2：请查看 backgroundEvent 里的分析
           hostdb_hostfile_update_timestamp = hostdb_current_interval;
         }
       }
@@ -195,6 +212,131 @@ ParseHostFile(char const *path)
 }
 ```
 
+### Hosts 文件的更新后的动态加载
+
+在 HostDB 子系统启动时，会创建一个 `HostDBContinuation` 实例，并将状态机设置为 `backgroundEvent()`，然后周期性的回调该状态机。
+
+将时间以 `HOST_DB_TIMEOUT_INTERVAL` 为最小单位分片，每个分片里回调一次 `backgroundEvent()` 状态机，其中 `hostdb_current_interval` 记录了该事件分片的唯一编号。
+
+```
+#define HOST_DB_TIMEOUT_INTERVAL HRTIME_SECOND
+
+int
+HostDBProcessor::start(int, size_t)
+{
+...
+  REC_EstablishStaticConfigInt32U(hostdb_hostfile_check_interval, "proxy.config.hostdb.host_file.interval");
+
+  //
+  // Set up hostdb_current_interval
+  //
+  hostdb_current_interval = (unsigned int)(Thread::get_hrtime() / HOST_DB_TIMEOUT_INTERVAL);
+
+  HostDBContinuation *b = hostDBContAllocator.alloc();
+  SET_CONTINUATION_HANDLER(b, (HostDBContHandler)&HostDBContinuation::backgroundEvent);
+  b->mutex = new_ProxyMutex();
+  // 每秒一次，没有保存返回的 Action，该状态机不可取消
+  eventProcessor.schedule_every(b, HOST_DB_TIMEOUT_INTERVAL, ET_DNS);
+...
+}
+```
+
+全局变量 `hostdb_hostfile_check_interval` 用于表示 Hosts 文件的更新周期(以秒为单位)，同时也是解释 Hosts 文件后产生的 `HostDBInfo` 记录的生存周期。
+
+虽然每个时间分片都会回调 `backgroundEvent()` ，但是只有达到更新周期时，`backgroundEvent()` 才会重新加载并解析 Hosts 文件，因此对 Hosts 文件及相关配置的变更不会立即生效。
+
+在重新加载 Hosts 文件之前，需要判断以下几种情况：
+
+1. 自上次加载后，`proxy.config.hostdb.host_file.path` 没有发生变化
+   - 指向有效的 Hosts 文件，并且文件的最后更新日期在上次加载时间之后，则调用 `ParseHostFile()` 完成加载和解析，
+   - 该配置项为空内容，则调用 `ParseHostFile()` 产生空的 HostsFileMap 对象，
+   - 如 Hosts 文件无法打开，则不做任何操作，不会清空当前的 HostsFileMap 对象。
+2. 自上次加载后，`proxy.config.hostdb.host_file.path` 发生了变化，
+   - 指向了新的、有效的 Hosts 文件，重置上一次加载 Hosts 文件的时间，然后调用 `ParseHostFile()` 完成加载和解析，
+   -  该配置项为空内容，则调用 `ParseHostFile()` 产生空的 HostsFileMap 对象，
+   - 如 Hosts 文件无法打开，也产生空的 HostsFileMap 对象，注意与上面的情况进行区分。
+
+对于 Hosts 文件无法打开的两种情况，可以理解为：
+
+- 配置无修改，但是 Hosts 文件异常无法打开，可以认为是外部故障，有可能在一段时间后故障解除，又能打开了，
+   - 所以这里把这种情况视为异常，不对 HostsFileMap 对象做任何的变更。
+- 配置有修改，但是 Hosts 文件异常无法打开，可以认为是配置错误，
+   - 此时清空之前加载的 Hosts 文件内容，可以让错误尽快出现，并提示管理员解决配置错误。
+
+
+```
+//
+// Background event
+// Just increment the current_interval.  Might do other stuff
+// here, like move records to the current position in the cluster.
+//
+int
+HostDBContinuation::backgroundEvent(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
+{
+  // 递增时间分片的编号
+  ++hostdb_current_interval;
+
+  // hostdb_current_interval is bumped every HOST_DB_TIMEOUT_INTERVAL seconds
+  // so we need to scale that so the user config value is in seconds.
+  // 由于 hostdb_hostfile_check_interval 对应的用户配置是以秒为单位的数值，
+  // 因此，在进行更新周期判断之前，需要先将 hostdb_current_interval 的数值由时间片的编号转换为秒，
+  if (hostdb_hostfile_check_interval && // enabled
+      (hostdb_current_interval - hostdb_hostfile_check_timestamp) * (HOST_DB_TIMEOUT_INTERVAL / HRTIME_SECOND) >
+        hostdb_hostfile_check_interval) {
+    bool update_p = false; // do we need to reparse the file and update?
+    struct stat info;
+    char path[sizeof(hostdb_hostfile_path)];
+
+    REC_ReadConfigString(path, "proxy.config.hostdb.host_file.path", sizeof(path));
+    if (0 != strcasecmp(hostdb_hostfile_path, path)) {
+      Debug("hostdb", "Update host file '%s' -> '%s'", (*hostdb_hostfile_path ? hostdb_hostfile_path : "*-none-*"),
+            (*path ? path : "*-none-*"));
+      // path to hostfile changed
+      // 如果 Hosts 文件的路径发生变化，将上一次 Hosts 文件的更新时间重置
+      hostdb_hostfile_update_timestamp = 0; // never updated from this file
+      if ('\0' != *path) {
+        memcpy(hostdb_hostfile_path, path, sizeof(hostdb_hostfile_path));
+      } else {
+        // 如果路径为空，那表示这里没有 Hosts 文件了，也就意味着需要将 HostsFileMap 里的记录清空
+        hostdb_hostfile_path[0] = 0; // mark as not there
+      }
+      // 标记需要调用 ParseHostFile 对新的 Hosts 文件进行解析
+      update_p = true;
+    } else {
+      // 如果 Hosts 文件的路径没有发生变化，那么就要看上一次检查时，路径是否为空？
+      // 注意：这里相当于把 `Hosts 文件路径为空` 看做是 `Hosts 文件的内容为空`，
+      // 会产生一个空内容的 HostsFileMap 对象，并保持 hostdb_hostfile_check_interval 的时间
+      hostdb_hostfile_check_timestamp = hostdb_current_interval;
+      if (*hostdb_hostfile_path) {
+        if (0 == stat(hostdb_hostfile_path, &info)) {
+          // Hosts 文件路径不为空，并且可以获取其文件状态信息。
+          // BUG: 由于当前 (HOST_DB_TIMEOUT_INTERVAL / HRTIME_SECOND) 的值为 1，可以暂时忽略。
+          // 在 ParseHostFile 中，hostdb_hostfile_update_timestamp 被赋值为时间分片的编号，
+          // 因此在这里应该将其还原回以秒为单位的数值，需要乘以 (HOST_DB_TIMEOUT_INTERVAL / HRTIME_SECOND)
+          // 修复该 BUG，只需要在 ParseHostFile 或 backgroundEvent 修改一处即可。
+          if (info.st_mtime > (time_t)hostdb_hostfile_update_timestamp) {
+            // 如果 Hosts 文件的最后修改时间在上一次解析操作之后，
+            // 就标记需要调用 ParseHostFile 对 Hosts 文件进行重新解析
+            update_p = true; // same file but it's changed.
+          }
+        } else {
+          // 注意：Hosts 文件如果被删除，那么是不会产生空内容的 HostsFileMap 对象。
+          Debug("hostdb", "Failed to stat host file '%s'", hostdb_hostfile_path);
+        }
+      }
+    }
+    // 根据设定的标记来调用 ParseHostFile 完成 Hosts 文件的解析
+    if (update_p) {
+      Debug("hostdb", "Updating from host file");
+      ParseHostFile(hostdb_hostfile_path);
+    }
+  }
+
+  return EVENT_CONT;
+}
+```
+
+
 ## 关于 /etc/hosts 实现的问题
 
 可以看到 `ParseHostFile()` 方法将为 `/etc/hosts` 内的每一条记录创建（new）一个 HostDBInfo 的对象，当 RefCountedHostsFileMap 对象被自动释放后，也会将其成员 `HostsFileMap hosts_file_map` 析构，从而释放（delete）这些保存了 `/etc/hosts` 记录的 HostDBInfo 的对象。如果有任何的状态机保存了指向这些 HostDBInfo 的对象的指针，那么就会成为野指针。
@@ -203,7 +345,7 @@ ParseHostFile(char const *path)
 
 当然，无论在任何情况下，都不应该保存指向 HostDBInfo 对象的指针，而是应该在收到来自 HostDB 回调时，复制 HostDBInfo 对象的结果信息到本地对象中保存，并在将来使用。
 
-为了将 HostDBInfo 的存储结构统一到 MultiCache 中进行存储，官方于 7.0.0 版本引入了以下提交：
+由于通过不上锁的方式切换 HostsFileMap 对象存在一定的风险，因此官方对 HostDBInfo 的存储进行了改进。为了将 HostDBInfo 对象统一到 MultiCache 中，官方于 7.0.0 版本引入了以下提交：
 
 ```
 commit 5f0a649f7af0f6616b81d577a635e6997344b9e1
@@ -217,6 +359,7 @@ Date:   Tue May 10 19:59:24 2016 -0700
     In addition to fixing the down status issues, this also means we no longer need to keep old copies of the strings etc. since they are copied once lookup_done is called.
 ```
 
+该提交将 Hosts 文件的检索移到了 HostDB 之后，但是在调用 DNS 子系统之前。这个改进将 Hosts 文件内获得的结果看做是一种特殊的 DNS 解析结果，一并存储到 HostDB 中。
 
 ## 参考资料
 
