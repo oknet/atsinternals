@@ -966,7 +966,7 @@ Lfail : {
 - levels：表示数据区的层数，最少 1 层，最多 3 层，默认值为 2
 - level 0 elements per bucket：第 0 层每个 bucket 可容纳的元素（Entry）数量，默认为 4
 - level 1 elements per bucket：第 1 层每个 bucket 可容纳的元素（Entry）数量，需要大于第 0 层的值，默认为 32
-- level 2 elements per bucket：第 2 层每个 bucket 可容纳的元素（Entry）数量，需要大于第 1 层的值，默认为 1，因此该默认值不合法，如制定 levels=3 时，需要显示指定该值
+- level 2 elements per bucket：第 2 层每个 bucket 可容纳的元素（Entry）数量，需要大于第 1 层的值，默认为 1，所以默认值不合法，当设置 levels=3 时，需要显示指定该值
 
 返回值：
 
