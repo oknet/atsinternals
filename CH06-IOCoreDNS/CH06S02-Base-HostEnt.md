@@ -70,6 +70,18 @@ struct SRV {
   SRV() : weight(0), port(0), priority(0), ttl(0), host_len(0), key(0) { host[0] = '\0'; }
 };
 
+// 重载 '<' 比较操作符，用于直接对比两个 SRV 类型的优先级，在 HostDBContinuation::dnsEvent 中有实际应用
+// 其中 priority 的值越小，表示对应 SRV 记录的优先级越高，
+// 而 key 的值是 SRV 记录的 target 域名经过忽略大小写的 FNVHash 函数计算而来。
+// 备注：根据我个人的理解，key 值的大小对于 SRV 类型的应用无任何影响。
+// 由于这里在 priority 相等时，进一步比较了 key 值的大小，导致在 HostDBContinuation::dnsEvent 中的冒泡排序结果为不稳定排序；
+// 如果将 priority 相等时，改为总是返回 false，则在 HostDBContinuation::dnsEvent 中的排序结果将变为稳定排序。
+inline bool operator<(const SRV &left, const SRV &right)
+{
+  // lower priorities first, then the key
+  return (left.priority == right.priority) ? (left.key < right.key) : (left.priority < right.priority);
+}
+
 struct SRVHosts {
   // 包含多少个有效的 SRV 记录
   unsigned srv_host_count;
