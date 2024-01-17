@@ -75,7 +75,7 @@ template <class C> struct MultiCache : public MultiCacheBase {
   // 将指定的 block 所在的 Entry 清空，如果该 block 已经备份到下一级，
   // 则遍历 MultiCache 数据库，将备份有该 block 内容的 Entry 也全部清空
   void delete_block(C *block);
-  // 从最顶层开始遍历 MultiCache 数据库，最多遍历 level 层，查找与指定 hash 值匹配的第一个数据元素
+  // 从第 0 层（顶层）至第 level（包含）层，遍历 MultiCache 数据库，查找与指定 hash 值匹配的第一个数据元素
   C *lookup_block(uint64_t folded_md5, unsigned int level);
   // 在两个工作半区之间复制 HEAP 区的数据，具体参考 Heap and MultiCacheHeapGC 章节
   void copy_heap(int paritition, MultiCacheHeapGC *);
@@ -409,10 +409,10 @@ MultiCacheBase::update(int *poffset, int *old_poffset)
 
 ### C *MultiCache<C>::lookup_block(folded md5, level)
 
-从第 0 层级开始，逐层查找指定 MD5 值的数据元素，最多向下查找指定的层数，返回找到的数据元素。参数：
+从第 0 层级开始，逐层查找指定 MD5 值的数据元素，并返回找到的元素；如遍历完指定的层后，仍未找到数据元素，则返回 NULL。参数：
 
 - `uint64_t folded_md5`：被“折叠的” MD5 值，方便使用 64 位直接运算，
-- `unsigned int level`：指定在第 0 层查找不到时，继续向下查找几层？
+- `unsigned int level`：遍历操作可以抵达的最深层级。
 
 如果没有找到指定的数据元素，返回 NULL，否则返回找到的数据元素。
 
@@ -429,17 +429,17 @@ MultiCache<C>::lookup_block(uint64_t folded_md5, unsigned int level)
   // 根据 MD5 值计算 TAG，TAG 受到 MultiCacheHeader::tag_bits 的限制，默认为 56 bits 的长度，
   // 这里 tag = md5 / buckets 之后的低 56 bits
   uint64_t tag = make_tag(folded_md5);
-  // 从第 0 层开始
+  // 开始在第 0 层进行查找
   int i = 0;
   // Level 0
   // 遍历指定 Bucket 内所有的数据元素，找到就立即返回该元素
   for (i = 0; i < elements[0]; i++)
     if (tag == b[i].tag())
       return &b[i];
-  // 第 0 层遍历完成之后，如果指定向下查找层数小于等于 0，就停止向下查找
+  // 如可以抵达的最深层级小于等于第 0 层，则停止查找，并返回 NULL
   if (level <= 0)
     return NULL;
-  // 如果指定向下查找层数大于 0，就继续在第 1 层里查找
+  // 开始在第 1 层进行查找
   // Level 1
   // 根据 MD5 值进行 hash 后得到 Bucket 的编号，然后得到该 Bucket 所在指定层级的第一个数据元素
   b = cache_bucket(folded_md5, 1);
@@ -447,10 +447,10 @@ MultiCache<C>::lookup_block(uint64_t folded_md5, unsigned int level)
   for (i = 0; i < elements[1]; i++)
     if (tag == b[i].tag())
       return &b[i];
-  // 第 1 层遍历完成之后，如果指定向下查找层数小于等于 1，就停止向下查找
+  // 如可以抵达的最深层级小于等于第 1 层，则停止查找，并返回 NULL
   if (level <= 1)
     return NULL;
-  // 如果指定向下查找层数大于 1，就继续在第 2 层里查找
+  // 开始在第 2 层进行查找
   // Level 2
   // 根据 MD5 值进行 hash 后得到 Bucket 的编号，然后得到该 Bucket 所在指定层级的第一个数据元素
   b = cache_bucket(folded_md5, 2);
