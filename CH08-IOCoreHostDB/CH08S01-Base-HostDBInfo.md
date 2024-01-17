@@ -49,9 +49,11 @@ Bytes \  0        8        16       24     31
 
 ```
 
-由于 commit 0e703e1e3b 的提交，在 HostDBInfo 中增加了 hostname_offset 成员，由此导致自 6.0.0 版本开始出现随机崩溃的问题，因此在上述信息中删掉了 hostname_offset 成员。该 Bug 是因为 hostname_offset 成员为 HostDBInfo 引入了第二个 HEAP 区的存储空间，但是根据 MultiCache 章节的分析可知：一个数据元素只允许在 HEAP 区申请一段连续的存储空间。
+由于 commit 0e703e1e3b 的提交，在 HostDBInfo 中增加了 hostname\_offset 成员，并在 commit 0cd1ef3e 中重写了这部分代码，由此导致自 6.0.0 版本开始出现随机崩溃的问题。
 
-提供一个补丁修复随机崩溃的问题，但是由于补丁删除了 hostname_offset 成员，导致主机名无法在 HostDB UI 的结果中显示，如果您需要在结果中总是显示主机名的信息，那么需要您自行改进下面的补丁文件。[下载 diff 文件](https://github.com/oknet/trafficserver/commit/9dd751635590c0ce37df3b150cfd24b34c772019.diff)
+该 Bug 是因为 hostname\_offset 成员为 HostDBInfo 引入了第二个 HEAP 区的存储空间，但是根据 MultiCache 章节的分析可知：一个数据元素只允许在 HEAP 区申请一段连续的存储空间。所以在上述结构体中我删掉了 hostname\_offset 成员。
+
+提供一个补丁修复随机崩溃的问题，但是由于补丁删除了 hostname\_offset 成员，导致主机名无法在 HostDB UI 的结果中显示，如果您需要在结果中总是显示主机名的信息，那么需要您自行改进下面的补丁文件。[下载 diff 文件](https://github.com/oknet/trafficserver/commit/9dd751635590c0ce37df3b150cfd24b34c772019.diff)
 
 ```
 diff --git a/iocore/hostdb/HostDB.cc b/iocore/hostdb/HostDB.cc
